@@ -1,0 +1,12 @@
+dir=down mode=Gated rtt_ms=40 tcp_buf_kb=256 flows=1 secs=6.01 mbps=41.7 cold_connect_ms=46
+   peak_rss_MiB=6
+dir=down mode=Gated rtt_ms=40 tcp_buf_kb=256 flows=32 secs=6.03 mbps=1431.3 cold_connect_ms=45
+   peak_rss_MiB=42
+dir=down mode=Gated rtt_ms=40 tcp_buf_kb=1024 flows=1 secs=6.04 mbps=164.0 cold_connect_ms=46
+   peak_rss_MiB=8
+dir=down mode=Gated rtt_ms=40 tcp_buf_kb=1024 flows=32 secs=6.00 mbps=5669.7 cold_connect_ms=46
+   peak_rss_MiB=141
+dir=down mode=Gated rtt_ms=40 tcp_buf_kb=4096 flows=1 secs=6.01 mbps=724.2 cold_connect_ms=46
+   peak_rss_MiB=19
+dir=down mode=Gated rtt_ms=40 tcp_buf_kb=4096 flows=32 secs=6.03 mbps=12200.0 cold_connect_ms=47
+   peak_rss_MiB=554

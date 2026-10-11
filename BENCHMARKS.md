@@ -51,8 +51,21 @@ ports, which costs about 27% throughput. The gate removes both.
 The netstack has no window autotuning, so one flow is capped near `buffer / RTT`. At the default 256 KiB, an
 iPad on cellular (30–60 ms RTT to home) gets about 30–60 Mbit/s per TCP flow through the exit node, whatever
 the ISP speed. Buffers are `vec![0; n]` (calloc), so the cost of a larger setting is mostly virtual memory until
-data is actually queued. Measuring RSS under many flows is still open; see "Next".
+data is actually queued (measured below).
 The runner exposes this as `--tcp-buffer-size`.
+
+**Memory cost** (`bench/results/forwarder-rss-buf.txt`; gated mode, RTT 40 ms, down, 6 s, every flow saturating;
+peak RSS of the whole bench process, i.e. peer *and* forwarder netstack, both with the given buffer):
+
+| buffer | 1 flow: Mbps / peak RSS | 32 flows: Mbps / peak RSS |
+|---|---|---|
+| 256 KiB | 42 / 6 MiB | 1,431 / 42 MiB |
+| 1 MiB | 164 / 8 MiB | 5,670 / 141 MiB |
+| 4 MiB | 724 / 19 MiB | 12,200 / 554 MiB |
+
+RSS tracks bytes actually in flight, not the configured size (calloc'd buffers stay virtual until touched).
+Worst case is about 2 × buffer per *saturating* flow on the forwarder, so 4 MiB × 100 bulk flows would be
+~800 MiB. Browsing flows rarely fill their windows. For the live A/B: 256 KiB (fork default) vs 2 MiB vs 4 MiB.
 
 *Caveat:* the in-memory pipe has no loss and no reordering. smoltcp's loss recovery (no SACK) will do worse
 on a real path, which matters more as the window grows.
@@ -106,7 +119,6 @@ spread, with the path (direct/DERP) from the runner log quoted per run:
 ## Next
 
 - Live baselines (above).
-- RSS vs `tcp_buffer_size` × concurrent flows (forwarder bench with many flows + `/usr/bin/time -l`).
 - Phase 3A: connected per-peer underlay sockets + DF in `ts_magicsock`, with an A/B switch.
 - Phase 3B: `sendmsg_x`/`recvmsg_x` batching behind a feature flag with a safe fallback.
 - Loss/reorder injection in the forwarder bench to measure smoltcp's recovery.
