@@ -639,7 +639,12 @@ mod tests {
     /// Public destinations pass the guard (the connect itself is never attempted here).
     #[test]
     fn public_exit_destinations_are_not_forbidden() {
-        for dst in ["1.1.1.1:443", "8.8.8.8:53", "93.184.215.14:80", "100.128.0.1:443"] {
+        for dst in [
+            "1.1.1.1:443",
+            "8.8.8.8:53",
+            "93.184.215.14:80",
+            "100.128.0.1:443",
+        ] {
             assert!(!exit_dst_is_forbidden(dst.parse().unwrap()), "{dst}");
         }
     }

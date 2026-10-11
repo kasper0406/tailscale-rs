@@ -103,9 +103,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let dev = Device::new(&config, auth_key).await?;
-    dev.wait_until_running(Some(Duration::from_secs(90))).await?;
+    dev.wait_until_running(Some(Duration::from_secs(90)))
+        .await?;
     let (v4, v6) = dev.tailscale_ips().await?;
-    tracing::info!(?v4, ?v6, advertise_exit_node = !args.no_advertise, "running");
+    tracing::info!(
+        ?v4,
+        ?v6,
+        advertise_exit_node = !args.no_advertise,
+        "running"
+    );
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut ticker = (args.status_interval > 0)
