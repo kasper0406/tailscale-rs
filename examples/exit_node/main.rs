@@ -6,7 +6,8 @@
 //! touch the host's routes, DNS or packet filter, and it does not need root.
 //!
 //! The auth key is read from a file (never argv or logs) and is only needed for the first
-//! registration; afterwards the identity in `--state-dir` is reused.
+//! registration; afterwards the identity in `--state-dir` is reused. Alternatively,
+//! `--interactive` prints a login URL to approve in a browser.
 //!
 //! ```sh
 //! TS_RS_EXPERIMENT=this_is_unstable_software \
@@ -34,6 +35,12 @@ struct Args {
     /// File containing the auth key. Only read if the identity is not yet registered.
     #[arg(long)]
     auth_key_file: Option<PathBuf>,
+
+    /// Register without an auth key: print control's login URL and wait (up to 1 h) for it to
+    /// be approved in a browser, like `tailscale up` does. The node is owned by the approving
+    /// user rather than tagged.
+    #[arg(long, conflicts_with = "auth_key_file")]
+    interactive: bool,
 
     /// Hostname to request.
     #[arg(long, default_value = "rust-exit")]
@@ -78,8 +85,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let auth_key = match (&args.auth_key_file, first_run) {
         (Some(p), _) => Some(tokio::fs::read_to_string(p).await?.trim().to_owned()),
-        (None, true) => return Err("first run needs --auth-key-file".into()),
-        (None, false) => None,
+        (None, true) if !args.interactive => {
+            return Err("first run needs --auth-key-file or --interactive".into());
+        }
+        (None, _) => None,
     };
 
     let config = Config {
@@ -103,8 +112,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let dev = Device::new(&config, auth_key).await?;
-    dev.wait_until_running(Some(Duration::from_secs(90)))
-        .await?;
+    let wait = if args.interactive { 3600 } else { 90 };
+    {
+        let running = dev.wait_until_running(Some(Duration::from_secs(wait)));
+        tokio::pin!(running);
+        let mut poll = tokio::time::interval(Duration::from_secs(1));
+        let mut shown = None;
+        loop {
+            tokio::select! {
+                res = &mut running => { res?; break; }
+                _ = poll.tick(), if args.interactive => {
+                    if let Ok(Some(url)) = dev.pop_browser_url().await
+                        && shown.as_ref() != Some(&url)
+                    {
+                        tracing::info!(%url, "open this URL to log the node in");
+                        shown = Some(url);
+                    }
+                }
+            }
+        }
+    }
     let (v4, v6) = dev.tailscale_ips().await?;
     tracing::info!(
         ?v4,
