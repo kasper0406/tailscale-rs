@@ -1,0 +1,357 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index cd12f9f..7929527 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2082,6 +2082,7 @@ name = "geiserx_ts_forwarder"
+ version = "0.57.4"
+ dependencies = [
+  "bytes",
++ "etherparse",
+  "geiserx_ts_netstack_smoltcp",
+  "ipnet",
+  "thiserror 2.0.21",
+diff --git a/ts_forwarder/Cargo.toml b/ts_forwarder/Cargo.toml
+index 5c4612b..c61e7a9 100644
+--- a/ts_forwarder/Cargo.toml
++++ b/ts_forwarder/Cargo.toml
+@@ -17,6 +17,7 @@ name = "ts_forwarder"
+ workspace = true
+ 
+ [dependencies]
++etherparse = "0.19"
+ ts_netstack_smoltcp = { workspace = true, features = ["tokio"] }
+ ipnet.workspace = true
+ bytes.workspace = true
+diff --git a/ts_forwarder/src/lib.rs b/ts_forwarder/src/lib.rs
+index e3a0ea7..d795055 100644
+--- a/ts_forwarder/src/lib.rs
++++ b/ts_forwarder/src/lib.rs
+@@ -55,6 +55,7 @@ mod all_port;
+ mod class;
+ mod dialer;
+ mod forwarder;
++mod ipv6_reject;
+ mod tcp;
+ mod udp;
+ 
+@@ -64,3 +65,4 @@ pub use dialer::{
+     RealDialer,
+ };
+ pub use forwarder::{Forwarder, PortSpec, RouteUpdater};
++pub use ipv6_reject::reject_ipv6;
+diff --git a/ts_runtime/src/forwarder_actor.rs b/ts_runtime/src/forwarder_actor.rs
+index ccc2a88..3aba6d2 100644
+--- a/ts_runtime/src/forwarder_actor.rs
++++ b/ts_runtime/src/forwarder_actor.rs
+@@ -137,6 +137,7 @@ impl kameo::Actor for ForwarderActor {
+             netstack.run_tokio().await;
+         });
+ 
++        let reject_up = netstack_up.clone();
+         // Pump packets emitted by the forwarder netstack down into the dataplane (out the overlay).
+         joinset.spawn(async move {
+             while let Some(buf) = netstack_down_rx.recv_async().await {
+@@ -151,7 +152,41 @@ impl kameo::Actor for ForwarderActor {
+         // Pump packets the dataplane routed to this transport up into the forwarder netstack,
+         // dropping what its bounded ingress queue has no room for.
+         joinset.spawn(async move {
+-            crate::netstack_actor::pump_ingress(netstack_down, netstack_down_tx, "forwarder").await;
++            let mut netstack_down = netstack_down;
++            let mut dropped = 0_u64;
++            let mut dropping = false;
++            while let Some(bufs) = netstack_down.recv().await {
++                for buf in bufs {
++                    if buf.as_ref().first().is_some_and(|b| b >> 4 == 6) {
++                        if let Some(reply) = ts_forwarder::reject_ipv6(buf.as_ref()) {
++                            if reject_up.send(vec![reply.into()]).is_err() {
++                                return;
++                            }
++                        }
++                        // Consume IPv6 even when it cannot safely be answered.
++                        continue;
++                    }
++                    if netstack_down_tx.try_send(buf.as_ref()) {
++                        if dropping {
++                            dropping = false;
++                            tracing::debug!(
++                                netstack = "forwarder",
++                                dropped_total = dropped,
++                                "netstack ingress queue has room again"
++                            );
++                        }
++                    } else {
++                        dropped += 1;
++                        if !dropping {
++                            dropping = true;
++                            tracing::debug!(
++                                netstack = "forwarder",
++                                "netstack ingress queue full; dropping inbound packets"
++                            );
++                        }
++                    }
++                }
++            }
+ 
+             tracing::warn!("forwarder netstack uplink shut down!");
+         });
+diff --git a/ts_forwarder/src/ipv6_reject.rs b/ts_forwarder/src/ipv6_reject.rs
+new file mode 100644
+index 0000000..0b68e9e
+--- /dev/null
++++ b/ts_forwarder/src/ipv6_reject.rs
+@@ -0,0 +1,80 @@
++//! Stateless IPv6 rejection, for an already authenticated, source-checked, ACL-admitted
++//! packet routed to the dedicated IPv4-only forwarder. Never creates a host socket.
++
++use ts_netstack_smoltcp::netcore::smoltcp::{
++    phy::{Checksum, ChecksumCapabilities},
++    wire::{IpAddress, TcpPacket, TcpRepr, UdpPacket, UdpRepr},
++};
++
++/// Returns a TCP reset or ICMPv6 administrative prohibition. `None` means deterministic
++/// discard (malformed/later-fragment packet, fragmented UDP, RST, other protocol,
++/// or non-unicast endpoint).
++/// The caller MUST consume every IPv6 packet, even when this returns `None`.
++/// A leading first-fragment TCP SYN with a complete TCP header is reset immediately;
++/// its full transport checksum cannot be verified without reassembly. Call only after ACLs.
++pub fn reject_ipv6(bytes: &[u8]) -> Option<Vec<u8>> {
++    let sliced = etherparse::SlicedPacket::from_ip(bytes).ok()?;
++    let etherparse::NetSlice::Ipv6(ip) = sliced.net? else {
++        return None;
++    };
++    let header = ip.header();
++    let src = header.source_addr();
++    let dst = header.destination_addr();
++    if src.is_unspecified() || src.is_multicast() || dst.is_unspecified() || dst.is_multicast() {
++        return None;
++    }
++    let fragmented = ip.is_payload_fragmented();
++    if fragmented
++        && (bytes.get(6) != Some(&44)
++            || u16::from_be_bytes([*bytes.get(42)?, *bytes.get(43)?]) >> 3 != 0)
++    {
++        return None;
++    }
++    let src_ip = IpAddress::Ipv6(src);
++    let dst_ip = IpAddress::Ipv6(dst);
++    let mut checksums = ChecksumCapabilities::default();
++    if fragmented {
++        checksums.tcp = Checksum::Tx;
++    }
++    let payload = ip.payload().payload;
++    let builder = etherparse::PacketBuilder::ipv6(dst.octets(), src.octets(), 64);
++    match ip.payload().ip_number.0 {
++        6 => {
++            let packet = TcpPacket::new_checked(payload).ok()?;
++            let repr = TcpRepr::parse(&packet, &src_ip, &dst_ip, &checksums).ok()?;
++            if packet.rst() {
++                return None;
++            }
++            let mut builder = builder
++                .tcp(
++                    repr.dst_port,
++                    repr.src_port,
++                    repr.ack_number.unwrap_or_default().0 as u32,
++                    0,
++                )
++                .rst();
++            if repr.ack_number.is_none() {
++                let len =
++                    repr.payload.len() as u32 + u32::from(packet.syn()) + u32::from(packet.fin());
++                builder = builder.ack((repr.seq_number.0 as u32).wrapping_add(len));
++            }
++            let mut out = Vec::with_capacity(builder.size(0));
++            builder.write(&mut out, &[]).ok()?;
++            Some(out)
++        }
++        17 if !fragmented => {
++            let packet = UdpPacket::new_checked(payload).ok()?;
++            UdpRepr::parse(&packet, &src_ip, &dst_ip, &checksums).ok()?;
++            // Type 1, code 1; quote the original packet verbatim within the IPv6 1280 MTU.
++            let quote = &bytes[..bytes
++                .len()
++                .min(40 + usize::from(header.payload_length()))
++                .min(1232)];
++            let builder = builder.icmpv6_raw(1, 1, [0; 4]);
++            let mut out = Vec::with_capacity(builder.size(quote.len()));
++            builder.write(&mut out, quote).ok()?;
++            Some(out)
++        }
++        _ => None,
++    }
++}
+diff --git a/ts_forwarder/tests/ipv6_reject.rs b/ts_forwarder/tests/ipv6_reject.rs
+new file mode 100644
+index 0000000..fd2b787
+--- /dev/null
++++ b/ts_forwarder/tests/ipv6_reject.rs
+@@ -0,0 +1,169 @@
++//! Isolated wire-level and netstack-pair rejection probes.
++use smoltcp::{phy::ChecksumCapabilities, wire::*};
++use std::{net::Ipv6Addr, time::Duration};
++use ts_forwarder::reject_ipv6;
++use ts_netstack_smoltcp::{
++    CreateSocket, Netstack, WakingPipe, WakingPipeDev,
++    netcore::{self, HasChannel, NetstackControl, smoltcp},
++};
++
++const SRC: &str = "fd7a:115c:a1e0::123";
++const DST: &str = "2001:4860:4860::8888";
++
++fn syn() -> Vec<u8> {
++    let b = etherparse::PacketBuilder::ipv6(
++        SRC.parse::<Ipv6Addr>().unwrap().octets(),
++        DST.parse::<Ipv6Addr>().unwrap().octets(),
++        64,
++    )
++    .tcp(1234, 443, u32::MAX, 65535)
++    .syn();
++    let mut out = Vec::new();
++    b.write(&mut out, &[]).unwrap();
++    out
++}
++
++#[test]
++fn reset_has_reversed_tuple_wrapped_ack_and_valid_checksum() {
++    let out = reject_ipv6(&syn()).unwrap();
++    let ip = Ipv6Packet::new_checked(&out[..]).unwrap();
++    assert_eq!(ip.src_addr(), DST.parse::<Ipv6Addr>().unwrap());
++    assert_eq!(ip.dst_addr(), SRC.parse::<Ipv6Addr>().unwrap());
++    let p = TcpPacket::new_checked(ip.payload()).unwrap();
++    assert!(p.rst() && p.ack());
++    assert_eq!((p.src_port(), p.dst_port()), (443, 1234));
++    assert_eq!(p.ack_number().0 as u32, 0);
++    TcpRepr::parse(
++        &p,
++        &ip.src_addr().into(),
++        &ip.dst_addr().into(),
++        &ChecksumCapabilities::default(),
++    )
++    .unwrap();
++    assert!(reject_ipv6(&out).is_none(), "never reset a reset");
++    let mut bad = syn();
++    bad[56] ^= 1; // TCP checksum
++    assert!(reject_ipv6(&bad).is_none());
++}
++
++#[test]
++fn udp_error_quotes_original_and_is_bounded_with_valid_checksum() {
++    let b = etherparse::PacketBuilder::ipv6(
++        SRC.parse::<Ipv6Addr>().unwrap().octets(),
++        DST.parse::<Ipv6Addr>().unwrap().octets(),
++        64,
++    )
++    .udp(1234, 443);
++    let mut input = Vec::new();
++    b.write(&mut input, &[7; 1400]).unwrap();
++    let out = reject_ipv6(&input).unwrap();
++    assert_eq!(out.len(), 1280);
++    let ip = Ipv6Packet::new_checked(&out[..]).unwrap();
++    let p = Icmpv6Packet::new_checked(ip.payload()).unwrap();
++    assert_eq!(
++        (p.msg_type(), p.msg_code()),
++        (Icmpv6Message::DstUnreachable, 1)
++    );
++    assert!(p.verify_checksum(&ip.src_addr().into(), &ip.dst_addr().into()));
++    assert_eq!(&out[48..], &input[..1232]);
++}
++
++#[test]
++fn extensions_and_first_fragment_syn_reset_but_later_fragments_drop() {
++    let orig = syn();
++    let mut ext = orig[..40].to_vec();
++    ext[6] = 60; // Destination Options
++    ext[4..6].copy_from_slice(&28u16.to_be_bytes());
++    ext.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0]);
++    ext.extend_from_slice(&orig[40..]);
++    assert!(reject_ipv6(&ext).is_some());
++    ext[6] = 44; // Fragment: more-fragments bit
++    ext[43] = 1;
++    assert!(
++        reject_ipv6(&ext).is_some(),
++        "first fragment contains the complete SYN header"
++    );
++    ext[42..44].copy_from_slice(&0x0011u16.to_be_bytes()); // nonzero offset
++    assert!(reject_ipv6(&ext).is_none());
++    for len in 0..60 {
++        assert!(reject_ipv6(&orig[..len]).is_none());
++    }
++}
++
++#[tokio::test]
++async fn peer_observes_connection_refused_on_first_syn() {
++    let (p1, mut p2) = WakingPipe::new(None);
++    let mut peer = Netstack::new(
++        WakingPipeDev {
++            pipe: p1,
++            mtu: 1280,
++            medium: smoltcp::phy::Medium::Ip,
++        },
++        netcore::Config::default(),
++    );
++    let ch = peer.command_channel();
++    let run = tokio::spawn(async move { peer.run_tokio().await });
++    ch.set_ips([SRC.parse::<Ipv6Addr>().unwrap().into()])
++        .await
++        .unwrap();
++    let reject = tokio::spawn(async move {
++        let syn = p2.rx.recv_async().await.unwrap();
++        let reply = reject_ipv6(&syn).unwrap();
++        p2.tx.send(&reply);
++        // Keep the virtual link open until the test ends.
++        std::future::pending::<()>().await;
++    });
++    let result = tokio::time::timeout(
++        Duration::from_millis(250),
++        ch.tcp_connect(
++            format!("[{SRC}]:1234").parse().unwrap(),
++            format!("[{DST}]:443").parse().unwrap(),
++        ),
++    )
++    .await
++    .expect("must reject first SYN, before a retransmission timer");
++    assert!(result.is_err(), "must never complete the IPv6 handshake");
++    // The reset completes connect promptly. The existing channel API currently reports
++    // BadSocketHandle when its blocked connect observes the removed, reset socket.
++    let error = result.err().unwrap();
++    assert!(
++        format!("{error:?}").contains("BadSocketHandle"),
++        "error: {error:?}"
++    );
++    reject.abort();
++    run.abort();
++}
++
++#[tokio::test]
++async fn baseline_any_ip_resets_unmatched_ipv6_but_wildcard_listener_accepts() {
++    let (p1, mut p2) = WakingPipe::new(None);
++    let mut fwd = Netstack::new(
++        WakingPipeDev {
++            pipe: p1,
++            mtu: 1280,
++            medium: smoltcp::phy::Medium::Ip,
++        },
++        netcore::Config::default(),
++    );
++    let ch = fwd.command_channel();
++    let run = tokio::spawn(async move { fwd.run_tokio().await });
++    ch.set_any_ip(true).await.unwrap();
++    p2.tx.send(&syn());
++    let first = tokio::time::timeout(Duration::from_millis(250), p2.rx.recv_async())
++        .await
++        .unwrap()
++        .unwrap();
++    let ip = Ipv6Packet::new_checked(&first[..]).unwrap();
++    assert!(TcpPacket::new_checked(ip.payload()).unwrap().rst());
++    // A wildcard "0.0.0.0" listener has addr=None and also accepts IPv6!
++    let _listener = ch.tcp_listen("0.0.0.0:443".parse().unwrap()).await.unwrap();
++    p2.tx.send(&syn());
++    let reply = tokio::time::timeout(Duration::from_millis(250), p2.rx.recv_async())
++        .await
++        .unwrap()
++        .unwrap();
++    let ip = Ipv6Packet::new_checked(&reply[..]).unwrap();
++    let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
++    assert!(tcp.syn() && tcp.ack() && !tcp.rst());
++    run.abort();
++}

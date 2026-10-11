@@ -1,0 +1,70 @@
+diff --git a/ts_tunnel/tests/key_replacement_probe.rs b/ts_tunnel/tests/key_replacement_probe.rs
+new file mode 100644
+index 0000000..e68d14d
+--- /dev/null
++++ b/ts_tunnel/tests/key_replacement_probe.rs
+@@ -0,0 +1,64 @@
++//! Reproduction of retained transport keys after a static peer-key update (baseline bug).
++use ts_packet::PacketMut;
++use ts_tunnel::{Endpoint, NodeKeyPair, PeerConfig, PeerId};
++
++fn config(key: ts_tunnel::NodePublicKey) -> PeerConfig {
++    PeerConfig {
++        key,
++        psk: [0; 32].into(),
++        persistent_keepalive_interval: None,
++    }
++}
++
++#[test]
++fn old_transport_survives_static_key_update_while_new_handshake_fails() {
++    let a_key = NodeKeyPair::new();
++    let b_key = NodeKeyPair::new();
++    let c_key = NodeKeyPair::new();
++    let id = PeerId(1);
++    let mut a = Endpoint::new(a_key.clone());
++    let mut b = Endpoint::new(b_key.clone());
++    a.upsert_peer(id, config(b_key.public));
++    b.upsert_peer(id, config(a_key.public));
++    let initiation = b
++        .send([(id, vec![PacketMut::from(vec![1])])])
++        .to_peers
++        .remove(&id)
++        .unwrap();
++    let response = a.recv(initiation).to_peers.remove(&id).unwrap();
++    let confirmation = b.recv(response).to_peers.remove(&id).unwrap();
++    assert!(!a.recv(confirmation).to_local.is_empty());
++
++    a.upsert_peer(id, config(c_key.public));
++    let old_data = b
++        .send([(id, vec![PacketMut::from(vec![2])])])
++        .to_peers
++        .remove(&id)
++        .unwrap();
++    assert!(
++        !a.recv(old_data).to_local.is_empty(),
++        "baseline still admits old session"
++    );
++
++    let mut c = Endpoint::new(c_key);
++    c.upsert_peer(id, config(a_key.public));
++    let initiation = c
++        .send([(id, vec![PacketMut::from(vec![3])])])
++        .to_peers
++        .remove(&id)
++        .unwrap();
++    let response = a.recv(initiation).to_peers.remove(&id).unwrap();
++    assert!(
++        c.recv(response).to_peers.is_empty(),
++        "response MAC1 still targets old key"
++    );
++    let old_data = b
++        .send([(id, vec![PacketMut::from(vec![4])])])
++        .to_peers
++        .remove(&id)
++        .unwrap();
++    assert!(
++        !a.recv(old_data).to_local.is_empty(),
++        "old session remains live after attempted new handshake"
++    );
++}

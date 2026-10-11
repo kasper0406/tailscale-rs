@@ -1,0 +1,5 @@
+unconnected sendto           pps=   200042 mbps=   1984 cpu_us_per_pkt= 7.94 enobufs_or_err=0
+unconnected sendto + DF      pps=   219371 mbps=   2176 cpu_us_per_pkt= 7.34 enobufs_or_err=0
+connected send               pps=   361340 mbps=   3584 cpu_us_per_pkt= 4.93 enobufs_or_err=0
+connected send + DF          pps=   573321 mbps=   5687 cpu_us_per_pkt= 3.37 enobufs_or_err=0
+connected sendmsg_x x32 + DF pps=  1046911 mbps=  10385 cpu_us_per_pkt= 1.88 enobufs_or_err=0

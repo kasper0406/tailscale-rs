@@ -1,0 +1,7 @@
+repos/
+scratch/
+state/
+target/
+*.log
+!codex/*.md
+bench/*/target/
