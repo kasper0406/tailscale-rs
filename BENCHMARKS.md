@@ -69,11 +69,14 @@ cd bench/udp-send && cargo build --release && ./target/release/udp-send sink 2 1
 
 | send path | packets/s (3 runs) | CPU µs/packet |
 |---|---|---|
-| unconnected `sendto` (**fork magicsock today**) | 184k / 184k / 200k | 8.5 / 8.5 / 8.0 |
-| unconnected `sendto` + `IP_DONTFRAG` | 192k / 207k / 213k | 8.2 / 7.8 / 7.5 |
-| connected `send` | 381k / 391k / 360k | 4.7 / 4.6 / 5.0 |
-| connected `send` + `IP_DONTFRAG` | 716k / 712k / 536k | 2.7 / 2.7 / 3.6 |
-| connected `sendmsg_x` ×32 + `IP_DONTFRAG` | 1,123k / 1,027k / 946k | 1.8 / 1.9 / 2.1 |
+| unconnected `sendto` (**fork magicsock today**) | 200k / 199k / 205k | 7.9 / 7.9 / 7.7 |
+| unconnected `sendto` + `IP_DONTFRAG` | 219k / 241k / 239k | 7.3 / 6.9 / 6.9 |
+| connected `send` | 361k / 381k / 368k | 4.9 / 4.7 / 4.8 |
+| connected `send` + `IP_DONTFRAG` | 573k / 575k / 542k | 3.4 / 3.3 / 3.3 |
+| connected `sendmsg_x` ×32 + `IP_DONTFRAG` | 1,047k / 1,001k / 1,068k | 1.9 / 2.0 / 1.8 |
+
+Median CPU per packet goes from 7.9 µs (unconnected) to 4.8 (connected), 3.3 (+DF) and 1.9 (+`sendmsg_x`),
+about 4x less. Earlier exploratory runs gave the same ordering.
 
 This matches the mechanism behind tailscale/tailscale#21602 (connected sockets + DF on darwin; DF lets macOS
 skip the random IPv4 ID, and connecting saves the per-packet route/PCB lookup). It points Phase 3A (connected
