@@ -75,6 +75,37 @@ fn spawn_forwarder<D: RealDialer>(
     (route_updater, gate)
 }
 
+/// Token bucket for IPv6 rejections (TCP RST / ICMPv6) the forwarder sends back to peers:
+/// [`RejectBudget::PER_SEC`] per second, bursting to the same.
+struct RejectBudget {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl RejectBudget {
+    const PER_SEC: f64 = 1000.0;
+
+    fn new() -> Self {
+        Self {
+            tokens: Self::PER_SEC,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let refill = now.duration_since(self.last).as_secs_f64() * Self::PER_SEC;
+        self.tokens = (self.tokens + refill).min(Self::PER_SEC);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Which concrete dialer the forwarder is wired with — the anti-leak gate's only output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DialerChoice {
@@ -248,9 +279,13 @@ impl kameo::Actor for ForwarderActor {
         // it can't be answered safely) and never reaches the netstack, whose wildcard listeners
         // would otherwise accept it. IPv4 goes through the port gate in all-port mode.
         joinset.spawn(async move {
+            let mut reject_budget = RejectBudget::new();
             let admit = |b: &[u8]| {
                 if b.first().is_some_and(|v| v >> 4 == 6) {
-                    if let Some(reply) = ts_forwarder::reject_ipv6(b)
+                    // Replies skip the bounded netstack ingress, so cap their rate; over budget the
+                    // packet is still consumed, just not answered.
+                    if reject_budget.take()
+                        && let Some(reply) = ts_forwarder::reject_ipv6(b)
                         && reject_up.send(vec![reply.into()]).is_err()
                     {
                         tracing::debug!("dataplane gone; IPv6 rejection not sent");
@@ -306,6 +341,14 @@ impl ForwarderActor {
 
 #[cfg(test)]
 mod tests {
+    /// The IPv6 rejection budget allows a burst of `PER_SEC`, then refuses until it refills.
+    #[test]
+    fn reject_budget_caps_burst() {
+        let mut b = super::RejectBudget::new();
+        let allowed = (0..3000).filter(|_| b.take()).count();
+        assert!((1000..1010).contains(&allowed), "allowed {allowed}");
+    }
+
     use super::*;
     use crate::env::ForwarderConfig;
 
