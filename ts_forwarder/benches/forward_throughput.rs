@@ -8,7 +8,9 @@
 //! the peer's path latency (the forwarder's own egress leg stays on loopback).
 //!
 //! ```sh
-//! `TCP_BUF_KB` overrides the per-direction netstack TCP buffer (both stacks).
+//! `FWD_MODE` picks how the forwarder takes ports: `ports` (default; an explicit listener on the
+//! server's port), `raw` (all-port, raw-socket observer) or `gated` (all-port behind the ingress
+//! `PortGate`, what the runtime runs). `TCP_BUF_KB` overrides the per-direction netstack TCP buffer (both stacks).
 //!
 //! RTT_MS=40 cargo bench -p geiserx_ts_forwarder --bench forward_throughput -- [secs] [flows] [up|down]
 //! ```
@@ -20,9 +22,11 @@ use std::{
 };
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use ts_forwarder::{DialError, DialedUdp, FlowClass, Forwarder, HostExitDialer, RealDialer, RouteTable};
+use ts_forwarder::{
+    DialError, DialedUdp, FlowClass, Forwarder, HostExitDialer, RealDialer, RouteTable,
+};
 use ts_netstack_smoltcp::{
-    CreateSocket, Netstack, WakingPipe, WakingPipeDev, WakingPipeReceiver, WakingPipeSender,
+    CreateSocket, Netstack, WakingPipe, WakingPipeDev, WakingPipeReceiver,
     netcore::{self, Channel, HasChannel, NetstackControl, smoltcp},
 };
 
@@ -33,20 +37,29 @@ const CHUNK: usize = 64 * 1024;
 /// Bytes the loopback server actually received (`up`), to cross-check the sender-side count.
 static SERVER_RX: AtomicU64 = AtomicU64::new(0);
 
-/// Forward packets from `rx` to `tx`, each delivered `delay` after it was received.
-fn spawn_delay(mut rx: WakingPipeReceiver, tx: WakingPipeSender, delay: Duration) {
+/// Relay packets from `rx` to `deliver`, each delivered `delay` after it was received.
+fn spawn_relay(
+    mut rx: WakingPipeReceiver,
+    deliver: impl Fn(&[u8]) + Send + 'static,
+    delay: Duration,
+) {
     let (q_tx, mut q_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(pkt) = rx.recv_async().await {
-            if q_tx.send((tokio::time::Instant::now() + delay, pkt)).is_err() {
+            if q_tx
+                .send((tokio::time::Instant::now() + delay, pkt))
+                .is_err()
+            {
                 return;
             }
         }
     });
     tokio::spawn(async move {
         while let Some((due, pkt)) = q_rx.recv().await {
-            tokio::time::sleep_until(due).await;
-            tx.send_async(&pkt).await;
+            if !delay.is_zero() {
+                tokio::time::sleep_until(due).await;
+            }
+            deliver(&pkt);
         }
     });
 }
@@ -69,7 +82,20 @@ impl RealDialer for LoopbackInternetDialer {
     }
 }
 
-async fn spawn_pair(rtt: Duration, tcp_buf: Option<usize>) -> (Channel, Channel) {
+/// How the forwarder takes ports.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mode {
+    /// An explicit listener on the server's port.
+    Ports,
+    /// All-port, raw-socket observer.
+    Raw,
+    /// All-port, ingress port gate (what the runtime uses).
+    Gated,
+}
+
+/// Peer netstack <-> relay (delay, and the gate in `Gated` mode) <-> forwarder. Returns the peer's
+/// channel.
+async fn spawn_forwarder(rtt: Duration, tcp_buf: Option<usize>, mode: Mode, port: u16) -> Channel {
     let mut config = netcore::Config {
         mtu: OVERLAY_MTU,
         ..netcore::Config::default()
@@ -77,31 +103,73 @@ async fn spawn_pair(rtt: Duration, tcp_buf: Option<usize>) -> (Channel, Channel)
     if let Some(b) = tcp_buf {
         config.tcp_buffer_size = b;
     }
-    let (p1, p2) = if rtt.is_zero() {
-        WakingPipe::new(None)
-    } else {
-        let (p1, a) = WakingPipe::new(None);
-        let (b, p2) = WakingPipe::new(None);
-        spawn_delay(a.rx, b.tx, rtt / 2);
-        spawn_delay(b.rx, a.tx, rtt / 2);
-        (p1, p2)
-    };
+    let (p1, a) = WakingPipe::new(None);
+    let (b, p2) = WakingPipe::new(None);
     let dev = |pipe| WakingPipeDev {
         pipe,
         mtu: OVERLAY_MTU,
         medium: smoltcp::phy::Medium::Ip,
     };
-
     let mut peer = Netstack::new(dev(p1), config.clone());
     let mut fwd = Netstack::new(dev(p2), config);
     let peer_ch = peer.command_channel();
     let fwd_ch = fwd.command_channel();
     tokio::spawn(async move { peer.run_tokio().await });
     tokio::spawn(async move { fwd.run_tokio().await });
-
     peer_ch.set_ips([PEER_IP.into()]).await.unwrap();
     fwd_ch.set_any_ip(true).await.unwrap();
-    (peer_ch, fwd_ch)
+
+    let routes = RouteTable::new(["0.0.0.0/0".parse().unwrap()]);
+    let into_fwd = b.tx.clone();
+    let (forwarder, gate) = match mode {
+        Mode::Ports => (
+            Forwarder::new(fwd_ch, routes, LoopbackInternetDialer, vec![port], vec![]),
+            None,
+        ),
+        Mode::Raw => (
+            Forwarder::all_ports(fwd_ch, routes, LoopbackInternetDialer),
+            None,
+        ),
+        Mode::Gated => {
+            let (f, g) = Forwarder::all_ports_gated(
+                fwd_ch,
+                routes,
+                LoopbackInternetDialer,
+                into_fwd.clone(),
+            );
+            (f, Some(g))
+        }
+    };
+    tokio::spawn(async move {
+        let _ = forwarder.run().await;
+    });
+
+    let half = rtt / 2;
+    match gate {
+        Some(gate) => spawn_relay(
+            a.rx,
+            move |p| {
+                let _ = gate.ingress(p);
+            },
+            half,
+        ),
+        None => spawn_relay(
+            a.rx,
+            move |p| {
+                let _ = into_fwd.try_send(p);
+            },
+            half,
+        ),
+    }
+    let to_peer = a.tx;
+    spawn_relay(
+        b.rx,
+        move |p| {
+            let _ = to_peer.try_send(p);
+        },
+        half,
+    );
+    peer_ch
 }
 
 /// Loopback server: in `up` mode it discards, in `down` mode it streams zeros.
@@ -136,28 +204,49 @@ async fn spawn_server(down: bool) -> SocketAddr {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--bench").collect();
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != "--bench")
+        .collect();
     let secs: f64 = args.first().and_then(|a| a.parse().ok()).unwrap_or(5.0);
     let flows: u16 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(1);
     let down = args.get(2).is_some_and(|a| a == "down");
 
-    let rtt_ms: u64 = std::env::var("RTT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let rtt_ms: u64 = std::env::var("RTT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
-    let tcp_buf_kb: Option<usize> = std::env::var("TCP_BUF_KB").ok().and_then(|v| v.parse().ok());
+    let tcp_buf_kb: Option<usize> = std::env::var("TCP_BUF_KB")
+        .ok()
+        .and_then(|v| v.parse().ok());
+
+    let mode = match std::env::var("FWD_MODE").as_deref() {
+        Ok("raw") => Mode::Raw,
+        Ok("gated") => Mode::Gated,
+        _ => Mode::Ports,
+    };
 
     let server = spawn_server(down).await;
-    let (peer_ch, fwd_ch) =
-        spawn_pair(Duration::from_millis(rtt_ms), tcp_buf_kb.map(|k| k * 1024)).await;
-    let forwarder = Forwarder::new(
-        fwd_ch,
-        RouteTable::new(["0.0.0.0/0".parse().unwrap()]),
-        LoopbackInternetDialer,
-        vec![server.port()],
-        vec![],
-    );
-    tokio::spawn(async move {
-        let _ = forwarder.run().await;
+    let peer_ch = spawn_forwarder(
+        Duration::from_millis(rtt_ms),
+        tcp_buf_kb.map(|k| k * 1024),
+        mode,
+        server.port(),
+    )
+    .await;
+
+    // The first connect goes to a cold port: in `raw` mode its SYN is lost and the connect waits
+    // for a retransmit; in `gated` mode it is held for the new listener.
+    let started = Instant::now();
+    let first = SocketAddr::new(PEER_IP.into(), 9_999);
+    drop(loop {
+        match peer_ch.tcp_connect(first, server).await {
+            Ok(s) => break s,
+            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
     });
+    let cold_connect_ms = started.elapsed().as_secs_f64() * 1e3;
 
     let deadline = Instant::now() + Duration::from_secs_f64(secs);
     let mut tasks = Vec::new();
@@ -193,7 +282,7 @@ async fn main() {
     let elapsed = start.elapsed().as_secs_f64();
     let mbps = |b: u64| b as f64 * 8.0 / elapsed / 1e6;
     println!(
-        "dir={} rtt_ms={rtt_ms} tcp_buf_kb={} flows={flows} secs={elapsed:.2} mbps={:.1} server_rx_mbps={:.1}",
+        "dir={} mode={mode:?} rtt_ms={rtt_ms} tcp_buf_kb={} flows={flows} secs={elapsed:.2} mbps={:.1} server_rx_mbps={:.1} cold_connect_ms={cold_connect_ms:.0}",
         if down { "down" } else { "up" },
         tcp_buf_kb.map_or("default".to_owned(), |k| k.to_string()),
         mbps(total),
