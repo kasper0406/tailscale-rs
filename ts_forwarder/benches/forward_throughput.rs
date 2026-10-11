@@ -7,13 +7,16 @@
 //! `RTT_MS` inserts a symmetric one-way delay of `RTT_MS / 2` on the overlay pipe, standing in for
 //! the peer's path latency (the forwarder's own egress leg stays on loopback).
 //!
-//! ```sh
 //! `LOSS_PCT` drops that percentage of overlay packets in each direction.
 //!
 //! `FWD_MODE` picks how the forwarder takes ports: `ports` (default; an explicit listener on the
 //! server's port), `raw` (all-port, raw-socket observer) or `gated` (all-port behind the ingress
 //! `PortGate`, what the runtime runs). `TCP_BUF_KB` overrides the per-direction netstack TCP buffer (both stacks).
 //!
+//! `VERIFY_MB` makes this a bounded finite-transfer regression (fails if the byte target is
+//! not reached within `secs`). Normal measurements also stop at `secs`, including stalled I/O.
+//!
+//! ```sh
 //! RTT_MS=40 cargo bench -p geiserx_ts_forwarder --bench forward_throughput -- [secs] [flows] [up|down]
 //! ```
 
@@ -273,49 +276,83 @@ async fn main() {
     // for a retransmit; in `gated` mode it is held for the new listener.
     let started = Instant::now();
     let first = SocketAddr::new(PEER_IP.into(), 9_999);
-    drop(loop {
-        match peer_ch.tcp_connect(first, server).await {
-            Ok(s) => break s,
-            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
-        }
-    });
+    drop(
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match peer_ch.tcp_connect(first, server).await {
+                    Ok(s) => break s,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                }
+            }
+        })
+        .await
+        .expect("cold connect exceeded 10 seconds"),
+    );
     let cold_connect_ms = started.elapsed().as_secs_f64() * 1e3;
 
-    let deadline = Instant::now() + Duration::from_secs_f64(secs);
+    SERVER_RX.store(0, Ordering::Relaxed);
+    let verify_bytes: Option<u64> = std::env::var("VERIFY_MB")
+        .ok()
+        .map(|v| v.parse::<u64>().expect("VERIFY_MB must be an integer") * 1024 * 1024);
+    let start = Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(secs);
     let mut tasks = Vec::new();
     for i in 0..flows {
         let peer_ch = peer_ch.clone();
         tasks.push(tokio::spawn(async move {
             let local = SocketAddr::new(PEER_IP.into(), 10_000 + i);
-            let mut s = loop {
-                match peer_ch.tcp_connect(local, server).await {
-                    Ok(s) => break s,
-                    Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            let mut s = tokio::time::timeout_at(deadline, async {
+                loop {
+                    match peer_ch.tcp_connect(local, server).await {
+                        Ok(s) => break s,
+                        Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                    }
                 }
-            };
+            })
+            .await
+            .expect("flow connect exceeded measurement deadline");
             let mut buf = vec![0u8; CHUNK];
             let mut bytes = 0u64;
-            while Instant::now() < deadline {
-                let n = if down {
-                    s.read(&mut buf).await.unwrap()
-                } else {
-                    s.write_all(&buf).await.unwrap();
-                    CHUNK
+            let mut last_progress = Instant::now();
+            while verify_bytes.is_none_or(|target| bytes < target) {
+                let transfer = async {
+                    if down {
+                        s.read(&mut buf).await
+                    } else {
+                        // Count partial writes too; cancellation of write_all loses that count.
+                        s.write(&buf).await
+                    }
                 };
-                bytes += n as u64;
+                match tokio::time::timeout_at(deadline, transfer).await {
+                    Ok(Ok(n)) if n > 0 => {
+                        bytes += n as u64;
+                        last_progress = Instant::now();
+                    }
+                    Ok(Ok(_)) | Err(_) => break,
+                    Ok(Err(e)) => panic!("transfer failed: {e}"),
+                }
             }
-            bytes
+            if let Some(target) = verify_bytes {
+                assert!(
+                    bytes >= target,
+                    "transfer stalled: {bytes}/{target} bytes; no progress for {:?}",
+                    last_progress.elapsed()
+                );
+            }
+            (bytes, last_progress.elapsed().as_secs_f64())
         }));
     }
-    let start = Instant::now();
     let mut total = 0u64;
+    let mut stalled_secs = 0.0_f64;
     for t in tasks {
-        total += t.await.unwrap();
+        let (bytes, idle) = t.await.unwrap();
+        total += bytes;
+        stalled_secs = stalled_secs.max(idle);
     }
     let elapsed = start.elapsed().as_secs_f64();
     let mbps = |b: u64| b as f64 * 8.0 / elapsed / 1e6;
     println!(
-        "dir={} mode={mode:?} rtt_ms={rtt_ms} loss_pct={loss_pct} tcp_buf_kb={} flows={flows} secs={elapsed:.2} mbps={:.1} server_rx_mbps={:.1} cold_connect_ms={cold_connect_ms:.0}",
+        "dir={} mode={mode:?} rtt_ms={rtt_ms} loss_pct={loss_pct} tcp_buf_kb={} flows={flows} secs={elapsed:.2} mbps={:.1} server_rx_mbps={:.1} cold_connect_ms={cold_connect_ms:.0} stalled_secs={stalled_secs:.2}",
         if down { "down" } else { "up" },
         tcp_buf_kb.map_or("default".to_owned(), |k| k.to_string()),
         mbps(total),
