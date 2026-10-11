@@ -25,3 +25,31 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
 - **D5 Runner.** Use a ~150-line purpose-built runner (`examples/exit_node` on fork branch `ts-exit/runner`) instead of
   `tailscaled-rs`. It needs nothing from the daemon layer (IPC, launchd, persisted prefs), and keeping it in-tree
   reuses the fork's `Cargo.lock`.
+
+- **F4 Codex Phase 1 audit** (`docs/codex-audit-01.md`, verified by Claude where cited below). Five blockers:
+  (1) HostExitDialer had no destination boundary; (2) node-key replacement keeps old WireGuard sessions;
+  (3) IPv4-only advertisement hides the node from official clients; (4) the daemon layer never enables egress;
+  (5) security state travels over a best-effort bus.
+- **F5 Verified (3) in Go**: `tsaddr.ContainsExitRoutes` requires both `0.0.0.0/0` and `::/0`, and
+  `peerStatusFromNode` sets `ExitNodeOption` from it. **D6**: deviate from PLAN Phase 1.7's "do not advertise
+  `::/0` until working". Advertise the pair and reject IPv6 at the forwarder ingress (TCP RST / ICMPv6
+  prohibited), matching what a Go exit node does when its IPv6 dial fails: RST. No enum/opt-out (codex proposed
+  `ExitNodeIpv6::{Reject,Off}`). With rejection unconditional, the knob would guard nothing.
+- **D7 Fixed (1)**: HostExitDialer refuses loopback/RFC1918/link-local/CGNAT/multicast/broadcast/0/8/class-E
+  for exit flows (`a958192`). Stricter than Go, which re-adds the host's own interface IPs.
+- **F6 Cold-port loss**: all-port mode dropped the first SYN/datagram per new destination port (3 s smoltcp,
+  ~1 s iOS RTO) and copied every packet into a raw socket (~27% throughput). **D8**: replace with an ingress
+  `PortGate` (`47d3cd2`), not codex's reinjection/pinning idea. The gate holds the packet until the listener exists
+  and needs no raw socket. Cold connect went from 3,032 ms to 27 ms (1 RTT) in the bench.
+- **F7 Upstream bug**: `WakingPipeReceiver::try_recv` blocked (`6ff66f4`). Latent in production paths.
+- **F8 Window limit**: no TCP autotuning in the smoltcp netstack. One flow ≈ buffer/RTT (35 Mbit/s at 40 ms with the
+  256 KiB default). RSS tracks bytes in flight, not the configured buffer size (BENCHMARKS §1a). **D9**: keep the fork default for
+  the live baseline, A/B 2 MiB and 4 MiB via `--tcp-buffer-size`. That's config, not a code patch, so the Phase 1
+  "no perf patching" gate holds.
+- **D10 UDP idle** (`938bed4`): refresh flows on replies too, use Go's 2 min / 30 s (port 53) timeouts, and don't
+  reap a gated UDP port with live flows.
+- **F9 macOS send path** (`bench/udp-send`): unconnected sendto 7.9 µs/pkt → connected 4.8 → +DF 3.3 →
+  +sendmsg_x 1.9. The fork's magicsock uses unconnected `send_to` per packet, plus one buffer allocation, copy and
+  channel hop per received packet. Phase 3A/3B target, after the live baseline.
+- **Blockers (2) and (5)** remain. Codex sized (2) at ~half a day (patch in progress) and (5) at 1–3 days.
+  Until fixed they're documented limitations, mitigated by a tailnet where the only exit-node users are your own devices.
