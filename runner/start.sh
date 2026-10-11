@@ -9,9 +9,13 @@ if [[ -f $TS_EXIT_PIDFILE ]] && kill -0 $(cat $TS_EXIT_PIDFILE) 2>/dev/null; the
   echo "already running (pid $(cat $TS_EXIT_PIDFILE))"; exit 1
 fi
 [[ -x $TS_EXIT_BIN ]] || { echo "not built: run build.sh"; exit 1; }
-args=(--state-dir $TS_EXIT_STATE --hostname $TS_EXIT_HOSTNAME --tag $TS_EXIT_TAG --port $TS_EXIT_PORT)
-# The key is only needed until the identity in the state dir is registered.
-[[ -f $TS_EXIT_STATE/keys.json ]] || args+=(--auth-key-file $TS_EXIT_KEYFILE)
+args=(--state-dir $TS_EXIT_STATE --hostname $TS_EXIT_HOSTNAME --port $TS_EXIT_PORT)
+[[ -n $TS_EXIT_TAG ]] && args+=(--tag $TS_EXIT_TAG)
+# The key is only needed until the identity in the state dir is registered. Without a key file,
+# log in interactively: the log shows a URL to approve in a browser (node owned by your user).
+if [[ ! -f $TS_EXIT_STATE/keys.json ]]; then
+  if [[ -f $TS_EXIT_KEYFILE ]]; then args+=(--auth-key-file $TS_EXIT_KEYFILE); else args+=(--interactive); fi
+fi
 TS_RS_EXPERIMENT=this_is_unstable_software RUST_LOG=${RUST_LOG:-info} \
   nohup $TS_EXIT_BIN "${args[@]}" "$@" >> $TS_EXIT_LOG 2>&1 &
 echo $! > $TS_EXIT_PIDFILE
