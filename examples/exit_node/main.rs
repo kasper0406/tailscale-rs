@@ -21,7 +21,7 @@
 use std::{error::Error, path::PathBuf, time::Duration};
 
 use clap::Parser;
-use tailscale::{Config, Device, config::BadFormatBehavior};
+use tailscale::{Config, Device, RegistrationError, config::BadFormatBehavior};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::filter::LevelFilter;
 
@@ -112,24 +112,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let dev = Device::new(&config, auth_key).await?;
-    let wait = if args.interactive { 3600 } else { 90 };
-    {
-        let running = dev.wait_until_running(Some(Duration::from_secs(wait)));
-        tokio::pin!(running);
-        let mut poll = tokio::time::interval(Duration::from_secs(1));
-        let mut shown = None;
-        loop {
-            tokio::select! {
-                res = &mut running => { res?; break; }
-                _ = poll.tick(), if args.interactive => {
-                    if let Ok(Some(url)) = dev.pop_browser_url().await
-                        && shown.as_ref() != Some(&url)
-                    {
-                        tracing::info!(%url, "open this URL to log the node in");
-                        shown = Some(url);
-                    }
+    // Interactive login: `wait_until_running` reports `NeedsLogin(url)` right away rather than
+    // waiting, so show the URL and keep waiting until it is approved (or the hour runs out).
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(if args.interactive { 3600 } else { 90 });
+    let mut shown = None;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match dev.wait_until_running(Some(left)).await {
+            Ok(()) => break,
+            Err(RegistrationError::NeedsLogin(url)) if args.interactive && !left.is_zero() => {
+                if shown.as_ref() != Some(&url) {
+                    tracing::info!(%url, "open this URL to log the node in");
+                    shown = Some(url);
                 }
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
+            Err(e) => return Err(e.into()),
         }
     }
     let (v4, v6) = dev.tailscale_ips().await?;
