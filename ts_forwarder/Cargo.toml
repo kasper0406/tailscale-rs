@@ -26,3 +26,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "tim
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+
+[[bench]]
+name = "forward_throughput"
+harness = false
