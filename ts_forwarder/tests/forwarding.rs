@@ -501,7 +501,13 @@ async fn exit_node_flow_to_loopback_is_refused_under_host_exit_dialer() {
     let (peer_ch, fwd_ch) = spawn_pair().await;
 
     let routes = RouteTable::new(["0.0.0.0/0".parse().unwrap()]);
-    let forwarder = Forwarder::new(fwd_ch, routes, HostExitDialer, vec![sink_addr.port()], vec![]);
+    let forwarder = Forwarder::new(
+        fwd_ch,
+        routes,
+        HostExitDialer,
+        vec![sink_addr.port()],
+        vec![],
+    );
     tokio::spawn(async move {
         let _ = forwarder.run().await;
     });
@@ -734,4 +740,130 @@ async fn udp_exit_node_flow_is_dropped_under_direct_dialer() {
         0,
         "DirectDialer must never egress an exit-node UDP flow (anti-leak)"
     );
+}
+
+/// Spawn a peer netstack and a gated all-port forwarder: every packet the peer sends is offered
+/// to the forwarder's [`PortGate`] (as the runtime's ingress pump does) instead of being written to
+/// the forwarder netstack directly. Returns the peer's channel.
+async fn spawn_gated_forwarder<D: RealDialer>(routes: RouteTable, dialer: D) -> Channel {
+    let config = netcore::Config::default();
+    let (peer_pipe, mut from_peer) = WakingPipe::new(None);
+    let (mut to_fwd, fwd_pipe) = WakingPipe::new(None);
+    let dev = |pipe| WakingPipeDev {
+        pipe,
+        mtu: 1500,
+        medium: smoltcp::phy::Medium::Ip,
+    };
+    let mut peer = Netstack::new(dev(peer_pipe), config.clone());
+    let mut fwd = Netstack::new(dev(fwd_pipe), config);
+    let peer_ch = peer.command_channel();
+    let fwd_ch = fwd.command_channel();
+    tokio::spawn(async move { peer.run_tokio().await });
+    tokio::spawn(async move { fwd.run_tokio().await });
+    peer_ch.set_ips([PEER_IP.into()]).await.unwrap();
+    fwd_ch.set_any_ip(true).await.unwrap();
+
+    let (forwarder, gate) = Forwarder::all_ports_gated(fwd_ch, routes, dialer, to_fwd.tx.clone());
+    tokio::spawn(async move {
+        let _ = forwarder.run().await;
+    });
+
+    // Peer -> gate -> forwarder netstack.
+    tokio::spawn(async move {
+        while let Some(p) = from_peer.rx.recv_async().await {
+            gate.ingress(&p);
+        }
+    });
+    // Forwarder netstack -> peer.
+    let to_peer = from_peer.tx.clone();
+    tokio::spawn(async move {
+        while let Some(p) = to_fwd.rx.recv_async().await {
+            to_peer.send_async(&p).await;
+        }
+    });
+    peer_ch
+}
+
+/// Gated all-port mode: the very first SYN to a cold port is held until the port's listener is
+/// up and then accepted, so the connection completes without waiting for a SYN retransmit
+/// (smoltcp's, like most clients', is ~1 s). The raw-observer mode loses that SYN.
+#[tokio::test]
+async fn gated_all_ports_accepts_first_syn_to_cold_port() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let echo_addr = spawn_echo().await;
+    let peer_ch = spawn_gated_forwarder(
+        RouteTable::new(["127.0.0.0/8".parse().unwrap()]),
+        DirectDialer,
+    )
+    .await;
+
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let start = std::time::Instant::now();
+    // A single connect attempt: no retry loop, so a lost first SYN shows up as latency or failure.
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(10),
+        peer_ch.tcp_connect(peer_local, echo_addr),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect to a cold port must succeed on the first attempt");
+    let connect = start.elapsed();
+    assert!(
+        connect < Duration::from_millis(500),
+        "cold-port connect took {connect:?}: the first SYN was not held for the new listener"
+    );
+
+    client.write_all(b"gated hello").await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(60), client.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .unwrap();
+    assert_eq!(&buf[..n], b"gated hello");
+}
+
+/// Gated all-port mode, UDP: the first datagram to a cold port is answered (a DNS query or QUIC
+/// Initial must not be lost to listener creation).
+#[tokio::test]
+async fn gated_all_ports_answers_first_datagram_to_cold_port() {
+    let echo_addr = spawn_udp_echo().await;
+    let peer_ch = spawn_gated_forwarder(
+        RouteTable::new(["127.0.0.0/8".parse().unwrap()]),
+        DirectDialer,
+    )
+    .await;
+
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let peer_sock: OverlayUdpSocket = peer_ch.udp_bind(peer_local).await.unwrap();
+    peer_sock.send_to(echo_addr, b"first").await.unwrap();
+
+    // Exactly one send: the reply must come back without a retransmit.
+    let mut buf = [0u8; 64];
+    let (remote, n) = tokio::time::timeout(Duration::from_secs(10), peer_sock.recv_from(&mut buf))
+        .await
+        .expect("first datagram to a cold port was lost")
+        .unwrap();
+    assert_eq!(&buf[..n], b"first");
+    assert_eq!(remote, echo_addr);
+}
+
+/// Gating does not open an anti-leak hole: an exit-node flow under `DirectDialer` is still dropped
+/// at dial time, and many parallel cold SYNs to one port open exactly one listener's worth of flows.
+#[tokio::test]
+async fn gated_all_ports_still_drops_exit_node_flow_under_direct_dialer() {
+    use tokio::io::AsyncWriteExt;
+
+    let (sink_addr, dial_count) = spawn_counting_sink().await;
+    let peer_ch = spawn_gated_forwarder(
+        RouteTable::new(["0.0.0.0/0".parse().unwrap()]),
+        DirectDialer,
+    )
+    .await;
+
+    let peer_local = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let mut client = connect_with_retry(&peer_ch, peer_local, sink_addr).await;
+    client.write_all(b"leak attempt").await.ok();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(dial_count.load(Ordering::SeqCst), 0);
 }

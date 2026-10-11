@@ -77,10 +77,14 @@ pub(crate) async fn run_udp_port<D: RealDialer>(
     routes: tokio::sync::watch::Receiver<RouteTable>,
     dialer: Arc<D>,
     global_flows: Option<Arc<Semaphore>>,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), ts_netstack_smoltcp::netcore::Error> {
     let bind_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port);
     let overlay = Arc::new(channel.udp_bind(bind_addr).await?);
     tracing::debug!(%port, "udp forwarder listening");
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
 
     let mut flows: HashMap<(SocketAddr, SocketAddr), FlowState> = HashMap::new();
     let mut reap = tokio::time::interval(UDP_REAP_INTERVAL);

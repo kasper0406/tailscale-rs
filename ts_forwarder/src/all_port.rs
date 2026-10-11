@@ -42,7 +42,13 @@ use ts_netstack_smoltcp::{
     },
 };
 
-use crate::{class::RouteTable, dialer::RealDialer, tcp::run_tcp_port, udp::run_udp_port};
+use crate::{
+    class::RouteTable,
+    dialer::RealDialer,
+    port_gate::{OpenRequests, PortGate, Proto},
+    tcp::run_tcp_port,
+    udp::run_udp_port,
+};
 
 /// Maximum number of distinct ports that may have a live on-demand listener at once.
 ///
@@ -50,7 +56,7 @@ use crate::{class::RouteTable, dialer::RealDialer, tcp::run_tcp_port, udp::run_u
 /// tasks + netstack sockets (remote FD/memory-exhaustion DoS). Once this many ports are active,
 /// SYNs/datagrams to *new* ports are dropped (no listener spawned) until a port is evicted.
 /// Dropping an over-cap port is fail-closed: nothing is dialed.
-const MAX_PORTS: usize = 1024;
+pub(crate) const MAX_PORTS: usize = 1024;
 
 /// How long an on-demand per-port listener may go without any observed inbound packet before it
 /// is reaped (its task aborted and the port freed so a later packet can re-trigger it). Bounds
@@ -145,7 +151,7 @@ pub(crate) async fn run_tcp_all_ports<D: RealDialer>(
                 let global_inflight = global_inflight.clone();
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        run_tcp_port(channel, port, routes, dialer, Some(global_inflight)).await
+                        run_tcp_port(channel, port, routes, dialer, Some(global_inflight), None).await
                     {
                         // Listener bind/accept error: free the port so a retransmit re-triggers it.
                         tracing::warn!(%port, error = %e, "all-port tcp listener exited");
@@ -217,7 +223,7 @@ pub(crate) async fn run_udp_all_ports<D: RealDialer>(
                 let global_flows = global_flows.clone();
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        run_udp_port(channel, port, routes, dialer, Some(global_flows)).await
+                        run_udp_port(channel, port, routes, dialer, Some(global_flows), None).await
                     {
                         // Relay bind error: free the port so a later datagram re-triggers it.
                         tracing::warn!(%port, error = %e, "all-port udp relay exited");
@@ -236,6 +242,92 @@ pub(crate) async fn run_udp_all_ports<D: RealDialer>(
                 let reaped = before - ports.len();
                 if reaped > 0 {
                     tracing::debug!(reaped, "all-port: reaped idle udp relays");
+                }
+            }
+        }
+    }
+}
+
+/// Run the gated all-port manager: open a per-port listener for each port the [`PortGate`] asks
+/// for, tell the gate once it is registered (releasing the held packets), and close idle ports.
+///
+/// Serves TCP and UDP together. The active-port cap ([`MAX_PORTS`]) and the global flow caps are
+/// the same as in raw-observer mode; the gate enforces the port cap before asking.
+///
+/// Loops until the netstack channel closes.
+pub(crate) async fn run_gated_all_ports<D: RealDialer>(
+    channel: Channel,
+    routes: tokio::sync::watch::Receiver<RouteTable>,
+    dialer: Arc<D>,
+    gate: PortGate,
+    mut requests: OpenRequests,
+) -> Result<(), ts_netstack_smoltcp::netcore::Error> {
+    let global_tcp = Arc::new(Semaphore::new(MAX_GLOBAL_TCP_SPLICES));
+    let global_udp = Arc::new(Semaphore::new(MAX_GLOBAL_UDP_FLOWS));
+
+    // A listener task reports when it is registered and when it exits.
+    enum Event {
+        Ready(Proto, u16),
+        Exited(Proto, u16),
+    }
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let mut ports: HashMap<(Proto, u16), tokio::task::AbortHandle> = HashMap::new();
+    let mut reap = tokio::time::interval(PORT_REAP_INTERVAL);
+    reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            req = requests.0.recv() => {
+                let Some((proto, port)) = req else {
+                    // Every gate handle is gone, so no packet can reach this forwarder again.
+                    return Ok(());
+                };
+                tracing::debug!(?proto, %port, "all-port: opening listener for gated port");
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let (channel, routes, dialer, ev_tx) =
+                    (channel.clone(), routes.clone(), dialer.clone(), ev_tx.clone());
+                let (global_tcp, global_udp) = (global_tcp.clone(), global_udp.clone());
+                let handle = tokio::spawn(async move {
+                    let notify = ev_tx.clone();
+                    tokio::spawn(async move {
+                        if ready_rx.await.is_ok() {
+                            let _ = notify.send(Event::Ready(proto, port));
+                        }
+                    });
+                    let res = match proto {
+                        Proto::Tcp => {
+                            run_tcp_port(channel, port, routes, dialer, Some(global_tcp), Some(ready_tx)).await
+                        }
+                        Proto::Udp => {
+                            run_udp_port(channel, port, routes, dialer, Some(global_udp), Some(ready_tx)).await
+                        }
+                    };
+                    if let Err(e) = res {
+                        tracing::warn!(?proto, %port, error = %e, "all-port listener exited");
+                    }
+                    let _ = ev_tx.send(Event::Exited(proto, port));
+                })
+                .abort_handle();
+                if let Some(old) = ports.insert((proto, port), handle) {
+                    old.abort();
+                }
+            }
+            Some(ev) = ev_rx.recv() => match ev {
+                Event::Ready(proto, port) => gate.mark_open(proto, port),
+                Event::Exited(proto, port) => {
+                    ports.remove(&(proto, port));
+                    gate.close(proto, port);
+                }
+            },
+            _ = reap.tick() => {
+                for (proto, port) in gate.idle_ports(PORT_IDLE) {
+                    // Close in the gate first so a new flow re-opens the port rather than racing
+                    // the listener's teardown.
+                    gate.close(proto, port);
+                    if let Some(h) = ports.remove(&(proto, port)) {
+                        h.abort();
+                    }
+                    tracing::debug!(?proto, %port, "all-port: reaped idle gated port");
                 }
             }
         }
