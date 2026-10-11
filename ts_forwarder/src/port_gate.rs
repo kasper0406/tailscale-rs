@@ -47,19 +47,30 @@ const MAX_HELD_PER_PORT: usize = 32;
 /// Max bytes held across all opening ports. Bounds what a port sweep can pin in the gate.
 const MAX_HELD_BYTES: usize = 1 << 20;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Closed,
+    /// A listener is being started; initiating packets are held.
     Opening,
+    /// The listener is registered; everything passes.
     Open,
+    /// The listener is being torn down (idle reap or open timeout); initiating packets are held
+    /// and re-open the port once teardown completes.
+    Closing,
 }
 
 #[derive(Clone, Copy)]
 struct Slot {
     state: State,
-    /// Last packet seen for this port, in seconds since the gate's epoch.
+    /// Listener generation this slot's state refers to. Every open bumps it, so events from an
+    /// earlier listener on the same port are recognized as stale and ignored.
+    generation: u32,
+    /// Last packet seen for this port (or when it started opening), in seconds since the epoch.
     last: u32,
 }
+
+/// One port's listener generation: what the manager is asked to open and reports back about.
+pub(crate) type PortRef = (Proto, u16, u32);
 
 struct Inner {
     ingress: WakingPipeSender,
@@ -68,10 +79,11 @@ struct Inner {
     udp: Vec<Slot>,
     held: HashMap<(Proto, u16), Vec<Vec<u8>>>,
     held_bytes: usize,
-    /// Ports that are opening or open, across both protocols.
+    next_generation: u32,
+    /// Ports that are opening, open or closing, across both protocols.
     active: usize,
     max_active: usize,
-    open_requests: tokio::sync::mpsc::UnboundedSender<(Proto, u16)>,
+    open_requests: tokio::sync::mpsc::UnboundedSender<PortRef>,
 }
 
 /// What the gate did with a packet.
@@ -94,15 +106,16 @@ pub struct PortGate {
 }
 
 /// The manager side of a [`PortGate`]: open requests to serve.
-pub(crate) struct OpenRequests(pub(crate) tokio::sync::mpsc::UnboundedReceiver<(Proto, u16)>);
+pub(crate) struct OpenRequests(pub(crate) tokio::sync::mpsc::UnboundedReceiver<PortRef>);
 
 impl PortGate {
     /// A gate feeding `ingress` (the forwarder netstack's ingress queue), allowing at most
-    /// `max_active` ports (TCP and UDP together) to be opening or open at once.
+    /// `max_active` ports (TCP and UDP together) to be opening, open or closing at once.
     pub(crate) fn new(ingress: WakingPipeSender, max_active: usize) -> (Self, OpenRequests) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let closed = Slot {
             state: State::Closed,
+            generation: 0,
             last: 0,
         };
         let inner = Inner {
@@ -112,6 +125,7 @@ impl PortGate {
             udp: vec![closed; 1 << 16],
             held: HashMap::new(),
             held_bytes: 0,
+            next_generation: 1,
             active: 0,
             max_active,
             open_requests: tx,
@@ -124,9 +138,13 @@ impl PortGate {
         )
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Offer one inbound packet to the forwarder netstack.
     pub fn ingress(&self, packet: &[u8]) -> Admit {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.lock();
 
         let Some((proto, port, initiating)) = classify(packet) else {
             return inner.pass(packet);
@@ -138,9 +156,9 @@ impl PortGate {
                 slot.last = now;
                 inner.pass(packet)
             }
-            State::Opening => inner.hold(proto, port, packet),
-            State::Closed if !initiating => inner.pass(packet),
-            State::Closed => {
+            State::Opening | State::Closing if initiating => inner.hold(proto, port, packet),
+            State::Opening | State::Closing | State::Closed if !initiating => inner.pass(packet),
+            _ => {
                 if inner.active >= inner.max_active {
                     tracing::debug!(?proto, %port, "port gate: at max active ports; dropping");
                     return Admit::Dropped;
@@ -148,65 +166,100 @@ impl PortGate {
                 if inner.held_bytes + packet.len() > MAX_HELD_BYTES {
                     return Admit::Dropped;
                 }
-                if inner.open_requests.send((proto, port)).is_err() {
-                    // Manager gone: nothing will ever open the port.
+                let Some(generation) = inner.request_open(proto, port, now) else {
                     return Admit::Dropped;
-                }
+                };
                 inner.active += 1;
-                let slot = &mut inner.slots(proto)[port as usize];
-                slot.state = State::Opening;
-                slot.last = now;
+                tracing::trace!(?proto, %port, generation, "port gate: opening");
                 inner.hold(proto, port, packet)
             }
         }
     }
 
-    /// The listener for `port` is registered: release its held packets, then open the port.
+    /// Listener `port_ref` is registered: release its held packets, then open the port. Ignored
+    /// unless that exact generation is still opening.
     ///
     /// Releasing under the lock keeps ordering: anything arriving meanwhile waits and is passed
-    /// after the held packets.
-    pub(crate) fn mark_open(&self, proto: Proto, port: u16) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.slots(proto)[port as usize].state != State::Opening {
-            return;
+    /// after the held packets. Returns how many held packets the ingress queue refused.
+    pub(crate) fn mark_open(&self, (proto, port, generation): PortRef) -> usize {
+        let mut inner = self.lock();
+        let slot = inner.slots(proto)[port as usize];
+        if slot.state != State::Opening || slot.generation != generation {
+            return 0;
         }
-        let held = inner.held.remove(&(proto, port)).unwrap_or_default();
-        for p in &held {
-            inner.held_bytes -= p.len();
-            inner.ingress.try_send(p);
-        }
-        inner.slots(proto)[port as usize].state = State::Open;
-        tracing::debug!(?proto, %port, released = held.len(), "port gate: open");
+        let held = inner.take_held(proto, port);
+        let refused = held.iter().filter(|p| !inner.ingress.try_send(p)).count();
+        let now = inner.now();
+        let slot = &mut inner.slots(proto)[port as usize];
+        slot.state = State::Open;
+        slot.last = now;
+        tracing::debug!(?proto, %port, generation, released = held.len(), refused, "port gate: open");
+        refused
     }
 
-    /// The listener for `port` is gone (failed, evicted or exited): close the port and drop
-    /// anything still held for it, so the next initiating packet re-opens it.
-    pub(crate) fn close(&self, proto: Proto, port: u16) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.slots(proto)[port as usize].state == State::Closed {
-            return;
+    /// Listener `port_ref` has ended (exited, failed, panicked or was aborted). Ignored unless it
+    /// is the port's current generation. If the port was closing and packets arrived meanwhile, it
+    /// re-opens right away with a new generation, returned for the manager to start; otherwise the
+    /// port closes and anything still held for it is dropped.
+    pub(crate) fn listener_ended(&self, (proto, port, generation): PortRef) -> Option<PortRef> {
+        let mut inner = self.lock();
+        let slot = inner.slots(proto)[port as usize];
+        if slot.state == State::Closed || slot.generation != generation {
+            return None;
         }
-        if let Some(held) = inner.held.remove(&(proto, port)) {
-            inner.held_bytes -= held.iter().map(Vec::len).sum::<usize>();
+        let has_held = inner
+            .held
+            .get(&(proto, port))
+            .is_some_and(|h| !h.is_empty());
+        if slot.state == State::Closing && has_held {
+            let now = inner.now();
+            let new_generation = inner.bump_generation();
+            let slot = &mut inner.slots(proto)[port as usize];
+            slot.state = State::Opening;
+            slot.generation = new_generation;
+            slot.last = now;
+            return Some((proto, port, new_generation));
         }
+        inner.take_held(proto, port);
         inner.slots(proto)[port as usize].state = State::Closed;
         inner.active -= 1;
+        None
     }
 
-    /// Open ports that have seen no packet for at least `idle`.
-    pub(crate) fn idle_ports(&self, idle: Duration) -> Vec<(Proto, u16)> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+    /// Claim the listeners to tear down, moving each to `Closing` atomically with the check: open
+    /// ports idle for at least `idle` (and not `busy`), and ports stuck opening for at least
+    /// `open_timeout`, whose held packets are dropped. The manager aborts each returned
+    /// generation and reports it back through [`listener_ended`](Self::listener_ended).
+    pub(crate) fn claim_for_teardown(
+        &self,
+        idle: Duration,
+        open_timeout: Duration,
+        busy: impl Fn(Proto, u16) -> bool,
+    ) -> Vec<PortRef> {
+        let mut inner = self.lock();
         let now = inner.now();
-        let idle = u32::try_from(idle.as_secs()).unwrap_or(u32::MAX);
-        let mut out = Vec::new();
-        for (proto, slots) in [(Proto::Tcp, &inner.tcp), (Proto::Udp, &inner.udp)] {
-            for (port, s) in slots.iter().enumerate() {
-                if s.state == State::Open && now.saturating_sub(s.last) >= idle {
-                    out.push((proto, port as u16));
+        let secs = |d: Duration| u32::try_from(d.as_secs()).unwrap_or(u32::MAX);
+        let (idle, open_timeout) = (secs(idle), secs(open_timeout));
+        let mut claimed = Vec::new();
+        let mut stale_opening = Vec::new();
+        for proto in [Proto::Tcp, Proto::Udp] {
+            for (port, slot) in inner.slots(proto).iter_mut().enumerate() {
+                let port = port as u16;
+                let age = now.saturating_sub(slot.last);
+                match slot.state {
+                    State::Open if age >= idle && !busy(proto, port) => {}
+                    State::Opening if age >= open_timeout => stale_opening.push((proto, port)),
+                    _ => continue,
                 }
+                slot.state = State::Closing;
+                claimed.push((proto, port, slot.generation));
             }
         }
-        out
+        for (proto, port) in stale_opening {
+            tracing::warn!(?proto, %port, "port gate: listener never came up; dropping held packets");
+            inner.take_held(proto, port);
+        }
+        claimed
     }
 }
 
@@ -220,6 +273,30 @@ impl Inner {
             Proto::Tcp => &mut self.tcp,
             Proto::Udp => &mut self.udp,
         }
+    }
+
+    fn bump_generation(&mut self) -> u32 {
+        let g = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        g
+    }
+
+    /// Move a closed port to `Opening` under a new generation and ask the manager to open it.
+    fn request_open(&mut self, proto: Proto, port: u16, now: u32) -> Option<u32> {
+        let generation = self.bump_generation();
+        // Manager gone: nothing will ever open the port.
+        self.open_requests.send((proto, port, generation)).ok()?;
+        let slot = &mut self.slots(proto)[port as usize];
+        slot.state = State::Opening;
+        slot.generation = generation;
+        slot.last = now;
+        Some(generation)
+    }
+
+    fn take_held(&mut self, proto: Proto, port: u16) -> Vec<Vec<u8>> {
+        let held = self.held.remove(&(proto, port)).unwrap_or_default();
+        self.held_bytes -= held.iter().map(Vec::len).sum::<usize>();
+        held
     }
 
     fn pass(&self, packet: &[u8]) -> Admit {
@@ -314,6 +391,10 @@ mod tests {
         std::iter::from_fn(|| rx.rx.try_recv().map(|b| b.to_vec())).collect()
     }
 
+    fn never_busy(_: Proto, _: u16) -> bool {
+        false
+    }
+
     #[test]
     fn cold_syn_is_held_then_released_in_order() {
         let (g, mut reqs, mut ns) = gate(16);
@@ -323,11 +404,12 @@ mod tests {
         assert_eq!(g.ingress(&syn1), Admit::Held);
         assert_eq!(g.ingress(&syn2), Admit::Held);
         // Exactly one open request for the port, however many SYNs raced it.
-        assert_eq!(reqs.0.try_recv().unwrap(), (Proto::Tcp, 443));
+        let r = reqs.0.try_recv().unwrap();
+        assert_eq!((r.0, r.1), (Proto::Tcp, 443));
         assert!(reqs.0.try_recv().is_err());
         assert!(drain(&mut ns).is_empty());
 
-        g.mark_open(Proto::Tcp, 443);
+        assert_eq!(g.mark_open(r), 0);
         assert_eq!(drain(&mut ns), vec![syn1, syn2]);
 
         let data = tcp(443, false, true);
@@ -340,8 +422,9 @@ mod tests {
         let (g, mut reqs, mut ns) = gate(16);
         let q = udp(53);
         assert_eq!(g.ingress(&q), Admit::Held);
-        assert_eq!(reqs.0.try_recv().unwrap(), (Proto::Udp, 53));
-        g.mark_open(Proto::Udp, 53);
+        let r = reqs.0.try_recv().unwrap();
+        assert_eq!((r.0, r.1), (Proto::Udp, 53));
+        g.mark_open(r);
         assert_eq!(drain(&mut ns), vec![q]);
     }
 
@@ -364,16 +447,130 @@ mod tests {
     }
 
     #[test]
-    fn close_drops_held_and_reopens_on_next_syn() {
+    fn listener_failure_drops_held_and_next_syn_reopens() {
         let (g, mut reqs, mut ns) = gate(16);
         assert_eq!(g.ingress(&tcp(8080, true, false)), Admit::Held);
-        let _ = reqs.0.try_recv();
-        g.close(Proto::Tcp, 8080);
-        // A late mark_open for a closed port releases nothing.
-        g.mark_open(Proto::Tcp, 8080);
+        let r = reqs.0.try_recv().unwrap();
+        assert_eq!(g.listener_ended(r), None);
+        // A late Ready for the failed listener releases nothing.
+        g.mark_open(r);
         assert!(drain(&mut ns).is_empty());
         assert_eq!(g.ingress(&tcp(8080, true, false)), Admit::Held);
-        assert_eq!(reqs.0.try_recv().unwrap(), (Proto::Tcp, 8080));
+        let r2 = reqs.0.try_recv().unwrap();
+        assert_ne!(r2.2, r.2, "a re-open is a new generation");
+    }
+
+    /// Review finding: a delayed Ready from an old listener must not release packets held for a
+    /// newer one that isn't registered yet.
+    #[test]
+    fn stale_ready_does_not_release_new_generation() {
+        let (g, mut reqs, mut ns) = gate(16);
+        g.ingress(&tcp(443, true, false));
+        let old = reqs.0.try_recv().unwrap();
+        g.listener_ended(old);
+        let new_syn = tcp(443, true, false);
+        assert_eq!(g.ingress(&new_syn), Admit::Held);
+        let new = reqs.0.try_recv().unwrap();
+        g.mark_open(old);
+        assert!(
+            drain(&mut ns).is_empty(),
+            "released SYN before the new listener registered"
+        );
+        g.mark_open(new);
+        assert_eq!(drain(&mut ns), vec![new_syn]);
+    }
+
+    /// Review finding: a delayed exit of an old listener must not close the port's newer listener
+    /// or drop what it holds.
+    #[test]
+    fn stale_exit_does_not_close_new_generation() {
+        let (g, mut reqs, mut ns) = gate(16);
+        g.ingress(&tcp(443, true, false));
+        let old = reqs.0.try_recv().unwrap();
+        g.mark_open(old);
+        drain(&mut ns);
+        // Reaped idle, then torn down; a new SYN arrives after teardown.
+        assert_eq!(
+            g.claim_for_teardown(Duration::ZERO, Duration::MAX, never_busy),
+            vec![old]
+        );
+        assert_eq!(g.listener_ended(old), None);
+        let new_syn = tcp(443, true, false);
+        g.ingress(&new_syn);
+        let new = reqs.0.try_recv().unwrap();
+        // A second, stale report for the old generation changes nothing.
+        assert_eq!(g.listener_ended(old), None);
+        g.mark_open(new);
+        assert_eq!(drain(&mut ns), vec![new_syn]);
+    }
+
+    /// Review finding: a SYN that arrives while an idle port is being torn down is held and
+    /// re-opens the port once teardown completes, instead of racing the old listener's removal.
+    #[test]
+    fn syn_during_teardown_is_held_and_reopens() {
+        let (g, mut reqs, mut ns) = gate(16);
+        g.ingress(&tcp(443, true, false));
+        let old = reqs.0.try_recv().unwrap();
+        g.mark_open(old);
+        drain(&mut ns);
+        assert_eq!(
+            g.claim_for_teardown(Duration::ZERO, Duration::MAX, never_busy),
+            vec![old]
+        );
+        let syn = tcp(443, true, false);
+        assert_eq!(g.ingress(&syn), Admit::Held);
+        // Non-initiating traffic for flows that outlive the listener still passes.
+        assert_eq!(g.ingress(&tcp(443, false, true)), Admit::Passed);
+        drain(&mut ns);
+        let new = g.listener_ended(old).expect("held SYN re-opens the port");
+        assert_eq!((new.0, new.1), (Proto::Tcp, 443));
+        assert_ne!(new.2, old.2);
+        g.mark_open(new);
+        assert_eq!(drain(&mut ns), vec![syn]);
+    }
+
+    #[test]
+    fn teardown_claims_only_idle_open_ports_not_busy_or_opening() {
+        let (g, mut reqs, _ns) = gate(16);
+        g.ingress(&tcp(443, true, false));
+        g.ingress(&udp(443));
+        g.ingress(&tcp(80, true, false));
+        let a = reqs.0.try_recv().unwrap();
+        let b = reqs.0.try_recv().unwrap();
+        let _opening = reqs.0.try_recv().unwrap();
+        g.mark_open(a);
+        g.mark_open(b);
+        // UDP 443 is busy (live flows); TCP 80 is still opening and within its open timeout.
+        let claimed = g.claim_for_teardown(Duration::ZERO, Duration::MAX, |p, _| p == Proto::Udp);
+        assert_eq!(claimed, vec![a]);
+        // Claimed ports aren't claimed twice.
+        assert!(
+            g.claim_for_teardown(Duration::ZERO, Duration::MAX, |p, _| p == Proto::Udp)
+                .is_empty()
+        );
+        // Nothing is idle for an hour.
+        assert!(
+            g.claim_for_teardown(Duration::from_secs(3600), Duration::MAX, never_busy)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stuck_opening_is_claimed_and_its_held_packets_dropped() {
+        let (g, mut reqs, mut ns) = gate(16);
+        g.ingress(&tcp(9000, true, false));
+        let r = reqs.0.try_recv().unwrap();
+        assert_eq!(
+            g.claim_for_teardown(Duration::MAX, Duration::ZERO, never_busy),
+            vec![r]
+        );
+        assert_eq!(
+            g.listener_ended(r),
+            None,
+            "dropped packets don't re-open the port"
+        );
+        g.mark_open(r);
+        assert!(drain(&mut ns).is_empty());
     }
 
     #[test]
@@ -382,25 +579,17 @@ mod tests {
         assert_eq!(g.ingress(&tcp(1, true, false)), Admit::Held);
         assert_eq!(g.ingress(&udp(2)), Admit::Held);
         assert_eq!(g.ingress(&tcp(3, true, false)), Admit::Dropped);
-        assert_eq!(std::iter::from_fn(|| reqs.0.try_recv().ok()).count(), 2);
+        let first = reqs.0.try_recv().unwrap();
+        assert!(reqs.0.try_recv().is_ok());
+        assert!(reqs.0.try_recv().is_err());
 
         for _ in 1..MAX_HELD_PER_PORT {
             assert_eq!(g.ingress(&tcp(1, true, false)), Admit::Held);
         }
         assert_eq!(g.ingress(&tcp(1, true, false)), Admit::Dropped);
 
-        // Closing a port frees its active slot.
-        g.close(Proto::Tcp, 1);
+        // Ending a listener frees its active slot.
+        g.listener_ended(first);
         assert_eq!(g.ingress(&tcp(3, true, false)), Admit::Held);
-    }
-
-    #[test]
-    fn idle_ports_reports_only_open_ports() {
-        let (g, _reqs, _ns) = gate(16);
-        let _ = g.ingress(&tcp(443, true, false));
-        let _ = g.ingress(&udp(53));
-        g.mark_open(Proto::Tcp, 443);
-        assert_eq!(g.idle_ports(Duration::ZERO), vec![(Proto::Tcp, 443)]);
-        assert!(g.idle_ports(Duration::from_secs(60)).is_empty());
     }
 }

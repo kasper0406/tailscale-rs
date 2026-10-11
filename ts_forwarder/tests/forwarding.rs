@@ -746,6 +746,14 @@ async fn udp_exit_node_flow_is_dropped_under_direct_dialer() {
 /// to the forwarder's [`PortGate`] (as the runtime's ingress pump does) instead of being written to
 /// the forwarder netstack directly. Returns the peer's channel.
 async fn spawn_gated_forwarder<D: RealDialer>(routes: RouteTable, dialer: D) -> Channel {
+    spawn_gated_forwarder_with_handle(routes, dialer).await.0
+}
+
+/// [`spawn_gated_forwarder`], also returning the forwarder's task.
+async fn spawn_gated_forwarder_with_handle<D: RealDialer>(
+    routes: RouteTable,
+    dialer: D,
+) -> (Channel, tokio::task::JoinHandle<()>) {
     let config = netcore::Config::default();
     let (peer_pipe, mut from_peer) = WakingPipe::new(None);
     let (mut to_fwd, fwd_pipe) = WakingPipe::new(None);
@@ -764,7 +772,7 @@ async fn spawn_gated_forwarder<D: RealDialer>(routes: RouteTable, dialer: D) -> 
     fwd_ch.set_any_ip(true).await.unwrap();
 
     let (forwarder, gate) = Forwarder::all_ports_gated(fwd_ch, routes, dialer, to_fwd.tx.clone());
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let _ = forwarder.run().await;
     });
 
@@ -781,7 +789,7 @@ async fn spawn_gated_forwarder<D: RealDialer>(routes: RouteTable, dialer: D) -> 
             to_peer.send_async(&p).await;
         }
     });
-    peer_ch
+    (peer_ch, task)
 }
 
 /// Gated all-port mode: the very first SYN to a cold port is held until the port's listener is
@@ -866,4 +874,35 @@ async fn gated_all_ports_still_drops_exit_node_flow_under_direct_dialer() {
     client.write_all(b"leak attempt").await.ok();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(dial_count.load(Ordering::SeqCst), 0);
+}
+
+/// Cancelling a gated forwarder stops its on-demand listeners too: a port it had opened no
+/// longer accepts new connections afterwards (review finding: listener tasks were detached).
+#[tokio::test]
+async fn cancelling_gated_forwarder_stops_its_listeners() {
+    let echo_addr = spawn_echo().await;
+    let (peer_ch, task) = spawn_gated_forwarder_with_handle(
+        RouteTable::new(["127.0.0.0/8".parse().unwrap()]),
+        DirectDialer,
+    )
+    .await;
+
+    let first = SocketAddr::new(PEER_IP.into(), PEER_PORT);
+    let _open = connect_with_retry(&peer_ch, first, echo_addr).await;
+
+    task.abort();
+    let _ = task.await;
+    // Let the aborted listener's socket close in the netstack.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let second = SocketAddr::new(PEER_IP.into(), PEER_PORT + 1);
+    let res = tokio::time::timeout(
+        Duration::from_secs(10),
+        peer_ch.tcp_connect(second, echo_addr),
+    )
+    .await;
+    assert!(
+        !matches!(res, Ok(Ok(_))),
+        "a cancelled forwarder's listener still accepted a connection"
+    );
 }

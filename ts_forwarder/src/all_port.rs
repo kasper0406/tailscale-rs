@@ -48,7 +48,7 @@ use ts_netstack_smoltcp::{
 use crate::{
     class::RouteTable,
     dialer::RealDialer,
-    port_gate::{OpenRequests, PortGate, Proto},
+    port_gate::{OpenRequests, PortGate, PortRef, Proto},
     tcp::run_tcp_port,
     udp::run_udp_port,
 };
@@ -251,13 +251,22 @@ pub(crate) async fn run_udp_all_ports<D: RealDialer>(
     }
 }
 
+/// How long a gated port may stay opening (listener not yet registered) before it is torn down
+/// and its held packets dropped. Registering a listener is one netstack round trip.
+const PORT_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Run the gated all-port manager: open a per-port listener for each port the [`PortGate`] asks
-/// for, tell the gate once it is registered (releasing the held packets), and close idle ports.
+/// for, tell the gate once it is registered (releasing the held packets), and tear down idle
+/// ports.
 ///
 /// Serves TCP and UDP together. The active-port cap ([`MAX_PORTS`]) and the global flow caps are
 /// the same as in raw-observer mode; the gate enforces the port cap before asking.
 ///
-/// Loops until the netstack channel closes.
+/// Every listener is identified by a generation ([`PortRef`]) and owned by this function's
+/// `JoinSet`: dropping or cancelling the manager aborts all of them, and every way a listener can
+/// end (exit, error, panic, abort) is reported to the gate exactly once, for its own generation.
+///
+/// Returns when the netstack channel closes (a listener fails with `InternalChannelClosed`).
 pub(crate) async fn run_gated_all_ports<D: RealDialer>(
     channel: Channel,
     routes: tokio::sync::watch::Receiver<RouteTable>,
@@ -265,87 +274,142 @@ pub(crate) async fn run_gated_all_ports<D: RealDialer>(
     gate: PortGate,
     mut requests: OpenRequests,
 ) -> Result<(), ts_netstack_smoltcp::netcore::Error> {
+    use ts_netstack_smoltcp::netcore::{Error, InternalErrorKind};
+
     let global_tcp = Arc::new(Semaphore::new(MAX_GLOBAL_TCP_SPLICES));
     let global_udp = Arc::new(Semaphore::new(MAX_GLOBAL_UDP_FLOWS));
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<PortRef>();
 
-    // A listener task reports when it is registered and when it exits.
-    enum Event {
-        Ready(Proto, u16),
-        Exited(Proto, u16),
+    // The current listener per port: its generation, abort handle and (UDP) live-flow count. A UDP
+    // port's flows live in its task, so it is not torn down while it has any; TCP flows outlive
+    // their listener.
+    struct Listener {
+        generation: u32,
+        abort: tokio::task::AbortHandle,
+        live_flows: Option<Arc<AtomicUsize>>,
     }
-    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-    // Per port: the listener task, and (UDP) its live-flow count. A UDP port's flows die with its
-    // task, so it is only reaped once it has none; TCP flows outlive their listener.
-    type Listener = (tokio::task::AbortHandle, Option<Arc<AtomicUsize>>);
-    let mut ports: HashMap<(Proto, u16), Listener> = HashMap::new();
-    let mut reap = tokio::time::interval(PORT_REAP_INTERVAL);
+    let mut listeners: HashMap<(Proto, u16), Listener> = HashMap::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut task_ports: HashMap<tokio::task::Id, PortRef> = HashMap::new();
+
+    let start = |port_ref: PortRef,
+                 tasks: &mut tokio::task::JoinSet<Result<(), Error>>,
+                 task_ports: &mut HashMap<tokio::task::Id, PortRef>,
+                 listeners: &mut HashMap<(Proto, u16), Listener>| {
+        let (proto, port, generation) = port_ref;
+        tracing::debug!(?proto, %port, generation, "all-port: opening listener for gated port");
+        let live_flows = (proto == Proto::Udp).then(|| Arc::new(AtomicUsize::new(0)));
+        let (channel, routes, dialer) = (channel.clone(), routes.clone(), dialer.clone());
+        let (global_tcp, global_udp) = (global_tcp.clone(), global_udp.clone());
+        let (port_live, ready_tx) = (live_flows.clone(), ready_tx.clone());
+        let abort = tasks.spawn(async move {
+            let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+            let listener = async move {
+                match proto {
+                    Proto::Tcp => {
+                        run_tcp_port(
+                            channel,
+                            port,
+                            routes,
+                            dialer,
+                            Some(global_tcp),
+                            Some(registered_tx),
+                        )
+                        .await
+                    }
+                    Proto::Udp => {
+                        run_udp_port(
+                            channel,
+                            port,
+                            routes,
+                            dialer,
+                            Some(global_udp),
+                            Some(registered_tx),
+                            port_live,
+                        )
+                        .await
+                    }
+                }
+            };
+            tokio::pin!(listener);
+            tokio::select! {
+                biased;
+                res = &mut listener => return res,
+                registered = registered_rx => {
+                    if registered.is_ok() {
+                        let _ = ready_tx.send(port_ref);
+                    }
+                }
+            }
+            listener.await
+        });
+        task_ports.insert(abort.id(), port_ref);
+        let old = listeners.insert(
+            (proto, port),
+            Listener {
+                generation,
+                abort,
+                live_flows,
+            },
+        );
+        // The gate only asks for a new generation once the previous one has ended.
+        debug_assert!(old.is_none(), "port {port} opened twice");
+    };
+
+    let mut reap = tokio::time::interval(PORT_REAP_INTERVAL.min(PORT_OPEN_TIMEOUT));
     reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             req = requests.0.recv() => {
-                let Some((proto, port)) = req else {
-                    // Every gate handle is gone, so no packet can reach this forwarder again.
-                    return Ok(());
-                };
-                tracing::debug!(?proto, %port, "all-port: opening listener for gated port");
-                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-                let (channel, routes, dialer, ev_tx) =
-                    (channel.clone(), routes.clone(), dialer.clone(), ev_tx.clone());
-                let (global_tcp, global_udp) = (global_tcp.clone(), global_udp.clone());
-                let live = (proto == Proto::Udp).then(|| Arc::new(AtomicUsize::new(0)));
-                let port_live = live.clone();
-                let handle = tokio::spawn(async move {
-                    let notify = ev_tx.clone();
-                    tokio::spawn(async move {
-                        if ready_rx.await.is_ok() {
-                            let _ = notify.send(Event::Ready(proto, port));
-                        }
-                    });
-                    let res = match proto {
-                        Proto::Tcp => {
-                            run_tcp_port(channel, port, routes, dialer, Some(global_tcp), Some(ready_tx)).await
-                        }
-                        Proto::Udp => {
-                            run_udp_port(
-                                channel, port, routes, dialer, Some(global_udp), Some(ready_tx), port_live,
-                            )
-                            .await
-                        }
-                    };
-                    if let Err(e) = res {
-                        tracing::warn!(?proto, %port, error = %e, "all-port listener exited");
-                    }
-                    let _ = ev_tx.send(Event::Exited(proto, port));
-                })
-                .abort_handle();
-                if let Some((old, _)) = ports.insert((proto, port), (handle, live)) {
-                    old.abort();
+                // The gate keeps a sender while it exists, and we hold the gate.
+                let Some(port_ref) = req else { return Ok(()) };
+                start(port_ref, &mut tasks, &mut task_ports, &mut listeners);
+            }
+            Some(port_ref) = ready_rx.recv() => {
+                let refused = gate.mark_open(port_ref);
+                if refused > 0 {
+                    tracing::debug!(port = port_ref.1, refused, "all-port: ingress full; held packets dropped");
                 }
             }
-            Some(ev) = ev_rx.recv() => match ev {
-                Event::Ready(proto, port) => gate.mark_open(proto, port),
-                Event::Exited(proto, port) => {
-                    ports.remove(&(proto, port));
-                    gate.close(proto, port);
+            Some(done) = tasks.join_next_with_id() => {
+                let (id, outcome) = match done {
+                    Ok((id, res)) => (id, Ok(res)),
+                    Err(e) => (e.id(), Err(e)),
+                };
+                let Some(port_ref @ (proto, port, generation)) = task_ports.remove(&id) else {
+                    continue;
+                };
+                if listeners.get(&(proto, port)).is_some_and(|l| l.generation == generation) {
+                    listeners.remove(&(proto, port));
                 }
-            },
+                match outcome {
+                    Ok(Err(e @ Error::Internal(InternalErrorKind::InternalChannelClosed))) => return Err(e),
+                    Ok(Err(e)) => tracing::warn!(?proto, %port, error = %e, "all-port listener exited"),
+                    Ok(Ok(())) => {}
+                    Err(e) if e.is_cancelled() => {}
+                    Err(e) => tracing::error!(?proto, %port, error = %e, "all-port listener panicked"),
+                }
+                if let Some(reopen) = gate.listener_ended(port_ref) {
+                    start(reopen, &mut tasks, &mut task_ports, &mut listeners);
+                }
+            }
             _ = reap.tick() => {
-                for (proto, port) in gate.idle_ports(PORT_IDLE) {
-                    let busy = ports
+                let busy = |proto, port| {
+                    listeners
                         .get(&(proto, port))
-                        .and_then(|(_, live)| live.as_ref())
-                        .is_some_and(|l| l.load(Ordering::Relaxed) > 0);
-                    if busy {
-                        continue;
+                        .and_then(|l| l.live_flows.as_ref())
+                        .is_some_and(|n| n.load(Ordering::Relaxed) > 0)
+                };
+                for (proto, port, generation) in
+                    gate.claim_for_teardown(PORT_IDLE, PORT_OPEN_TIMEOUT, busy)
+                {
+                    // Completion is reported through `join_next_with_id` above, which tells the
+                    // gate and re-opens the port if packets arrived during teardown.
+                    if let Some(l) = listeners.get(&(proto, port)).filter(|l| l.generation == generation) {
+                        l.abort.abort();
                     }
-                    // Close in the gate first so a new flow re-opens the port rather than racing
-                    // the listener's teardown.
-                    gate.close(proto, port);
-                    if let Some((h, _)) = ports.remove(&(proto, port)) {
-                        h.abort();
-                    }
-                    tracing::debug!(?proto, %port, "all-port: reaped idle gated port");
+                    tracing::debug!(?proto, %port, generation, "all-port: tearing down gated port");
                 }
             }
         }
