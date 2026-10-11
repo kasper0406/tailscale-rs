@@ -62,6 +62,17 @@ Settings (`runner/env.sh`, overridable via environment): hostname `rust-exit`, t
 WireGuard UDP port 41642 (not the official client's 41641), state `state/rust-exit`.
 Extra runner flags pass through `start.sh`, e.g. `--tcp-buffer-size 2097152` (see BENCHMARKS.md).
 
+Branches: `ts-exit/runner` is the functional exit node. `ts-exit/perf-connected` adds the opt-in macOS
+underlay optimization, and its default behavior is identical. Build whichever is checked out in
+`repos/geiserx-tailscale-rs`. A/B the optimization on the perf build with:
+
+```sh
+TS_DEBUG_MAGICSOCK_CONNECTED_SOCKETS=1 TS_DEBUG_DONT_FRAGMENT=1 runner/start.sh
+```
+
+The log then shows `magicsock: connected sockets / DF enabled` at start, and
+`connected socket opened` (debug level) once a peer has carried 1 MiB.
+
 ## 3. Verify it joined
 
 `runner/status.sh` shows `running ... v4=Some(100.x.y.z)`, and the `self` line lists
@@ -122,6 +133,5 @@ More logging: `RUST_LOG=debug runner/start.sh` (verbose; contains peer IPs, neve
 - IPv4 only. IPv6 is advertised (clients need the pair to offer the node) but always rejected.
 - Policy updates from control go over a best-effort internal bus. A dropped update could leave a revoked
   permission in force until the next full update. Don't rely on revocation being instant.
-- A peer whose node key changes keeps its old WireGuard session for up to ~3 minutes.
 - Single-flow throughput is capped by the fixed TCP window (no autotuning). See BENCHMARKS.md.
 - Not audited. Don't route sensitive traffic through it.

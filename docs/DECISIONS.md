@@ -53,3 +53,22 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   channel hop per received packet. Phase 3A/3B target, after the live baseline.
 - **Blockers (2) and (5)** remain. Codex sized (2) at ~half a day (patch in progress) and (5) at 1–3 days.
   Until fixed they're documented limitations, mitigated by a tailnet where the only exit-node users are your own devices.
+
+- **F10 Codex series review** (`docs/codex-03-review.md`) found real lifecycle bugs in the first PortGate manager:
+  stale Ready/Exited events across port re-opens, non-atomic reaping, detached listener tasks surviving
+  cancellation, and Opening never timing out. Fixed in `46a2402` with per-port generations, an atomic Closing
+  claim, JoinSet ownership and a 10 s open timeout, plus Codex's two probes as regression tests. IPv6 rejections are
+  rate-limited (`d3e10e4`).
+- **D11 Blocker 2 fixed** by Codex's patches (`6bfbbee`, `681cd75`), reviewed and applied by Claude.
+- **F11 macOS delivery check** (`bench/reuseport-check`): with `SO_REUSEPORT`, a socket connected to a peer on the
+  shared port receives that peer's datagrams, other senders still reach the wildcard socket, and replies leave
+  from the shared port (loopback and en0).
+- **D12 Phase 3A prepared ahead of the live baseline** on a separate branch (`ts-exit/perf-connected`,
+  `19e0507`). It's off by default with the Go knob names, so the gate "no perf patching before a working
+  baseline" holds for the baseline binary: the same build with knobs off is byte-for-byte the runner behavior.
+- **F12 Magicsock receive pump** ends permanently on any recv error (`DirectTransport::new`). Not hit by the
+  shared unconnected socket in practice. The connected-socket pumps tolerate per-datagram errors (ECONNREFUSED).
+- **D13 Code is saved** to github.com/kasper0406/tailscale-rs (a GitHub fork of tailscale/tailscale-rs, at the user's
+  request): branches `ts-exit/runner`, `ts-exit/perf-connected`. They carry the GeiserX tree's unrelated history,
+  so they don't compare against the fork's `main`. This workspace (docs/scripts) isn't pushed: the permission
+  classifier blocked it, pending the user's decision.
