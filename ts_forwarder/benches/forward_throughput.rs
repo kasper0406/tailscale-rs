@@ -8,6 +8,8 @@
 //! the peer's path latency (the forwarder's own egress leg stays on loopback).
 //!
 //! ```sh
+//! `LOSS_PCT` drops that percentage of overlay packets in each direction.
+//!
 //! `FWD_MODE` picks how the forwarder takes ports: `ports` (default; an explicit listener on the
 //! server's port), `raw` (all-port, raw-socket observer) or `gated` (all-port behind the ingress
 //! `PortGate`, what the runtime runs). `TCP_BUF_KB` overrides the per-direction netstack TCP buffer (both stacks).
@@ -42,10 +44,23 @@ fn spawn_relay(
     mut rx: WakingPipeReceiver,
     deliver: impl Fn(&[u8]) + Send + 'static,
     delay: Duration,
+    loss: f64,
+    seed: u64,
 ) {
+    // Drop each packet with probability `loss` (xorshift; no extra dependency).
+    let mut state = seed | 1;
+    let mut lose = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64 <= loss
+    };
     let (q_tx, mut q_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(pkt) = rx.recv_async().await {
+            if loss > 0.0 && lose() {
+                continue;
+            }
             if q_tx
                 .send((tokio::time::Instant::now() + delay, pkt))
                 .is_err()
@@ -95,7 +110,13 @@ enum Mode {
 
 /// Peer netstack <-> relay (delay, and the gate in `Gated` mode) <-> forwarder. Returns the peer's
 /// channel.
-async fn spawn_forwarder(rtt: Duration, tcp_buf: Option<usize>, mode: Mode, port: u16) -> Channel {
+async fn spawn_forwarder(
+    rtt: Duration,
+    loss: f64,
+    tcp_buf: Option<usize>,
+    mode: Mode,
+    port: u16,
+) -> Channel {
     let mut config = netcore::Config {
         mtu: OVERLAY_MTU,
         ..netcore::Config::default()
@@ -152,6 +173,8 @@ async fn spawn_forwarder(rtt: Duration, tcp_buf: Option<usize>, mode: Mode, port
                 let _ = gate.ingress(p);
             },
             half,
+            loss,
+            0x9e37_79b9,
         ),
         None => spawn_relay(
             a.rx,
@@ -159,6 +182,8 @@ async fn spawn_forwarder(rtt: Duration, tcp_buf: Option<usize>, mode: Mode, port
                 let _ = into_fwd.try_send(p);
             },
             half,
+            loss,
+            0x9e37_79b9,
         ),
     }
     let to_peer = a.tx;
@@ -168,6 +193,8 @@ async fn spawn_forwarder(rtt: Duration, tcp_buf: Option<usize>, mode: Mode, port
             let _ = to_peer.try_send(p);
         },
         half,
+        loss,
+        0x85eb_ca6b,
     );
     peer_ch
 }
@@ -227,9 +254,15 @@ async fn main() {
         _ => Mode::Ports,
     };
 
+    let loss_pct: f64 = std::env::var("LOSS_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+
     let server = spawn_server(down).await;
     let peer_ch = spawn_forwarder(
         Duration::from_millis(rtt_ms),
+        loss_pct / 100.0,
         tcp_buf_kb.map(|k| k * 1024),
         mode,
         server.port(),
@@ -282,7 +315,7 @@ async fn main() {
     let elapsed = start.elapsed().as_secs_f64();
     let mbps = |b: u64| b as f64 * 8.0 / elapsed / 1e6;
     println!(
-        "dir={} mode={mode:?} rtt_ms={rtt_ms} tcp_buf_kb={} flows={flows} secs={elapsed:.2} mbps={:.1} server_rx_mbps={:.1} cold_connect_ms={cold_connect_ms:.0}",
+        "dir={} mode={mode:?} rtt_ms={rtt_ms} loss_pct={loss_pct} tcp_buf_kb={} flows={flows} secs={elapsed:.2} mbps={:.1} server_rx_mbps={:.1} cold_connect_ms={cold_connect_ms:.0}",
         if down { "down" } else { "up" },
         tcp_buf_kb.map_or("default".to_owned(), |k| k.to_string()),
         mbps(total),
