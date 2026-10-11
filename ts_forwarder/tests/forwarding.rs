@@ -891,7 +891,7 @@ async fn cancelling_gated_forwarder_stops_its_listeners() {
     let _open = connect_with_retry(&peer_ch, first, echo_addr).await;
 
     task.abort();
-    let _ = task.await;
+    assert!(task.await.unwrap_err().is_cancelled());
     // Let the aborted listener's socket close in the netstack.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
