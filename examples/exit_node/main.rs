@@ -160,27 +160,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn log_status(dev: &Device) {
-    let status = match dev.status().await {
-        Ok(s) => s,
-        Err(e) => {
+    // Never let a status query stall the main loop (and with it signal handling).
+    let status = match tokio::time::timeout(Duration::from_secs(5), dev.status()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "status");
             return;
         }
+        Err(_) => {
+            let t = Duration::from_secs(2);
+            let self_node = tokio::time::timeout(t, dev.self_node()).await.is_ok();
+            let peer_tracker = tokio::time::timeout(t, dev.peers_with_route("1.1.1.1".parse().unwrap()))
+                .await
+                .is_ok();
+            tracing::warn!(self_node, peer_tracker, "status query timed out");
+            return;
+        }
     };
-    if let Some(me) = &status.self_node {
-        tracing::info!(
+    match &status.self_node {
+        Some(me) => tracing::info!(
             routes = ?me.allowed_routes,
             exit_node = me.is_exit_node,
+            peers = status.peers.len(),
             health = ?status.health,
             "self"
-        );
+        ),
+        None => tracing::info!(peers = status.peers.len(), health = ?status.health, "self (no self node yet)"),
     }
-    for p in status.peers.iter().filter(|p| p.online == Some(true)) {
+    // Online state is often unknown in this engine (None), so only skip peers known offline.
+    for p in status.peers.iter().filter(|p| p.online != Some(false)) {
         let path = match (&p.cur_addr, &p.relay) {
             (Some(a), _) => format!("direct {a}"),
             (None, Some(r)) => format!("derp {r}"),
-            (None, None) => "unknown".to_owned(),
+            (None, None) => "idle".to_owned(),
         };
-        tracing::info!(peer = %p.display_name, ip = %p.ipv4, %path, "peer");
+        tracing::info!(peer = %p.display_name, ip = %p.ipv4, online = ?p.online, %path, "peer");
     }
 }
