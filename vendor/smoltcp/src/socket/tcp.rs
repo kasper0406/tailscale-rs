@@ -248,12 +248,7 @@ impl RttEstimator {
         }
     }
 
-    fn on_retransmit(&mut self) {
-        if self.timestamp.is_some() {
-            tcp_trace!("rtte: abort sampling due to retransmit");
-        }
-        self.timestamp = None;
-
+    fn on_rto(&mut self) {
         // RFC 6298 (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer").  The
         // maximum value discussed in (2.5) above may be used to provide
         // an upper bound to this doubling operation.
@@ -271,6 +266,13 @@ impl RttEstimator {
             self.have_measurement = false;
             tcp_trace!("rtte: too many retransmissions, clearing srtt, rttvar.");
         }
+    }
+
+    fn on_retransmit(&mut self) {
+        if self.timestamp.is_some() {
+            tcp_trace!("rtte: abort sampling due to retransmit");
+        }
+        self.timestamp = None;
     }
 }
 
@@ -2398,6 +2400,12 @@ impl<'a> Socket<'a> {
             // had sent them. This will cause all data in the queue
             // to be sent again.
             self.remote_last_seq = self.local_seq_no;
+
+            // Fast retransmit invalidates RTT samples (Karn), but only an expired
+            // retransmission timer backs off the RTO (RFC 6298 section 5.5).
+            if matches!(self.timer, Timer::Retransmit { .. }) {
+                self.rtte.on_rto();
+            }
 
             // Clear the `should_retransmit` state. If we can't retransmit right
             // now for whatever reason (like zero window), this avoids an
@@ -6691,6 +6699,72 @@ mod test {
         // even though we're in "fast retransmit", we shouldn't
         // force-send anything because the remote's window is full.
         recv_nothing!(s);
+    }
+
+    #[test]
+    fn test_fast_loss_then_tail_loss_recovers_without_spurious_backoff() {
+        let mut s = socket_established();
+        s.remote_mss = 2;
+        let mut seq = LOCAL_SEQ + 1;
+
+        // Seven flights lose their first segment. Each of the three following
+        // segments generates a duplicate ACK; recovery must not count as an RTO.
+        // No unambiguous RTT sample is available (Karn's rule).
+        for flight in 0..7 {
+            let time = flight * 25;
+            s.send_slice(b"abcdefgh").unwrap();
+            for (i, payload) in b"abcdefgh".chunks(2).enumerate() {
+                recv!(s, time time, Ok(TcpRepr {
+                    seq_number: seq + i * 2,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload,
+                    ..RECV_TEMPL
+                }));
+            }
+            // Establish the ACK baseline, then report the three out-of-order
+            // segments. The first ACK in later flights is also a duplicate.
+            for _ in 0..4 {
+                send!(s, time time + 10, TcpRepr {
+                    seq_number: REMOTE_SEQ + 1,
+                    ack_number: Some(seq),
+                    ..SEND_TEMPL
+                });
+            }
+            assert_eq!(s.timer, Timer::FastRetransmit);
+            for (i, payload) in b"abcdefgh".chunks(2).enumerate() {
+                recv!(s, time time + 10, Ok(TcpRepr {
+                    seq_number: seq + i * 2,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload,
+                    ..RECV_TEMPL
+                }));
+            }
+            seq += 8;
+            send!(s, time time + 20, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(seq),
+                ..SEND_TEMPL
+            });
+        }
+
+        // The next flight contains only a lost tail: no duplicate ACKs can
+        // trigger fast retransmit. It must recover at the original 1s RTO,
+        // rather than waiting 60s after repeated fast recovery.
+        s.send_slice(b"ij").unwrap();
+        recv!(s, time 200, Ok(TcpRepr {
+            seq_number: seq,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"ij"[..],
+            ..RECV_TEMPL
+        }));
+        recv_nothing!(s, time 1199);
+        recv!(s, time 1200, Ok(TcpRepr {
+            seq_number: seq,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: &b"ij"[..],
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(2000));
     }
 
     #[test]
