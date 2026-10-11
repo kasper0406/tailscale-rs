@@ -67,6 +67,11 @@ struct Args {
     #[arg(long, conflicts_with = "exit_dns")]
     no_exit_dns: bool,
 
+    /// Tailnet port for the peerAPI, which serves exit-node DNS (DoH) to the node's users; 0 disables
+    /// it. Go clients send all their DNS there when using this node as exit node.
+    #[arg(long, default_value_t = 41643)]
+    peerapi_port: u16,
+
     /// Per-direction userspace TCP buffer in bytes (netstack default: 256 KiB).
     #[arg(long)]
     tcp_buffer_size: Option<usize>,
@@ -114,14 +119,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         requested_tags: args.tags.clone(),
         // A persistent exit node must survive brief disconnects without being GC'd by control.
         ephemeral: false,
-        // Userspace only: never take over the host resolver.
-        accept_dns: false,
+        // The tailnet DNS config backs the exit-node DoH service. Userspace mode never touches the
+        // host resolver either way.
+        accept_dns: true,
         advertise_exit_node: !args.no_advertise,
         forward_all_ports: !args.no_advertise,
         forward_exit_egress: !args.no_advertise,
         // Egress to the exit node's LAN stays off, like Go's default for exit-node users.
         exit_node_allow_lan_access: false,
         exit_node_dns: exit_dns,
+        peerapi_port: (args.peerapi_port != 0).then_some(args.peerapi_port),
         tcp_buffer_size: args.tcp_buffer_size,
         wireguard_listen_port: Some(args.port),
         netmap_cache_dir: None,
