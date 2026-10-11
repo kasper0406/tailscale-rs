@@ -29,7 +29,10 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -223,7 +226,7 @@ pub(crate) async fn run_udp_all_ports<D: RealDialer>(
                 let global_flows = global_flows.clone();
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        run_udp_port(channel, port, routes, dialer, Some(global_flows), None).await
+                        run_udp_port(channel, port, routes, dialer, Some(global_flows), None, None).await
                     {
                         // Relay bind error: free the port so a later datagram re-triggers it.
                         tracing::warn!(%port, error = %e, "all-port udp relay exited");
@@ -271,7 +274,10 @@ pub(crate) async fn run_gated_all_ports<D: RealDialer>(
         Exited(Proto, u16),
     }
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-    let mut ports: HashMap<(Proto, u16), tokio::task::AbortHandle> = HashMap::new();
+    // Per port: the listener task, and (UDP) its live-flow count. A UDP port's flows die with its
+    // task, so it is only reaped once it has none; TCP flows outlive their listener.
+    type Listener = (tokio::task::AbortHandle, Option<Arc<AtomicUsize>>);
+    let mut ports: HashMap<(Proto, u16), Listener> = HashMap::new();
     let mut reap = tokio::time::interval(PORT_REAP_INTERVAL);
     reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -287,6 +293,8 @@ pub(crate) async fn run_gated_all_ports<D: RealDialer>(
                 let (channel, routes, dialer, ev_tx) =
                     (channel.clone(), routes.clone(), dialer.clone(), ev_tx.clone());
                 let (global_tcp, global_udp) = (global_tcp.clone(), global_udp.clone());
+                let live = (proto == Proto::Udp).then(|| Arc::new(AtomicUsize::new(0)));
+                let port_live = live.clone();
                 let handle = tokio::spawn(async move {
                     let notify = ev_tx.clone();
                     tokio::spawn(async move {
@@ -299,7 +307,10 @@ pub(crate) async fn run_gated_all_ports<D: RealDialer>(
                             run_tcp_port(channel, port, routes, dialer, Some(global_tcp), Some(ready_tx)).await
                         }
                         Proto::Udp => {
-                            run_udp_port(channel, port, routes, dialer, Some(global_udp), Some(ready_tx)).await
+                            run_udp_port(
+                                channel, port, routes, dialer, Some(global_udp), Some(ready_tx), port_live,
+                            )
+                            .await
                         }
                     };
                     if let Err(e) = res {
@@ -308,7 +319,7 @@ pub(crate) async fn run_gated_all_ports<D: RealDialer>(
                     let _ = ev_tx.send(Event::Exited(proto, port));
                 })
                 .abort_handle();
-                if let Some(old) = ports.insert((proto, port), handle) {
+                if let Some((old, _)) = ports.insert((proto, port), (handle, live)) {
                     old.abort();
                 }
             }
@@ -321,10 +332,17 @@ pub(crate) async fn run_gated_all_ports<D: RealDialer>(
             },
             _ = reap.tick() => {
                 for (proto, port) in gate.idle_ports(PORT_IDLE) {
+                    let busy = ports
+                        .get(&(proto, port))
+                        .and_then(|(_, live)| live.as_ref())
+                        .is_some_and(|l| l.load(Ordering::Relaxed) > 0);
+                    if busy {
+                        continue;
+                    }
                     // Close in the gate first so a new flow re-opens the port rather than racing
                     // the listener's teardown.
                     gate.close(proto, port);
-                    if let Some(h) = ports.remove(&(proto, port)) {
+                    if let Some((h, _)) = ports.remove(&(proto, port)) {
                         h.abort();
                     }
                     tracing::debug!(?proto, %port, "all-port: reaped idle gated port");

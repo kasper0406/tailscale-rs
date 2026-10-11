@@ -198,7 +198,7 @@ impl<D: RealDialer> Forwarder<D> {
                     // Explicit-port mode: no global cap (bounded, operator-chosen port set; the
                     // per-port caps suffice). All-port mode passes `Some(..)`.
                     tasks.spawn(async move {
-                        run_udp_port(channel, port, routes, dialer, None, None).await
+                        run_udp_port(channel, port, routes, dialer, None, None, None).await
                     });
                 }
             }
