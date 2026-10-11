@@ -58,6 +58,15 @@ struct Args {
     #[arg(long)]
     no_advertise: bool,
 
+    /// Resolver that answers exit-node users' DNS aimed at resolvers this node can't reach (their
+    /// LAN/hotspot resolver). Defaults to the first `nameserver` in /etc/resolv.conf.
+    #[arg(long)]
+    exit_dns: Option<std::net::SocketAddr>,
+
+    /// Don't answer such DNS at all (it is then refused like any private destination).
+    #[arg(long, conflicts_with = "exit_dns")]
+    no_exit_dns: bool,
+
     /// Per-direction userspace TCP buffer in bytes (netstack default: 256 KiB).
     #[arg(long)]
     tcp_buffer_size: Option<usize>,
@@ -91,6 +100,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         (None, _) => None,
     };
 
+    let exit_dns = if args.no_exit_dns {
+        None
+    } else {
+        args.exit_dns.or_else(system_resolver)
+    };
+    tracing::info!(?exit_dns, "exit-node DNS for unreachable resolvers");
+
     let config = Config {
         key_state: tailscale::config::load_key_file(&key_file, BadFormatBehavior::Error).await?,
         client_name: Some("ts-exit-node".to_owned()),
@@ -105,6 +121,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         forward_exit_egress: !args.no_advertise,
         // Egress to the exit node's LAN stays off, like Go's default for exit-node users.
         exit_node_allow_lan_access: false,
+        exit_node_dns: exit_dns,
         tcp_buffer_size: args.tcp_buffer_size,
         wireguard_listen_port: Some(args.port),
         netmap_cache_dir: None,
@@ -114,8 +131,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let dev = Device::new(&config, auth_key).await?;
     // Interactive login: `wait_until_running` reports `NeedsLogin(url)` right away rather than
     // waiting, so show the URL and keep waiting until it is approved (or the hour runs out).
-    let deadline = tokio::time::Instant::now()
-        + Duration::from_secs(if args.interactive { 3600 } else { 90 });
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(if args.interactive { 3600 } else { 90 });
     let mut shown = None;
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -170,9 +187,10 @@ async fn log_status(dev: &Device) {
         Err(_) => {
             let t = Duration::from_secs(2);
             let self_node = tokio::time::timeout(t, dev.self_node()).await.is_ok();
-            let peer_tracker = tokio::time::timeout(t, dev.peers_with_route("1.1.1.1".parse().unwrap()))
-                .await
-                .is_ok();
+            let peer_tracker =
+                tokio::time::timeout(t, dev.peers_with_route("1.1.1.1".parse().unwrap()))
+                    .await
+                    .is_ok();
             tracing::warn!(self_node, peer_tracker, "status query timed out");
             return;
         }
@@ -185,7 +203,9 @@ async fn log_status(dev: &Device) {
             health = ?status.health,
             "self"
         ),
-        None => tracing::info!(peers = status.peers.len(), health = ?status.health, "self (no self node yet)"),
+        None => {
+            tracing::info!(peers = status.peers.len(), health = ?status.health, "self (no self node yet)")
+        }
     }
     // Online state is often unknown in this engine (None), so only skip peers known offline.
     for p in status.peers.iter().filter(|p| p.online != Some(false)) {
@@ -196,4 +216,14 @@ async fn log_status(dev: &Device) {
         };
         tracing::info!(peer = %p.display_name, ip = %p.ipv4, online = ?p.online, %path, "peer");
     }
+}
+
+/// This host's resolver: the first `nameserver` in /etc/resolv.conf (macOS keeps it current).
+fn system_resolver() -> Option<std::net::SocketAddr> {
+    let conf = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    conf.lines()
+        .filter_map(|l| l.trim().strip_prefix("nameserver"))
+        .filter_map(|ip| ip.trim().parse::<std::net::Ipv4Addr>().ok())
+        .map(|ip| std::net::SocketAddr::from((ip, 53)))
+        .next()
 }
