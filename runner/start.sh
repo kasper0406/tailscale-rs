@@ -13,8 +13,10 @@ args=(--state-dir $TS_EXIT_STATE --hostname $TS_EXIT_HOSTNAME --port $TS_EXIT_PO
 [[ -n $TS_EXIT_TAG ]] && args+=(--tag $TS_EXIT_TAG)
 # The key is only needed until the identity in the state dir is registered. Without a key file,
 # log in interactively: the log shows a URL to approve in a browser (node owned by your user).
-if [[ ! -f $TS_EXIT_STATE/keys.json ]]; then
-  if [[ -f $TS_EXIT_KEYFILE ]]; then args+=(--auth-key-file $TS_EXIT_KEYFILE); else args+=(--interactive); fi
+if [[ ! -f $TS_EXIT_STATE/keys.json && -f $TS_EXIT_KEYFILE ]]; then
+  args+=(--auth-key-file $TS_EXIT_KEYFILE)
+else
+  args+=(--interactive)   # if control still wants a login, wait for it (URL in the log)
 fi
 TS_RS_EXPERIMENT=this_is_unstable_software RUST_LOG=${RUST_LOG:-info} \
   nohup $TS_EXIT_BIN "${args[@]}" "$@" >> $TS_EXIT_LOG 2>&1 &
