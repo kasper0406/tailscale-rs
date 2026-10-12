@@ -94,3 +94,11 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   Codex's critique agreed with the isolation idea but not the mechanism or bound, and asked for a controlled
   A/B plus fairness budgets before any default. **D16**: keep it opt-in; candidate follow-ups are splitting
   the pipeline into two threads (underlay+crypto | netstacks) and bounded drains.
+- **D17 Goal is general scalability, not this home line** (user, 2026-10-12). A stage/pipeline split is
+  capped by its slowest stage and fixes the per-packet hop count, so it isn't the general answer. Direction:
+  flow-sharded, run-to-completion threads (N shards, each owning its TCP-stack instance, per-flow host I/O,
+  encryption and batched sends; receive steers by 5-tuple, at most one cross-thread hop; per-peer send
+  counters atomic; control state shared read-only). Codex is critiquing the design before implementation.
+  Design-independent pieces of the 2-thread work (bounded drivers, RX coalescing, DNS off the pipeline,
+  flood-proof supervision, metrics, harness) are kept. A load generator that doesn't need the Go client
+  comes first, because scaling beyond ~1.7 Gbit/s can't be shown on this Mac with the co-located Go client.
