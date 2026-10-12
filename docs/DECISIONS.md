@@ -118,3 +118,11 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   The synthetic stalls were the harness's fresh control sessions briefly reporting no endpoints. Fixed in the
   harness (one `hold` session per peer per matrix, and the enrolled hostname is reported, so control doesn't
   rename the nodes).
+- **F19 Codex re-rank (docs/codex-12-stage0-replan.md), confirmed by profile.** Codex found quadratic work:
+  each replayed stream command validates its socket with a full `socket_set.iter().any(...)` scan
+  (`get_socket_mut!`), O(blocked × sockets) per pump. Profiles at 2 × 64 flows
+  (`scratch/prof/stage0-default-{down,up}-2x64.txt`): `process_one_cmd` self-time (the inlined scan) is
+  13.3% of busy node CPU on download and 8.4% on upload, plus `pump_waiters` 2.2%. smoltcp's per-packet
+  socket lookup (`process_tcp`) is only 0.8–1.8%. **D19**: build the cheap registry-based validation,
+  close dedup and bounded orphan reaping first (codex, branch `ts-exit/netstack-scans`), then receive
+  coalescing, then sharding stage 1. No smoltcp scheduler rewrite unless a post-fix profile justifies it.
