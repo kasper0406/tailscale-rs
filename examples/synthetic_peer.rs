@@ -96,8 +96,11 @@ enum Command {
         #[arg(long)]
         bind: Option<SocketAddr>,
         /// Endpoint to report to control, e.g. this host's LAN address and the `--bind` port.
-        #[arg(long, requires = "identity_file")]
+        #[arg(long, requires_all = ["identity_file", "hostname"])]
         advertise: Option<SocketAddr>,
+        /// The enrolled name, reported with `--advertise`.
+        #[arg(long)]
+        hostname: Option<String>,
         /// Before load, also wait for the node to ping us (it holds our netmap endpoint). Implied
         /// by `--advertise`; use it with `--bind` when a `hold` process advertises instead.
         #[arg(long)]
@@ -116,6 +119,10 @@ enum Command {
         identity_file: PathBuf,
         #[arg(long)]
         advertise: SocketAddr,
+        /// The name the peer was enrolled with; control renames a node to whatever a session
+        /// reports (the OS hostname when none is given).
+        #[arg(long)]
+        hostname: String,
     },
     /// Test fixture only: raw WG + production PortGate/forwarder, virtual dst mapped to local sink.
     Fixture {
@@ -361,6 +368,7 @@ async fn advertise_endpoint(
     disco_file: Option<&PathBuf>,
     identity: &PathBuf,
     advertise: SocketAddr,
+    hostname: String,
 ) -> Result<ts_control::AsyncControlClient> {
     let disco_file = disco_file.ok_or("--advertise needs --disco-key-file")?;
     let node_key = private(key)?;
@@ -374,7 +382,16 @@ async fn advertise_endpoint(
     }
     let (auth_url, _) = tokio::sync::watch::channel(None);
     let (mut client, stream) =
-        ts_control::AsyncControlClient::connect(&Default::default(), &keys, None, auth_url).await?;
+        ts_control::AsyncControlClient::connect(
+            &ts_control::Config {
+                hostname: Some(hostname),
+                ..Default::default()
+            },
+            &keys,
+            None,
+            auth_url,
+        )
+        .await?;
     // Drain netmap updates so the session's broadcast never backs up.
     tokio::spawn(async move {
         use futures_util::StreamExt;
@@ -905,10 +922,16 @@ fn main() -> Result<()> {
                 disco_key_file,
                 identity_file,
                 advertise,
+                hostname,
             } => {
-                let _control =
-                    advertise_endpoint(&key_file, Some(&disco_key_file), &identity_file, advertise)
-                        .await?;
+                let _control = advertise_endpoint(
+                    &key_file,
+                    Some(&disco_key_file),
+                    &identity_file,
+                    advertise,
+                    hostname,
+                )
+                .await?;
                 println!("{}", serde_json::json!({"holding": advertise.to_string()}));
                 std::future::pending::<()>().await;
                 Ok(())
@@ -952,11 +975,19 @@ fn main() -> Result<()> {
                 bind,
                 advertise,
                 await_node_ping,
+                hostname,
             } => {
-                let _control = match (identity_file, advertise) {
-                    (Some(identity), Some(advertise)) => {
-                        Some(advertise_endpoint(&key_file, disco_key_file.as_ref(), &identity, advertise).await?)
-                    }
+                let _control = match (identity_file, advertise, hostname) {
+                    (Some(identity), Some(advertise), Some(hostname)) => Some(
+                        advertise_endpoint(
+                            &key_file,
+                            disco_key_file.as_ref(),
+                            &identity,
+                            advertise,
+                            hostname,
+                        )
+                        .await?,
+                    ),
                     _ => None,
                 };
                 peer(
