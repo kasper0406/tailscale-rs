@@ -209,8 +209,11 @@ pub(crate) async fn run_udp_port<D: RealDialer>(
             }
             _ = reap.tick() => {
                 let before = flows.len();
-                let cutoff = now_ms().saturating_sub(u64::try_from(idle.as_millis()).unwrap_or(u64::MAX));
-                flows.retain(|_, f| f.last.load(Ordering::Relaxed) > cutoff);
+                // Age, not a `now - idle` cutoff: near the epoch that cutoff saturates to 0, and a
+                // flow created in the port's first millisecond (`last == 0`, e.g. the gate's held
+                // first datagram) would be reaped by `interval`'s immediate first tick.
+                let (now, idle_ms) = (now_ms(), u64::try_from(idle.as_millis()).unwrap_or(u64::MAX));
+                flows.retain(|_, f| now.saturating_sub(f.last.load(Ordering::Relaxed)) < idle_ms);
                 let reaped = before - flows.len();
                 if reaped > 0 {
                     tracing::trace!(reaped, "reaped idle udp flows");
