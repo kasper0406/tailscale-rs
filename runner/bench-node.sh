@@ -11,7 +11,7 @@ before=$(node_disco)
 python3 -I runner/detach.py $S/exit_node.log /usr/bin/env TS_RS_EXPERIMENT=this_is_unstable_software RUST_LOG=info \
   TS_BENCH_EXIT_REDIRECT=198.18.0.1:9000=127.0.0.1:9100 TS_DEBUG_MAGICSOCK_CONNECTED_SOCKETS=1 \
   TS_DEBUG_DONT_FRAGMENT=1 TS_DEBUG_MAGICSOCK_BATCHED_IO=1 "$@" $PWD/$bin --state-dir $PWD/$S \
-  --hostname rust-exit --port 41642 --interactive --status-interval 10 > $S/exit_node.pid
+  --hostname rust-exit --port 41642 --interactive --status-interval ${STATUS_INTERVAL:-10} > $S/exit_node.pid
 for i in $(seq 1 30); do
   disco=$(node_disco)
   [ -n "$disco" ] && [ "$disco" != "$before" ] && break; sleep 2

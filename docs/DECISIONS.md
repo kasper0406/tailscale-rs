@@ -126,3 +126,22 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   socket lookup (`process_tcp`) is only 0.8–1.8%. **D19**: build the cheap registry-based validation,
   close dedup and bounded orphan reaping first (codex, branch `ts-exit/netstack-scans`), then receive
   coalescing, then sharding stage 1. No smoltcp scheduler rewrite unless a post-fix profile justifies it.
+
+## 2026-10-13
+
+- **F20 Listener orphan bug (real-client impact).** A client RST during the TCP handshake sends smoltcp's
+  half-open socket back to LISTEN. Accept dropped it from the queue but left it in the socket set as an
+  untracked second listener, which then completed later handshakes that nobody accepted, so the client hung.
+  Found by instrumenting the harness's intermittent "0 bytes after node restart" stall: the generator
+  connected but `accept()` never returned. Handshake resets are routine (Happy Eyeballs, cancelled
+  requests, network switches), so this hit real clients too. Fixed with a packet-level regression test
+  (`14402a7`), cherry-picked to `runner`/`perf-connected`. The live node runs it (`bin/exit_node-live3`).
+  Four restart-then-matrix repros were clean (previously this failed in every fresh matrix).
+- **F21 Netstack scan work (codex, `ts-exit/netstack-scans`).** Registry validation: 2 × 64 download
+  5.75 → 5.37 CPU-s/GB. Targeted waiter replay (opt-in `TS_EXPERIMENT_TARGETED_REPLAY=1`, smoltcp wakers
+  plus a 50 ms safety sweep): → 4.67 (−19% total, +14% throughput). Upload only 11.15 → 10.57 (−5%). Single
+  flow within noise. Counters before targeted replay: 120 replay attempts per completion.
+- **F22 Upload is syscall-bound per packet.** Profile (2 × 64 upload, targeted replay): unbatched `sendto` of
+  ACKs ≈17% and `sendmsg_x` 4% of busy CPU, `recvfrom` 9%, alloc/copy 14%, netstack 18%. **D20**: next is
+  codex's receive/ACK batching (C1/C2: portable coalescing, `recvmsg_x`/`recvmmsg`, ACK send batching),
+  then sharding stage 1. Targeted replay stays opt-in until a live laptop/iPad soak.
