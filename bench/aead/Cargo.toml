@@ -1,0 +1,12 @@
+[package]
+name = "aead-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+chacha20poly1305 = "=0.10.1"
+ring = "0.17"
+
+[profile.release]
+opt-level = 3

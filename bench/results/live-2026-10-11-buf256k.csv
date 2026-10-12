@@ -1,0 +1,12 @@
+# 2026-10-11 ~19:00 local. Laptop (official Tailscale 1.88.0, macOS) on phone hotspot -> rust-exit (release build,
+# ts-exit/runner a91ea74, tcp_buffer_size default 256 KiB) -> Cloudflare speed endpoints.
+# Path: direct, laptop sees node via 203.0.113.34:41642 (home public IP), tailscale ping 23 ms. Values bytes/s.
+# down4 rows invalid (macOS date lacks %N) and omitted.
+test,run,bytes_per_s,mbit_s
+down1,1,9355426,74.8
+down1,2,9071018,72.6
+down1,3,9571306,76.6
+up1,1,6700028,53.6
+up1,2,8905437,71.2
+up1,3,7295406,58.4
+ttfb_s,1,0.268166,

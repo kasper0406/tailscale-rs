@@ -99,6 +99,36 @@ reports Macs in everyday use settling near 11k packets/s on the unconnected path
 
 ---
 
+## 1c. Tunnel-only, live on this Mac (`runner/tunnel-bench.sh`)
+
+The official Go client (built from `repos/tailscale-go` @ 3bb8a906, userspace `tailscaled` in
+`state/go-client`) moves 1 GB over WireGuard to the Rust node's own tailnet address (`--sink-port`
+service), each direction. The path is direct over the LAN (192.168.50.76:41642), with no internet and no
+exit forwarding. Both nodes share the Mac, so throughput is partly bounded by the Go client. The comparable
+metric is **the Rust node's CPU seconds per GB**. `exitnode` build profile (opt-level 3).
+Raw: `bench/results/tunnel-ab.csv`. Profiles: `scratch/prof/sample*.txt`.
+
+| variant (cumulative) | down Mbit/s | down CPU-s/GB | up Mbit/s | up CPU-s/GB |
+|---|---|---|---|---|
+| baseline (`runner` @ dceb1a3) | 1,178 | 18.6 | 1,860 | 11.6 |
+| + packet-path spans at trace (`752cf20`) | 1,282 | 15.7 | 1,870 | 10.5 |
+| + egress batching, zero-copy (`4124a9e`) | ~1,310 | 11.9 | ~1,850 | 10.5 |
+| + 7 MiB UDP socket buffers (`6f93451`) | ~1,280 | ~12.0 | ~1,850 | 10.5 |
+| + connected sockets + DF (`perf-connected`, opt-in) | **1,760** | **8.9** | **1,950** | **9.9** |
+| connected + DF alone on the baseline | 1,433 | 14.6 | 1,875 | 11.9 |
+
+Medians of 3–5 runs. In every series run 2 (the second download) is an outlier (362–995 Mbit/s). That's
+under investigation and excluded from the medians, listed in the CSV.
+
+Profile after these changes (download): UDP syscalls 26% of busy CPU (one `sendto` per packet), crypto 21%
+(RustCrypto ChaCha20-Poly1305 with the portable Poly1305 backend), malloc/memcpy 12%, tokio/locks/clock 15%,
+tracing down from 16% to 2.5%. Next: `ring` AEAD (microbench 2.6x faster than RustCrypto here, in
+progress), `sendmsg_x`/`recvmsg_x` batching, and fewer per-packet allocations.
+
+Through the exit node to the internet (same Go client, OVH test file, `runner/perf.sh`) the node
+reached ~740–760 Mbit/s, the home line's ceiling (direct from the Mac: 737–767 Mbit/s). The release build
+used 24.7–25.2 CPU-s/GB there, the `exitnode` profile 22.7–23.2, and with connected sockets + DF 17.4.
+
 ## 2./3. Live tunnel and exit-node results
 
 Not run yet: needs the auth key and route approval (RUNBOOK §0–4). Planned matrix, each ≥3 runs, median and

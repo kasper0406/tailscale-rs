@@ -1,0 +1,13 @@
+label,run,mbit_s,node_cpu_s,node_cpu_s_per_gb,node_cpu_pct
+direct-mac,1,767,,,
+direct-mac,2,743,,,
+direct-mac,3,737,,,
+release-s,1,681,5.04,25.20,212
+release-s,2,722,4.97,24.85,222
+release-s,3,758,4.94,24.70,232
+exitnode-O3,1,760,4.63,23.15,217
+exitnode-O3,2,751,4.54,22.70,211
+exitnode-O3,3,0,0.01,0.05,9
+O3-connected-DF,1,732,3.47,17.35,157
+O3-connected-DF,2,0,0.00,0.00,0
+O3-connected-DF,3,0,0.00,0.00,0

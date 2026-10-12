@@ -1,0 +1,3 @@
+#!/bin/zsh
+# The local Go test client's CLI (userspace tailscaled in state/go-client).
+exec /Volumes/git/ts-exit/bin/tailscale --socket=/Volumes/git/ts-exit/state/go-client/tailscaled.sock "$@"

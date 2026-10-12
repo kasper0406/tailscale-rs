@@ -1,0 +1,6 @@
+dir=down mode=Gated rtt_ms=25 loss_pct=0 tcp_buf_kb=256 flows=1 secs=15.00 mbps=56.7 cold_connect_ms=32
+dir=down mode=Gated rtt_ms=25 loss_pct=0 tcp_buf_kb=2048 flows=1 secs=15.01 mbps=555.6 cold_connect_ms=31
+dir=down mode=Gated rtt_ms=25 loss_pct=0.5 tcp_buf_kb=256 flows=1 secs=15.01 mbps=46.7 cold_connect_ms=31
+dir=down mode=Gated rtt_ms=25 loss_pct=0.5 tcp_buf_kb=2048 flows=1 secs=15.00 mbps=296.4 cold_connect_ms=30
+dir=down mode=Gated rtt_ms=25 loss_pct=2 tcp_buf_kb=256 flows=1 secs=15.03 mbps=23.3 cold_connect_ms=31
+loss=2 buf=2048 HANG (no result in 45 s)
