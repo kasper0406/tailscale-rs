@@ -43,3 +43,13 @@ combined-connected-DF,down,4,1773,8.86,8.86
 combined-connected-DF,up,4,1933,9.96,9.96
 combined-connected-DF,down,5,1752,8.92,8.92
 combined-connected-DF,up,5,1967,9.92,9.92
+combined-betteraddr,down,1,1759,8.92,8.92
+combined-betteraddr,up,1,1888,10.04,10.04
+combined-betteraddr,down,2,1756,8.92,8.92
+combined-betteraddr,up,2,1955,9.97,9.97
+combined-betteraddr,down,3,1760,8.90,8.90
+combined-betteraddr,up,3,1963,9.96,9.96
+combined-betteraddr,down,4,1760,8.88,8.88
+combined-betteraddr,up,4,1966,9.98,9.98
+combined-betteraddr,down,5,1749,9.00,9.00
+combined-betteraddr,up,5,1945,9.99,9.99

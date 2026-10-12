@@ -117,8 +117,10 @@ Raw: `bench/results/tunnel-ab.csv`. Profiles: `scratch/prof/sample*.txt`.
 | + connected sockets + DF (`perf-connected`, opt-in) | **1,760** | **8.9** | **1,950** | **9.9** |
 | connected + DF alone on the baseline | 1,433 | 14.6 | 1,875 | 11.9 |
 
-Medians of 3–5 runs. In every series run 2 (the second download) is an outlier (362–995 Mbit/s). That's
-under investigation and excluded from the medians, listed in the CSV.
+Medians of 3–5 runs. In every series up to here, run 2 (the second download) was an outlier (362–995 Mbit/s):
+the node's path choice briefly switched from the peer's LAN endpoint to its public one, a NAT hairpin through
+the router. Fixed by porting Go's full `betterAddr` scoring, which prefers private paths (`ts-exit/runner`).
+After that fix, 5 of 5 runs of the combined build landed at 1,749–1,760 Mbit/s down and 8.9 CPU-s/GB.
 
 Profile after these changes (download): UDP syscalls 26% of busy CPU (one `sendto` per packet), crypto 21%
 (RustCrypto ChaCha20-Poly1305 with the portable Poly1305 backend), malloc/memcpy 12%, tokio/locks/clock 15%,
