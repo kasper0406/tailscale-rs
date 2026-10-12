@@ -145,3 +145,12 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   ACKs ≈17% and `sendmsg_x` 4% of busy CPU, `recvfrom` 9%, alloc/copy 14%, netstack 18%. **D20**: next is
   codex's receive/ACK batching (C1/C2: portable coalescing, `recvmsg_x`/`recvmmsg`, ACK send batching),
   then sharding stage 1. Targeted replay stays opt-in until a live laptop/iPad soak.
+- **F23 Upload profile correction (codex):** 2,631 of 2,644 `__sendto` samples were host TCP writes to the
+  sink, not ACK sends. **Brief 15 A/B** (one binary, targeted replay on): the copy/alloc/tracing cleanup is
+  a clean win (2 × 64 upload 10.57 → 9.83 CPU-s/GB, +9%). RX batching (`recvmsg_x`/`recvmmsg`) gives another
+  −17% (→ 8.14, +11% throughput; −27% upload CPU vs the stage-0 baseline). But either experiment flag also
+  enables a 128-item work budget plus yields, which costs single-flow download ~65% CPU/GB and makes 2 × 64
+  download unfair. ACK batching alone is neutral. **D21**: decouple the budget from the flags (codex brief
+  16) and re-measure RX batching alone. Loopback-sink attribution was checked and rejected: the sink pays
+  for its own receives (5.8 s per 6 GB received vs 0.5 s per 6 GB sent), so the up/down asymmetry is real
+  node cost.
