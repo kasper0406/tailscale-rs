@@ -120,7 +120,7 @@ pub struct Runtime {
     shutdown: watch::Sender<bool>,
     _security: security::SecurityGuard,
     // After security: kill supervised tasks before dropping/joining their runtime.
-    _pipeline: Option<pipeline::PipelineThread>,
+    _pipeline: Option<pipeline::PipelineRuntimes>,
     /// Sender side of the exit-node selector `watch` cell. Held privately here (not on the cloned
     /// `Env`, which keeps only the read side) so that only `Runtime::set_exit_node` can mutate the
     /// selection; the route updater and source filter re-read it via [`Env::exit_node`].
@@ -184,7 +184,7 @@ impl Runtime {
         auth_key: Option<String>,
         keys: ts_keys::NodeState,
     ) -> Result<Self, Error> {
-        let pipeline = pipeline::PipelineThread::from_env().map_err(|e| {
+        let pipeline = pipeline::PipelineRuntimes::from_env().map_err(|e| {
             tracing::error!(error = %e, "starting packet pipeline thread");
             Error {
                 kind: ErrorKind::PipelineUnavailable,
@@ -205,11 +205,14 @@ impl Runtime {
             env::ForwarderConfig::from_control_config(&config),
         );
 
-        env.packet_runtime = pipeline.as_ref().map(pipeline::PipelineThread::handle);
+        env.packet_runtime = pipeline.as_ref().map(pipeline::PipelineRuntimes::handle);
+        env.supervisor_runtime = pipeline
+            .as_ref()
+            .map(pipeline::PipelineRuntimes::supervisor_handle);
         env.caller_runtime = pipeline.as_ref().map(|_| tokio::runtime::Handle::current());
 
         let mut security =
-            security::SecurityGuard::new(shutdown_tx.clone(), env.packet_runtime.clone());
+            security::SecurityGuard::new(shutdown_tx.clone(), env.supervisor_runtime.clone());
         security.watch(&env.bus);
         security.ready(&env.bus).await?;
 

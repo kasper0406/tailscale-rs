@@ -29,13 +29,13 @@ impl FailureState {
 pub(crate) struct SecurityGuard {
     failure: Arc<FailureState>,
     monitors: JoinSet<()>,
-    packet_runtime: Option<tokio::runtime::Handle>,
+    monitor_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl SecurityGuard {
     pub(crate) fn new(
         shutdown: watch::Sender<bool>,
-        packet_runtime: Option<tokio::runtime::Handle>,
+        monitor_runtime: Option<tokio::runtime::Handle>,
     ) -> Self {
         Self {
             failure: Arc::new(FailureState {
@@ -43,7 +43,7 @@ impl SecurityGuard {
                 stops: Mutex::new(Vec::new()),
             }),
             monitors: JoinSet::new(),
-            packet_runtime,
+            monitor_runtime,
         }
     }
 
@@ -61,7 +61,7 @@ impl SecurityGuard {
         let actor = actor.clone();
         crate::pipeline::spawn_on(
             &mut self.monitors,
-            self.packet_runtime.as_ref(),
+            self.monitor_runtime.as_ref(),
             async move {
                 tokio::select! {
                     () = actor.wait_for_shutdown() => {
@@ -146,7 +146,7 @@ mod tests {
     fn environment() -> (
         Env,
         watch::Sender<bool>,
-        Option<crate::pipeline::PipelineThread>,
+        Option<crate::pipeline::PipelineRuntimes>,
     ) {
         let (shutdown, rx) = watch::channel(false);
         let mut env = Env::new(
@@ -154,10 +154,13 @@ mod tests {
             rx,
             ForwarderConfig::from_control_config(&ts_control::Config::default()),
         );
-        let pipeline = crate::pipeline::PipelineThread::from_env().unwrap();
+        let pipeline = crate::pipeline::PipelineRuntimes::from_env().unwrap();
         env.packet_runtime = pipeline
             .as_ref()
-            .map(crate::pipeline::PipelineThread::handle);
+            .map(crate::pipeline::PipelineRuntimes::handle);
+        env.supervisor_runtime = pipeline
+            .as_ref()
+            .map(crate::pipeline::PipelineRuntimes::supervisor_handle);
         env.caller_runtime = pipeline.as_ref().map(|_| tokio::runtime::Handle::current());
         (env, shutdown, pipeline)
     }
@@ -209,7 +212,7 @@ mod tests {
     async fn saturated_subscriber_can_publish_from_handler_and_keeps_order() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (env, shutdown, _pipeline) = environment();
-            let mut guard = SecurityGuard::new(shutdown, env.packet_runtime.clone());
+            let mut guard = SecurityGuard::new(shutdown, env.supervisor_runtime.clone());
             guard.watch(&env.bus);
             let (seen, mut rx) = mpsc::unbounded_channel();
             let entered = Arc::new(Notify::new());
@@ -262,7 +265,7 @@ mod tests {
     async fn late_registration_ack_orders_future_publications_without_replay() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (env, shutdown, _pipeline) = environment();
-            let mut guard = SecurityGuard::new(shutdown, env.packet_runtime.clone());
+            let mut guard = SecurityGuard::new(shutdown, env.supervisor_runtime.clone());
             guard.watch(&env.bus);
             env.publish(7_u32).await.unwrap();
             let (seen, mut rx) = mpsc::unbounded_channel();
@@ -291,7 +294,7 @@ mod tests {
     async fn subscribe_waits_for_registration_behind_a_blocked_broker() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (env, shutdown, _pipeline) = environment();
-            let mut guard = SecurityGuard::new(shutdown, env.packet_runtime.clone());
+            let mut guard = SecurityGuard::new(shutdown, env.supervisor_runtime.clone());
             guard.watch(&env.bus);
             let (seen, _rx) = mpsc::unbounded_channel();
             let entered = Arc::new(Notify::new());
@@ -340,7 +343,8 @@ mod tests {
         for kill in [false, true] {
             tokio::time::timeout(Duration::from_secs(5), async {
                 let (env, shutdown, _pipeline) = environment();
-                let mut guard = SecurityGuard::new(shutdown.clone(), env.packet_runtime.clone());
+                let mut guard =
+                    SecurityGuard::new(shutdown.clone(), env.supervisor_runtime.clone());
                 guard.watch(&env.bus);
                 let dataplane = env.on_packet_runtime(|| DataplaneActor::spawn(env.clone()));
                 guard.watch(&dataplane);
@@ -388,6 +392,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn independent_supervisor_stops_forwarding_under_packet_flood() {
+        let packet = crate::pipeline::PipelineThread::start().unwrap();
+        let supervisor = crate::pipeline::PipelineThread::named("ts-security-guard").unwrap();
+        let (shutdown, rx) = watch::channel(false);
+        let env = Env::new(
+            ts_keys::NodeState::generate(),
+            rx,
+            ForwarderConfig::from_control_config(&ts_control::Config::default()),
+        );
+        let mut guard = SecurityGuard::new(shutdown.clone(), Some(supervisor.handle()));
+        guard.watch(&env.bus);
+        let (tx, down) = mpsc::unbounded_channel();
+        let flooding = packet
+            .handle()
+            .spawn(crate::netstack_actor::pump_ingress_with_budget(
+                down,
+                |_| true,
+                "application",
+                true,
+            ));
+        guard.packet_pump(flooding.abort_handle());
+        // Thousands of packets are already queued, so receiving them need not yield by itself.
+        for _ in 0..1024 {
+            tx.send(vec![ts_packet::PacketMut::from(&[0u8; 20][..]); 64])
+                .unwrap();
+        }
+        let (seen, _rx) = mpsc::unbounded_channel();
+        let critical = Probe::spawn((env.clone(), seen, None, None));
+        guard.watch(&critical);
+        guard.ready(&critical).await.unwrap();
+        critical.kill();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !*shutdown.borrow() {
+                tokio::task::yield_now().await;
+            }
+            assert!(flooding.await.unwrap_err().is_cancelled());
+            env.bus.wait_for_shutdown().await;
+        })
+        .await
+        .unwrap();
+        drop(tx);
+    }
+
     struct FailedStart;
 
     impl Actor for FailedStart {
@@ -405,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn failed_startup_cannot_pass_security_barrier() {
         let (env, shutdown, _pipeline) = environment();
-        let mut guard = SecurityGuard::new(shutdown.clone(), env.packet_runtime.clone());
+        let mut guard = SecurityGuard::new(shutdown.clone(), env.supervisor_runtime.clone());
         guard.watch(&env.bus);
         let actor = FailedStart::spawn(());
         guard.watch(&actor);

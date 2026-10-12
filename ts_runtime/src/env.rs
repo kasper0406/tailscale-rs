@@ -230,6 +230,7 @@ pub struct RuntimePrefCells {
 pub struct Env {
     /// Placement handles only: Runtime owns and joins the dedicated thread.
     pub(crate) packet_runtime: Option<tokio::runtime::Handle>,
+    pub(crate) supervisor_runtime: Option<tokio::runtime::Handle>,
     pub(crate) caller_runtime: Option<tokio::runtime::Handle>,
     pub bus: ActorRef<MessageBus>,
     pub keys: Arc<ts_keys::NodeState>,
@@ -485,6 +486,7 @@ impl Env {
 
         let env = Self {
             packet_runtime: None,
+            supervisor_runtime: None,
             caller_runtime: None,
             // Publishers must never wait for subscriber capacity: handlers themselves publish.
             // The broker serializes delivery and waits for bounded subscriber mailboxes.

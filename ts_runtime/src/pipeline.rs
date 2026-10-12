@@ -17,41 +17,36 @@ pub(crate) struct PipelineThread {
 }
 
 impl PipelineThread {
-    pub(crate) fn from_env() -> std::io::Result<Option<Self>> {
-        if std::env::var_os("TS_EXPERIMENT_PIPELINE_THREAD").as_deref() == Some("1".as_ref()) {
-            Self::start().map(Some)
-        } else {
-            Ok(None)
-        }
+    pub(crate) fn start() -> std::io::Result<Self> {
+        Self::named(THREAD_NAME)
     }
 
-    pub(crate) fn start() -> std::io::Result<Self> {
+    pub(crate) fn named(name: &str) -> std::io::Result<Self> {
         let caller = Handle::current();
         let (stop, stopped) = oneshot::channel();
         let (ready, started) = std::sync::mpsc::sync_channel(1);
-        let thread = thread::Builder::new()
-            .name(THREAD_NAME.into())
-            .spawn(move || {
-                // Build and drop on the OS thread, including startup failures. A failed OS-thread
-                // spawn must not drop a Tokio runtime inside the caller's async context.
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => {
-                        drop(ready.send(Ok(runtime.handle().clone())));
-                        runtime.block_on(async {
-                            crate::pipeline_metrics::start_cpu_sampler(THREAD_NAME);
-                            let _ = stopped.await;
-                        });
-                        // Cancels remaining tasks without waiting for caller actors to reply.
-                        drop(runtime);
-                    }
-                    Err(error) => {
-                        drop(ready.send(Err(error)));
-                    }
+        let name = name.to_owned();
+        let thread = thread::Builder::new().name(name.clone()).spawn(move || {
+            // Build and drop on the OS thread, including startup failures. A failed OS-thread
+            // spawn must not drop a Tokio runtime inside the caller's async context.
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => {
+                    drop(ready.send(Ok(runtime.handle().clone())));
+                    runtime.block_on(async {
+                        crate::pipeline_metrics::start_cpu_sampler(&name);
+                        let _ = stopped.await;
+                    });
+                    // Cancels remaining tasks without waiting for caller actors to reply.
+                    drop(runtime);
                 }
-            })?;
+                Err(error) => {
+                    drop(ready.send(Err(error)));
+                }
+            }
+        })?;
         // Only a short startup handshake; no packet task or caller-runtime work is awaited.
         let handle = match started.recv() {
             Ok(Ok(handle)) => handle,
@@ -98,6 +93,31 @@ impl Drop for PipelineThread {
 fn join(thread: thread::JoinHandle<()>) {
     if thread.join().is_err() {
         tracing::error!("packet pipeline thread panicked");
+    }
+}
+
+/// Owners are separate from the handles cloned into actors. Off keeps ambient placement.
+pub(crate) struct PipelineRuntimes {
+    packet: PipelineThread,
+    supervisor: PipelineThread,
+}
+
+impl PipelineRuntimes {
+    pub(crate) fn from_env() -> std::io::Result<Option<Self>> {
+        let mode = std::env::var("TS_EXPERIMENT_PIPELINE_THREAD").unwrap_or_default();
+        if mode != "1" {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            packet: PipelineThread::start()?,
+            supervisor: PipelineThread::named("ts-security-guard")?,
+        }))
+    }
+    pub(crate) fn handle(&self) -> Handle {
+        self.packet.handle()
+    }
+    pub(crate) fn supervisor_handle(&self) -> Handle {
+        self.supervisor.handle()
     }
 }
 
