@@ -47,7 +47,9 @@ enum Command {
         #[arg(long)]
         identity_file: PathBuf,
         #[arg(long)]
-        auth_key_file: PathBuf,
+        /// Auth key file. Without one, print control's login URL and wait (up to 1 h) for it to
+        /// be approved in a browser.
+        auth_key_file: Option<PathBuf>,
         #[arg(long, default_value = "synthetic-load")]
         hostname: String,
         #[arg(long)]
@@ -225,7 +227,7 @@ async fn enroll(
     key: PathBuf,
     disco_file: PathBuf,
     identity: PathBuf,
-    auth: PathBuf,
+    auth: Option<PathBuf>,
     hostname: String,
     target: Option<String>,
 ) -> Result<()> {
@@ -260,16 +262,37 @@ async fn enroll(
     {
         return Err("identity file does not match supplied keys".into());
     }
-    let auth = zeroize::Zeroizing::new(std::fs::read_to_string(auth)?);
+    let auth = match auth {
+        Some(path) => Some(zeroize::Zeroizing::new(std::fs::read_to_string(path)?)),
+        None => None,
+    };
+    let interactive = auth.is_none();
     let config = ts_control::Config {
         hostname: Some(hostname),
         ephemeral: false,
         ..Default::default()
     };
-    let runtime = ts_runtime::Runtime::spawn(config, Some(auth.trim().to_owned()), keys).await?;
-    runtime
-        .wait_until_running(Some(Duration::from_secs(90)))
-        .await?;
+    let runtime =
+        ts_runtime::Runtime::spawn(config, auth.as_ref().map(|a| a.trim().to_owned()), keys).await?;
+    // Interactive login: wait_until_running reports NeedsLogin(url) right away; show the URL and
+    // keep waiting until it is approved.
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(if interactive { 3600 } else { 90 });
+    let mut shown = None;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match runtime.wait_until_running(Some(left)).await {
+            Ok(()) => break,
+            Err(ts_runtime::RegistrationError::NeedsLogin(url)) if interactive && !left.is_zero() => {
+                if shown.as_ref() != Some(&url) {
+                    println!("open this URL to approve the benchmark peer: {url}");
+                    shown = Some(url);
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
     let me = runtime
         .status()
         .await?
