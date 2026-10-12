@@ -58,6 +58,7 @@ pub mod peer_tracker;
 mod peerapi;
 mod peerapi_doh;
 mod pipeline;
+pub mod pipeline_metrics;
 mod route_updater;
 mod security;
 /// Stored Serve config + accept-loop runtime (`tsnet`'s `Get/SetServeConfig` + serving runtime).

@@ -41,6 +41,7 @@ impl PipelineThread {
                     Ok(runtime) => {
                         drop(ready.send(Ok(runtime.handle().clone())));
                         runtime.block_on(async {
+                            crate::pipeline_metrics::start_cpu_sampler(THREAD_NAME);
                             let _ = stopped.await;
                         });
                         // Cancels remaining tasks without waiting for caller actors to reply.
@@ -252,6 +253,28 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn enabled_metrics_sample_packet_thread_cpu() {
+        if !crate::pipeline_metrics::enabled() {
+            return;
+        }
+        let before = crate::pipeline_metrics::snapshot().thread_cpu_ns[0];
+        let pipeline = PipelineThread::start().unwrap();
+        pipeline
+            .handle()
+            .spawn(async {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_millis(20) {
+                    std::hint::spin_loop();
+                }
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+            })
+            .await
+            .unwrap();
+        assert!(crate::pipeline_metrics::snapshot().thread_cpu_ns[0] > before);
     }
 
     /// Run the public startup path in both suite modes, without a tailnet or real control server.

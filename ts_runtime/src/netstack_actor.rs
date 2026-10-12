@@ -100,10 +100,13 @@ pub(crate) async fn pump_ingress_with(
     mut admit: impl FnMut(&[u8]) -> bool,
     netstack_name: &'static str,
 ) -> u64 {
+    let counters = crate::pipeline_metrics::enabled();
+    let index = crate::pipeline_metrics::stack_index(netstack_name);
     let mut dropped: u64 = 0;
     let mut dropping = false;
 
     while let Some(bufs) = from_dataplane.recv().await {
+        let before = dropped;
         for buf in bufs {
             let buf: PacketMut = buf;
             if admit(buf.as_ref()) {
@@ -127,6 +130,7 @@ pub(crate) async fn pump_ingress_with(
                 }
             }
         }
+        if counters { crate::pipeline_metrics::drops(index, dropped - before); }
     }
 
     dropped
@@ -200,6 +204,7 @@ impl kameo::Actor for NetstackActor {
             netstack.run_tokio().await;
         });
 
+        let counters = crate::pipeline_metrics::enabled();
         env.spawn_packet(&mut joinset, async move {
             while let Some(first) = netstack_down_rx.recv_async().await {
                 // Hand the dataplane whatever is already queued as one batch, so encryption and the
@@ -211,6 +216,7 @@ impl kameo::Actor for NetstackActor {
                 {
                     batch.push(crate::netstack_actor::into_packet(more));
                 }
+                if counters { crate::pipeline_metrics::egress(0, batch.len()); }
                 if netstack_up.send(batch).is_err() {
                     break;
                 }

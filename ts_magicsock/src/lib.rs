@@ -52,3 +52,11 @@ pub use sock::{
     BindingVerifier, DerpSource, DirectTransport, MagicSock, PeerCapVersionLookup, ReceivedData,
     RelayedDisco,
 };
+
+/// Experimental kernel sendmsg_x completed-batch histogram, gated by TS_DEBUG_PIPELINE_METRICS.
+pub fn send_batch_histogram() -> [u64; 65] {
+    batch::histogram()
+}
+
+/// Kernel attempts by offered size, including retry/failure attempts.
+pub fn send_batch_offered_histogram() -> [u64; 65] { batch::offered_histogram() }

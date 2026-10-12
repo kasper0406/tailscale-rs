@@ -2278,3 +2278,6 @@ mod tests {
         assert_eq!(via_secret, Some(SAMPLE_KEY.to_string()));
     }
 }
+
+/// Experimental process-wide packet counters, enabled by TS_DEBUG_PIPELINE_METRICS=1.
+pub use ts_runtime::pipeline_metrics;

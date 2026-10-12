@@ -217,6 +217,12 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
 }
 
 async fn log_status(dev: &Device) {
+    if tailscale::pipeline_metrics::enabled() {
+        let m = tailscale::pipeline_metrics::snapshot();
+        tracing::info!(app_drops = m.ingress_drops[0], forwarder_drops = m.ingress_drops[1],
+            egress_batches = ?m.egress_batches, sendmsg_x_batches = ?m.sendmsg_x_batches, sendmsg_x_offered_batches = ?m.sendmsg_x_offered_batches,
+            thread_cpu_ns = ?m.thread_cpu_ns, "pipeline metrics (cumulative)");
+    }
     // Never let a status query stall the main loop (and with it signal handling).
     let status = match tokio::time::timeout(Duration::from_secs(5), dev.status()).await {
         Ok(Ok(s)) => s,

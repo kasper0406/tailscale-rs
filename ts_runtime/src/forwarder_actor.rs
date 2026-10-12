@@ -180,6 +180,7 @@ impl kameo::Actor for ForwarderActor {
 
         // Pump packets emitted by the forwarder netstack down into the dataplane (out the overlay).
         let reject_up = netstack_up.clone();
+        let counters = crate::pipeline_metrics::enabled();
         env.spawn_packet(&mut joinset, async move {
             while let Some(first) = netstack_down_rx.recv_async().await {
                 // Hand the dataplane whatever is already queued as one batch, so encryption and the
@@ -191,6 +192,7 @@ impl kameo::Actor for ForwarderActor {
                 {
                     batch.push(crate::netstack_actor::into_packet(more));
                 }
+                if counters { crate::pipeline_metrics::egress(1, batch.len()); }
                 if netstack_up.send(batch).is_err() {
                     break;
                 }
