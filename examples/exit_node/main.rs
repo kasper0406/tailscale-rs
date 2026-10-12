@@ -77,7 +77,7 @@ struct Args {
     tcp_buffer_size: Option<usize>,
 
     /// Serve a tunnel-only benchmark on this port of the node's tailnet address (0 = off). A client
-    /// that sends `d` gets an endless stream of zeros; one that sends `u` has everything discarded.
+    /// that sends `d` gets an endless stream of zeros; `u` has everything discarded; `e` is echoed.
     #[arg(long, default_value_t = 0)]
     sink_port: u16,
 
@@ -255,7 +255,8 @@ fn system_resolver() -> Option<std::net::SocketAddr> {
         .next()
 }
 
-/// One benchmark connection: `d` streams zeros to the client, `u` discards what it sends.
+/// One benchmark connection: `d` streams zeros to the client, `u` discards what it sends, `e`
+/// echoes it (latency probes).
 async fn serve_sink(mut conn: tailscale::netstack::TcpStream) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = vec![0u8; 64 * 1024];
@@ -266,6 +267,16 @@ async fn serve_sink(mut conn: tailscale::netstack::TcpStream) {
             while conn.write_all(&buf).await.is_ok() {}
         }
         (1, b'u') => while matches!(conn.read(&mut buf).await, Ok(n) if n > 0) {},
+        (1, b'e') => loop {
+            match conn.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    if conn.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        },
         _ => {}
     }
 }
