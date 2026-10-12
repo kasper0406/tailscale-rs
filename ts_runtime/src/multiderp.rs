@@ -165,7 +165,12 @@ impl Multiderp {
         let direct_sock = self.direct_sock.clone();
         let observed_routes = self.observed_routes.clone();
 
-        self.tasks.spawn(async move {
+        let resolver = self
+            .env
+            .caller_runtime
+            .clone()
+            .map(ts_derp::dial::resolver_on);
+        self.env.spawn_packet(&mut self.tasks, async move {
             let mut backoff = DerpBackoff::default();
             while !*shutdown.borrow() {
                 tokio::select! {
@@ -185,6 +190,7 @@ impl Multiderp {
                         &peer_db,
                         &direct_sock,
                         &observed_routes,
+                        resolver.clone(),
                     ) => match ret {
                         // A clean return (e.g. the connection closed without error) resets the
                         // backoff so the next failure starts from the bottom of the schedule.
@@ -480,6 +486,7 @@ async fn run_derp_once(
     peer_db: &RwLock<Option<Arc<PeerDb>>>,
     direct_sock: &RwLock<Option<Arc<MagicSock>>>,
     observed_routes: &RwLock<HashMap<PeerId, RegionId>>,
+    resolver: Option<ts_derp::dial::Resolver>,
 ) -> Result<(), ts_derp::Error> {
     // A non-home DERP connection is closed after this long without activity, matching wireguard-go's
     // `derpInactiveCleanupTime = 60 * time.Second` (wgengine/magicsock/derp.go). A shorter value tears
@@ -520,7 +527,10 @@ async fn run_derp_once(
         // Hold the client in an `Arc` so we can both wrap a clone with the PeerId<->NodeKey
         // lookup (for dataplane traffic) and keep a raw handle for `send_one` (disco frames
         // addressed directly by node public key, bypassing the PeerId mapping).
-        let client = Arc::new(ts_derp::DefaultClient::connect(&region.servers, &keys).await?);
+        let client = Arc::new(
+            ts_derp::DefaultClient::connect_with_resolver(&region.servers, &keys, resolver.clone())
+                .await?,
+        );
         let transport = client.clone().with_key_lookup(PeerDbLookup(peer_db));
 
         if let Some(pending) = pending {

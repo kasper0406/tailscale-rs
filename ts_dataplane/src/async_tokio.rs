@@ -69,8 +69,58 @@ struct CoreState {
 struct PollState {
     /// Queue for packets entering the data plane ("coming down") from overlay transports.
     from_overlay: DataplaneFromOverlay,
+    from_forwarder: Option<mpsc::Receiver<Vec<PacketMut>>>,
+    forwarder_tail: Vec<PacketMut>,
+    forwarder_probe: Option<crate::handoff_metrics::ReceiverProbe>,
     /// Queue for packets entering the data plane ("coming up") from underlay transports.
     from_underlay: DataplaneFromUnderlay,
+}
+
+fn shard_batching() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("TS_EXPERIMENT_SHARD_BATCH").as_deref(),
+            Ok("1" | "wg")
+        )
+    })
+}
+
+/// Drain ready publications from every shard, without sleeping or waiting to fill a batch.
+/// Preserve FIFO order and cap one WG turn at 64 packets; the remainder is at most 63.
+async fn receive_forwarder(
+    rx: &mut mpsc::Receiver<Vec<PacketMut>>,
+    tail: &mut Vec<PacketMut>,
+    batch: bool,
+    probe: &mut Option<crate::handoff_metrics::ReceiverProbe>,
+) -> Option<Vec<PacketMut>> {
+    let from_tail = !tail.is_empty();
+    let mut packets = if from_tail {
+        std::mem::take(tail)
+    } else {
+        std::future::poll_fn(|cx| match probe {
+            Some(probe) => probe.poll_recv(rx, cx),
+            None => rx.poll_recv(cx),
+        })
+        .await?
+    };
+    let mut publications = usize::from(!from_tail);
+    if batch {
+        while packets.len() < 64 && publications < 64 {
+            let Ok(more) = rx.try_recv() else {
+                break;
+            };
+            packets.extend(more);
+            publications += 1;
+        }
+        if packets.len() > 64 {
+            *tail = packets.split_off(64);
+        }
+    }
+    if crate::handoff_metrics::enabled() {
+        crate::handoff_metrics::receive(publications, packets.len());
+    }
+    Some(packets)
 }
 
 impl DataPlane {
@@ -102,9 +152,23 @@ impl DataPlane {
 
             poll_state: Mutex::new(PollState {
                 from_overlay: overlay_down,
+                from_forwarder: None,
+                forwarder_tail: Vec::new(),
+                forwarder_probe: crate::handoff_metrics::receiver_probe(),
                 from_underlay: underlay_up,
             }),
         }
+    }
+
+    /// Install stage-1 bounded shard egress to the same WG/dataplane owner.
+    /// At most `batches` batches are queued; producers must bound batch size too.
+    pub async fn bounded_forwarder_egress(&self, batches: usize) -> mpsc::Sender<Vec<PacketMut>> {
+        let (tx, rx) = mpsc::channel(batches);
+        // Wake step before waiting on its poll lock, which it holds across select.
+        self.transports_changed.notify_one();
+        self.poll_state.lock().await.from_forwarder = Some(rx);
+        self.transports_changed.notify_one();
+        tx
     }
 
     /// Allocate a new underlay transport.
@@ -169,6 +233,16 @@ impl DataPlane {
         }
     }
 
+    /// Run with bounded batches between cooperative yields (experimental pipeline placement).
+    pub async fn run_cooperative(&self) -> Infallible {
+        loop {
+            for _ in 0..8 {
+                self.step().await;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Run the data plane for a single step.
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn step(&self) {
@@ -201,10 +275,16 @@ impl DataPlane {
             let PollState {
                 from_overlay: overlay_down,
                 from_underlay: underlay_up,
+                from_forwarder,
+                forwarder_tail,
+                forwarder_probe,
                 ..
             } = &mut *poll_state;
 
             tokio::select! {
+                forwarder = async { receive_forwarder(from_forwarder.as_mut().unwrap(), forwarder_tail, shard_batching(), forwarder_probe).await }, if from_forwarder.is_some() => {
+                    match forwarder { Some(packets) => SelectResult::OverlayDown(packets), None => { *from_forwarder = None; SelectResult::TransportsChanged } }
+                }
                 overlay_pkts = overlay_down.recv() => {
                     let overlay_pkts = overlay_pkts.unwrap();
                     tracing::trace!(n_overlay_pkts = overlay_pkts.len());
@@ -239,6 +319,9 @@ impl DataPlane {
 
         let (to_peers, to_local) = match select_result {
             SelectResult::OverlayDown(overlay_down) => {
+                if crate::handoff_metrics::enabled() {
+                    crate::handoff_metrics::outbound(&overlay_down);
+                }
                 let OutboundResult { to_peers, loopback } =
                     core.sync.process_outbound(overlay_down);
 
@@ -378,6 +461,82 @@ fn next_wakeup<I: core::ops::Add<core::time::Duration, Output = I> + Copy>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ready_forwarder_batches_merge_with_bounded_fifo_tail_and_no_fill_wait() {
+        for batch in [false, true] {
+            let (tx, mut rx) = mpsc::channel(8);
+            for range in [0..40, 40..80, 80..120] {
+                tx.send(range.map(|n| vec![n as u8].into()).collect())
+                    .await
+                    .unwrap();
+            }
+            drop(tx);
+            let mut tail = Vec::new();
+            let mut received = Vec::new();
+            let mut sizes = Vec::new();
+            while let Some(packets) =
+                super::receive_forwarder(&mut rx, &mut tail, batch, &mut None).await
+            {
+                assert!(packets.len() <= 64);
+                sizes.push(packets.len());
+                received.extend(packets.iter().map(|p| p.as_ref()[0]));
+                assert!(tail.len() <= 63);
+            }
+            assert_eq!(received, (0u8..120).collect::<Vec<_>>());
+            assert_eq!(
+                sizes,
+                if batch {
+                    vec![64, 56]
+                } else {
+                    vec![40, 40, 40]
+                }
+            );
+        }
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(vec![vec![1].into()]).await.unwrap();
+        let mut tail = Vec::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            super::receive_forwarder(&mut rx, &mut tail, true, &mut None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "a lone packet must return without waiting to fill"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_forwarder_egress_wakes_poll_owner_and_limits_pending_batches() {
+        let dp = std::sync::Arc::new(super::DataPlane::new(ts_tunnel::NodeKeyPair::new()));
+        let owner = dp.clone();
+        let poll = tokio::spawn(async move {
+            owner.step().await;
+        });
+        tokio::task::yield_now().await;
+        let tx = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dp.bounded_forwarder_egress(2),
+        )
+        .await
+        .unwrap();
+        poll.await.unwrap();
+        tx.try_send(vec![]).unwrap();
+        tx.try_send(vec![]).unwrap();
+        assert!(tx.try_send(vec![]).is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while tx.capacity() == 0 {
+                dp.step().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(tx.try_send(vec![]).is_ok());
+    }
+
     use super::*;
 
     /// The wedge fix, distilled: with no event scheduled, the dataplane must still wake within the

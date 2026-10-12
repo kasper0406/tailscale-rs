@@ -51,6 +51,11 @@ pub(crate) const INGRESS_QUEUE_PACKETS: usize = 4096;
 /// Most packets a netstack egress pump hands the dataplane at once.
 pub(crate) const EGRESS_BATCH: usize = 64;
 
+/// Full driver/pump budgeting is independent of receive and egress publication batching.
+pub(crate) fn budget_experiment() -> bool {
+    std::env::var("TS_EXPERIMENT_NETSTACK_BUDGET").as_deref() == Ok("1")
+}
+
 /// A packet the netstack emitted, as a [`PacketMut`]: zero-copy when the pipe's buffer is uniquely
 /// owned (it always is: the pipe copies each packet in), a copy otherwise.
 pub(crate) fn into_packet(buf: bytes::Bytes) -> PacketMut {
@@ -75,6 +80,11 @@ pub(crate) fn piped_ingress_bounded(
     let max_bytes = INGRESS_QUEUE_PACKETS.saturating_mul(config.mtu);
     let (mut stack, pipe) =
         netstack::piped_ingress_bounded(config, INGRESS_QUEUE_PACKETS, max_bytes);
+    let ack_batching = std::env::var("TS_EXPERIMENT_ACK_BATCH").as_deref() == Ok("1");
+    stack.set_egress_batching(ack_batching);
+    if budget_experiment() {
+        stack.set_work_budget(Some(128));
+    }
     if match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
         Ok("1") => true,
         Ok("0") => false,
@@ -136,11 +146,14 @@ pub(crate) async fn pump_ingress_with_batch_wake(
     netstack_name: &'static str,
     cooperative: bool,
 ) -> u64 {
+    let counters = crate::pipeline_metrics::enabled();
+    let index = crate::pipeline_metrics::stack_index(netstack_name);
     let mut dropped: u64 = 0;
     let mut dropping = false;
     let mut processed = 0;
 
     while let Some(bufs) = from_dataplane.recv().await {
+        let before = dropped;
         for buf in bufs {
             if processed == 128 {
                 finish_batch();
@@ -173,6 +186,9 @@ pub(crate) async fn pump_ingress_with_batch_wake(
             }
         }
         finish_batch();
+        if counters {
+            crate::pipeline_metrics::drops(index, dropped - before);
+        }
     }
 
     dropped
@@ -238,15 +254,21 @@ impl kameo::Actor for NetstackActor {
                 tx: netstack_down_tx,
             },
         ) = piped_ingress_bounded(config);
+        if env.packet_runtime.is_some() {
+            netstack.set_work_budget(Some(128));
+        }
         let channel = netstack.command_channel();
 
         let mut joinset = JoinSet::new();
 
-        joinset.spawn(async move {
+        env.spawn_packet(&mut joinset, async move {
             netstack.run_tokio().await;
         });
 
-        joinset.spawn(async move {
+        let counters = crate::pipeline_metrics::enabled();
+        let cooperative = env.packet_runtime.is_some() || budget_experiment();
+        env.spawn_packet(&mut joinset, async move {
+            let mut turns = 0;
             while let Some(first) = netstack_down_rx.recv_async().await {
                 // Hand the dataplane whatever is already queued as one batch, so encryption and the
                 // underlay send can work per batch rather than per packet.
@@ -257,15 +279,23 @@ impl kameo::Actor for NetstackActor {
                 {
                     batch.push(crate::netstack_actor::into_packet(more));
                 }
+                if counters {
+                    crate::pipeline_metrics::egress(0, batch.len());
+                }
                 if netstack_up.send(batch).is_err() {
                     break;
+                }
+                turns += 1;
+                if cooperative && turns == 4 {
+                    tokio::task::yield_now().await;
+                    turns = 0;
                 }
             }
 
             tracing::warn!("netstack downlink shut down!");
         });
 
-        joinset.spawn(async move {
+        env.spawn_packet(&mut joinset, async move {
             let batching = match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
                 Ok("1") => true,
                 Ok("0") => false,
@@ -286,7 +316,7 @@ impl kameo::Actor for NetstackActor {
                     }
                 },
                 "application",
-                batching,
+                cooperative || batching,
             )
             .await;
 

@@ -935,9 +935,22 @@ mod driver_tests {
     }
 
     #[test]
+    fn budgeted_async_ingress_services_dirty_recv_before_returning() {
+        budgeted_ingress_services_recv(false);
+    }
+
+    #[test]
     fn receive_only_async_ingress_services_dirty_recv_before_returning() {
+        budgeted_ingress_services_recv(true);
+    }
+
+    fn budgeted_ingress_services_recv(receive_only: bool) {
         let (mut stack, dev, client, server) = pair();
-        stack.set_ingress_budget(Some(1));
+        if receive_only {
+            stack.set_ingress_budget(Some(1));
+        } else {
+            stack.set_work_budget(Some(1));
+        }
         let recv = request(
             &mut stack,
             Some(server),
@@ -970,9 +983,12 @@ mod driver_tests {
 
     #[test]
     fn receive_only_budget_drains_single_tcp_egress_in_one_poll() {
-        {
+        for full_budget in [false, true] {
             let (mut stack, dev, client, _) = pair_with_buffer(16 * 1024);
             stack.set_ingress_budget(Some(1));
+            if full_budget {
+                stack.set_work_budget(Some(128));
+            }
             request(
                 &mut stack,
                 Some(client),
@@ -994,9 +1010,18 @@ mod driver_tests {
                     .is_ready()
             );
             let packets: alloc::vec::Vec<_> = dev.inner.pipe.rx.drain().collect();
-            assert!(packets.len() > 1, "single-flow egress must keep draining");
-            assert!(stack.metrics.counts().egress_passes - before > 1);
-            assert!(!stack.should_yield(), "no receive bound was hit");
+            if full_budget {
+                // Preserve the old path as the independent A/B control: one socket pass, even
+                // though 127 transmit tokens were unused. The runner will yield here.
+                assert_eq!(packets.len(), 1);
+                assert_eq!(stack.metrics.counts().egress_passes - before, 1);
+                assert_eq!(stack.metrics.counts().egress_budget_hits, 0);
+                assert!(stack.should_yield());
+            } else {
+                assert!(packets.len() > 1, "single-flow egress must keep draining");
+                assert!(stack.metrics.counts().egress_passes - before > 1);
+                assert!(!stack.should_yield(), "no receive bound was hit");
+            }
         }
     }
 

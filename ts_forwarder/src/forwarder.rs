@@ -125,7 +125,11 @@ impl<D: RealDialer> Forwarder<D> {
         dialer: D,
         ingress: WakingPipeSender,
     ) -> (Self, PortGate) {
-        let (gate, requests) = PortGate::new(ingress, crate::all_port::MAX_PORTS);
+        let (gate, requests) = PortGate::new(
+            ingress,
+            crate::shard_resources::current()
+                .map_or(crate::all_port::MAX_PORTS, |r| r.admission.ports_per_shard),
+        );
         let mut fwd = Self::new_with_spec(
             channel,
             routes,
@@ -162,9 +166,10 @@ impl<D: RealDialer> Forwarder<D> {
             let channel = self.channel.clone();
             let routes = self.routes_rx.clone();
             let dialer = self.dialer.clone();
-            tasks.spawn(async move {
-                run_gated_all_ports(channel, routes, dialer, gate, requests).await
-            });
+            tasks.spawn(crate::shard_resources::task(
+                async move { run_gated_all_ports(channel, routes, dialer, gate, requests).await },
+                false,
+            ));
         }
 
         match self.tcp {
@@ -176,16 +181,30 @@ impl<D: RealDialer> Forwarder<D> {
                     // Explicit-port mode: no global cap. The port set is operator-configured and
                     // bounded, so the per-port caps suffice; a global cap could wrongly throttle a
                     // legitimately busy multi-port config. (All-port mode passes `Some(..)`.)
-                    tasks.spawn(async move {
-                        run_tcp_port(channel, port, routes, dialer, None, None).await
-                    });
+                    tasks.spawn(crate::shard_resources::task(
+                        async move {
+                            run_tcp_port(
+                                channel,
+                                port,
+                                routes,
+                                dialer,
+                                crate::shard_resources::current().map(|r| r.admission.tcp),
+                                None,
+                            )
+                            .await
+                        },
+                        false,
+                    ));
                 }
             }
             PortSpec::All => {
                 let channel = self.channel.clone();
                 let routes = self.routes_rx.clone();
                 let dialer = self.dialer.clone();
-                tasks.spawn(async move { run_tcp_all_ports(channel, routes, dialer).await });
+                tasks.spawn(crate::shard_resources::task(
+                    async move { run_tcp_all_ports(channel, routes, dialer).await },
+                    false,
+                ));
             }
         }
 
@@ -197,17 +216,37 @@ impl<D: RealDialer> Forwarder<D> {
                     let dialer = self.dialer.clone();
                     // Explicit-port mode: no global cap (bounded, operator-chosen port set; the
                     // per-port caps suffice). All-port mode passes `Some(..)`.
-                    tasks.spawn(async move {
-                        run_udp_port(channel, port, routes, dialer, None, None, None).await
-                    });
+                    tasks.spawn(crate::shard_resources::task(
+                        async move {
+                            run_udp_port(
+                                channel,
+                                port,
+                                routes,
+                                dialer,
+                                crate::shard_resources::current().map(|r| r.admission.udp),
+                                None,
+                                None,
+                            )
+                            .await
+                        },
+                        false,
+                    ));
                 }
             }
             PortSpec::All => {
                 let channel = self.channel.clone();
                 let routes = self.routes_rx.clone();
                 let dialer = self.dialer.clone();
-                tasks.spawn(async move { run_udp_all_ports(channel, routes, dialer).await });
+                tasks.spawn(crate::shard_resources::task(
+                    async move { run_udp_all_ports(channel, routes, dialer).await },
+                    false,
+                ));
             }
+        }
+
+        // An operator-configured empty port set is a valid idle forwarder, not shard death.
+        if tasks.is_empty() && crate::shard_resources::current().is_some() {
+            std::future::pending::<()>().await;
         }
 
         // Keep the route sender alive for the lifetime of the run so receivers don't see the
@@ -223,6 +262,10 @@ impl<D: RealDialer> Forwarder<D> {
             match res {
                 Ok(task_result) => return task_result,
                 Err(join_err) => {
+                    if let Some(resources) = crate::shard_resources::current() {
+                        resources.failed.send_replace(true);
+                        return Ok(());
+                    }
                     tracing::error!(
                         error = %join_err,
                         "forwarder task failed (panic/cancel); continuing with remaining tasks"

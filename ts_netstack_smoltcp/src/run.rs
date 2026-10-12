@@ -58,7 +58,7 @@ pub async fn run(
 
     loop {
         // Commands must get service even with a perpetually readable device.
-        if netstack.ingress_budget().is_some() {
+        if netstack.work_budget().is_some() || netstack.ingress_budget().is_some() {
             netstack.process_cmds();
         }
         let now = clock();

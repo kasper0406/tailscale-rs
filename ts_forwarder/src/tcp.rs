@@ -53,7 +53,10 @@ pub(crate) async fn run_tcp_port<D: RealDialer>(
     }
 
     // Bounds concurrent spliced flows on this listener; saturated => drop new flows.
-    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_SPLICES));
+    let inflight = Arc::new(Semaphore::new(
+        crate::shard_resources::current()
+            .map_or(MAX_INFLIGHT_SPLICES, |r| r.admission.tcp_per_port),
+    ));
 
     loop {
         let overlay = listener.accept().await?;
@@ -88,12 +91,15 @@ pub(crate) async fn run_tcp_port<D: RealDialer>(
         };
         let routes = routes.borrow().clone();
         let dialer = dialer.clone();
-        tokio::spawn(async move {
-            // Hold both permits for the whole splice lifetime; released on drop.
-            let _permit = permit;
-            let _global = global_permit;
-            splice_one(overlay, routes, dialer).await;
-        });
+        tokio::spawn(crate::shard_resources::task(
+            async move {
+                // Hold both permits for the whole splice lifetime; released on drop.
+                let _permit = permit;
+                let _global = global_permit;
+                splice_one(overlay, routes, dialer).await;
+            },
+            true,
+        ));
     }
 }
 

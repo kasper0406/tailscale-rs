@@ -2146,6 +2146,9 @@ guarantees.
     Ok(())
 }
 
+/// Experimental process-wide packet counters, enabled by TS_DEBUG_PIPELINE_METRICS=1.
+pub use ts_runtime::pipeline_metrics;
+
 #[cfg(test)]
 mod tests {
     use secrecy::ExposeSecret as _;

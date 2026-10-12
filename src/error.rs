@@ -52,6 +52,10 @@ pub enum Error {
     #[error("{}", ts_control::PEER_KEY_EXPIRED)]
     PeerKeyExpired,
 
+    /// The opt-in forwarder shard configuration or runtime could not start.
+    #[error("{0}")]
+    ForwarderShards(ts_runtime::ErrorKind),
+
     /// An error occurred which can not be anticipated or handled by a library user.
     ///
     /// This is likely due to a bug in our code or a rare and unexpected error.
@@ -164,6 +168,13 @@ impl From<ts_runtime::Error> for Error {
     fn from(value: ts_runtime::Error) -> Self {
         match value.kind {
             ts_runtime::ErrorKind::Timeout => Error::Timeout,
+            // OS thread / Tokio reactor creation failed; the runtime logs the underlying I/O error.
+            ts_runtime::ErrorKind::PipelineUnavailable => Error::Internal(InternalErrorKind::Io),
+            ts_runtime::ErrorKind::ForwarderShardsConfiguration
+            | ts_runtime::ErrorKind::ForwarderShardsUnavailable
+            | ts_runtime::ErrorKind::ForwarderShardsRequireNetstack => {
+                Error::ForwarderShards(value.kind)
+            }
             ts_runtime::ErrorKind::ActorGone
             | ts_runtime::ErrorKind::MailboxFull
             | ts_runtime::ErrorKind::ReplyErr => Error::Internal(InternalErrorKind::Actor),

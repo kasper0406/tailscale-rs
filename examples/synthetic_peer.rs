@@ -508,7 +508,7 @@ fn stack(
         tcp_buffer_size: buffer_kb * 1024,
         ..Default::default()
     });
-    stack.set_ingress_budget(Some(128));
+    stack.set_work_budget(Some(128));
     (stack, pipe)
 }
 struct FixtureDialer(SocketAddr);

@@ -156,6 +156,16 @@ pub enum ErrorKind {
     /// either panicked or exited. It's unlikely this operation can be retried successfully.
     ActorGone,
 
+    /// The explicitly requested packet pipeline thread/runtime could not be started.
+    PipelineUnavailable,
+
+    /// Invalid shard count or incompatible pipeline-thread experiment.
+    ForwarderShardsConfiguration,
+    /// A requested forwarder shard or its independent supervisor could not start.
+    ForwarderShardsUnavailable,
+    /// TUN recursive DNS currently borrows a forwarder channel; stage 1 keeps app services separate.
+    ForwarderShardsRequireNetstack,
+
     /// The actor replied with an error.
     ReplyErr,
 
@@ -183,6 +193,16 @@ pub enum ErrorKind {
 impl core::fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ForwarderShardsConfiguration => write!(
+                f,
+                "TS_EXPERIMENT_FORWARDER_SHARDS must be 1..=64; N>1 is incompatible with TS_EXPERIMENT_PIPELINE_THREAD=1"
+            ),
+            Self::ForwarderShardsUnavailable => write!(f, "forwarder shard thread unavailable"),
+            Self::ForwarderShardsRequireNetstack => write!(
+                f,
+                "TS_EXPERIMENT_FORWARDER_SHARDS>1 requires Netstack transport mode (TUN DNS shares a forwarder channel)"
+            ),
+            Self::PipelineUnavailable => write!(f, "packet pipeline thread unavailable"),
             Self::ActorGone => write!(f, "expected actor is unreachable"),
             Self::ReplyErr => write!(f, "actor replied with an error"),
             Self::MailboxFull => write!(f, "actor's mailbox was full"),

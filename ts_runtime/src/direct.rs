@@ -1140,11 +1140,10 @@ impl kameo::Actor for DirectManager {
         // sighting is forwarded to the peer tracker over `observed_tx` so that key becomes the one
         // we send to (Go `endpoint.checkAndUpdateDiscoKey`).
         let (observed_tx, observed_rx) = tokio::sync::mpsc::unbounded_channel();
-        tasks.spawn(run_disco_key_observer(
-            observed_rx,
-            env.clone(),
-            env.shutdown.clone(),
-        ));
+        env.spawn_background(
+            &mut tasks,
+            run_disco_key_observer(observed_rx, env.clone(), env.shutdown.clone()),
+        );
 
         let verifier_db = peer_db.clone();
         let binding_verifier: BindingVerifier = Arc::new(move |disco, claimed_node_key| {
@@ -1182,7 +1181,8 @@ impl kameo::Actor for DirectManager {
         .await
         {
             Ok(sock) => Arc::new(
-                sock.with_enable_ipv6(env.enable_ipv6)
+                sock.with_packet_runtime(env.packet_runtime.clone())
+                    .with_enable_ipv6(env.enable_ipv6)
                     .with_binding_verifier(binding_verifier)
                     .with_peer_cap_version(peer_cap_version),
             ),
@@ -1207,35 +1207,44 @@ impl kameo::Actor for DirectManager {
         let (transport_id, from_dataplane, to_dataplane) =
             dataplane.ask(NewUnderlayTransport).await?;
 
-        let transport = DirectTransport::new(sock.clone())
-            .with_receive_batching(receive_batching_enabled())
+        let transport = env
+            .on_packet_runtime(|| {
+                DirectTransport::new(sock.clone()).with_receive_batching(
+                    env.packet_runtime.is_some() || receive_batching_enabled(),
+                )
+            })
             .with_key_lookup(DiscoPeerLookup(peer_db.clone()));
 
-        tasks.spawn(run_direct(
-            transport,
-            from_dataplane,
-            to_dataplane,
-            env.shutdown.clone(),
-        ));
-        tasks.spawn(run_pinger(sock.clone(), env.shutdown.clone()));
-        tasks.spawn(run_advertiser(
-            sock.clone(),
-            env.clone(),
-            env.shutdown.clone(),
-        ));
+        env.spawn_packet(
+            &mut tasks,
+            run_direct(
+                transport,
+                from_dataplane,
+                to_dataplane,
+                env.shutdown.clone(),
+            ),
+        );
+        env.spawn_background(&mut tasks, run_pinger(sock.clone(), env.shutdown.clone()));
+        env.spawn_background(
+            &mut tasks,
+            run_advertiser(sock.clone(), env.clone(), env.shutdown.clone()),
+        );
         // Active STUN probing shares the one bound socket; clone the multiderp ref before it is
         // moved into run_call_me_maybe below. `peer_db`, the datapath idleness clock and the
         // `debug-always-stun` flag are cloned in so the prober can evaluate Go's
         // `shouldDoPeriodicReSTUNLocked` stop conditions itself (see `should_do_periodic_restun`).
-        tasks.spawn(run_stun_prober(
-            sock.clone(),
-            peer_db.clone(),
-            multiderp.clone(),
-            stun_cursor.clone(),
-            env.datapath_activity.clone(),
-            force_background_stun.clone(),
-            env.shutdown.clone(),
-        ));
+        env.spawn_background(
+            &mut tasks,
+            run_stun_prober(
+                sock.clone(),
+                peer_db.clone(),
+                multiderp.clone(),
+                stun_cursor.clone(),
+                env.datapath_activity.clone(),
+                force_background_stun.clone(),
+                env.shutdown.clone(),
+            ),
+        );
 
         // Hand the bound socket to multiderp so a peer's `CallMeMaybe` relayed to us over DERP is
         // demuxed into the magicsock (and can open a direct path) instead of being forwarded to the
@@ -1251,12 +1260,15 @@ impl kameo::Actor for DirectManager {
         // Clone for the struct field (the on-demand STUN sweep in `RebindAndReprobe` needs it)
         // before `run_call_me_maybe` consumes the original.
         let multiderp_for_field = multiderp.clone();
-        tasks.spawn(run_call_me_maybe(
-            sock.clone(),
-            peer_db.clone(),
-            multiderp,
-            env.shutdown.clone(),
-        ));
+        env.spawn_background(
+            &mut tasks,
+            run_call_me_maybe(
+                sock.clone(),
+                peer_db.clone(),
+                multiderp,
+                env.shutdown.clone(),
+            ),
+        );
 
         Ok(Self {
             sock: Some(sock),

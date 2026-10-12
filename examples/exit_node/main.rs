@@ -120,11 +120,20 @@ fn parse_serve_tcp(s: &str) -> Result<(u16, std::net::SocketAddr), String> {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.worker_threads.max(1))
         .enable_all()
-        .build()?
-        .block_on(run(args))
+        .build()?;
+    let result = runtime.block_on(run(args));
+    // A system DNS lookup cannot be cancelled inside getaddrinfo. Device pipeline threads have
+    // joined by now; bound the caller pool teardown too. Process exit reclaims a stuck OS lookup.
+    if matches!(
+        std::env::var("TS_EXPERIMENT_PIPELINE_THREAD").as_deref(),
+        Ok("1")
+    ) {
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+    result
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn Error>> {
@@ -261,6 +270,14 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
 }
 
 async fn log_status(dev: &Device) {
+    if tailscale::pipeline_metrics::enabled() {
+        let m = tailscale::pipeline_metrics::snapshot();
+        tracing::info!(app_drops = m.ingress_drops[0], forwarder_drops = m.ingress_drops[1],
+            egress_batches = ?m.egress_batches, sendmsg_x_batches = ?m.sendmsg_x_batches, sendmsg_x_offered_batches = ?m.sendmsg_x_offered_batches,
+            thread_cpu_ns = ?m.thread_cpu_ns, netstack = ?m.netstack, receive = ?m.receive,
+            splice = ?m.splice, forwarder_shards = ?m.forwarder_shards,
+                    wg_handoff = ?m.wg_handoff, "pipeline metrics (cumulative)");
+    }
     // Never let a status query stall the main loop (and with it signal handling).
     let status = match tokio::time::timeout(Duration::from_secs(5), dev.status()).await {
         Ok(Ok(s)) => s,

@@ -204,6 +204,11 @@ async fn spawn_forwarder(
     };
     let mut peer = Netstack::new(dev(p1), config.clone());
     let mut fwd = Netstack::new(dev(p2), config);
+    if let Ok(budget) = std::env::var("NETSTACK_WORK_BUDGET") {
+        let budget: usize = budget.parse().expect("NETSTACK_WORK_BUDGET is an integer");
+        peer.set_work_budget((budget > 0).then_some(budget));
+        fwd.set_work_budget((budget > 0).then_some(budget));
+    }
     let peer_ch = peer.command_channel();
     let fwd_ch = fwd.command_channel();
     tokio::spawn(async move { peer.run_tokio().await });

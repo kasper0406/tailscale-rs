@@ -40,6 +40,7 @@ pub mod exit_node_suggest;
 /// Fallback TCP handler registry (`tsnet.Server.RegisterFallbackTCPHandler` parity).
 pub mod fallback_tcp;
 mod forwarder_actor;
+mod forwarder_shards;
 /// Client-side Funnel ingress termination (`tsnet`'s `ListenFunnel` data path).
 pub mod funnel;
 /// Unified IPN notification bus ([`Notify`] / [`watch_ipn_bus`](Runtime::watch_ipn_bus)), mirroring
@@ -57,6 +58,8 @@ mod packetfilter;
 pub mod peer_tracker;
 mod peerapi;
 mod peerapi_doh;
+mod pipeline;
+pub mod pipeline_metrics;
 mod route_updater;
 mod security;
 /// Stored Serve config + accept-loop runtime (`tsnet`'s `Get/SetServeConfig` + serving runtime).
@@ -117,6 +120,10 @@ pub struct Runtime {
     env: Env,
     shutdown: watch::Sender<bool>,
     _security: security::SecurityGuard,
+    // After security: kill supervised tasks before dropping/joining their runtime.
+    _pipeline: Option<pipeline::PipelineRuntimes>,
+    _shard_threads: Vec<pipeline::PipelineThread>,
+    _shard_supervisor: Option<pipeline::PipelineThread>,
     /// Sender side of the exit-node selector `watch` cell. Held privately here (not on the cloned
     /// `Env`, which keeps only the read side) so that only `Runtime::set_exit_node` can mutate the
     /// selection; the route updater and source filter re-read it via [`Env::exit_node`].
@@ -170,11 +177,68 @@ pub struct Runtime {
 
 impl Runtime {
     /// Spawn a new runtime with the given parameters for connecting to a tailnet.
+    ///
+    /// Experimental: `TS_EXPERIMENT_PIPELINE_THREAD=1` places the serial packet path on a
+    /// dedicated current-thread Tokio runtime named `ts-packet-pipeline`. Control, listeners,
+    /// and per-flow forwarding remain on the caller runtime. Unset/other values keep ambient
+    /// placement. The thread is owned here and joined on shutdown/drop, including failed startup.
     pub async fn spawn(
         config: ts_control::Config,
         auth_key: Option<String>,
         keys: ts_keys::NodeState,
     ) -> Result<Self, Error> {
+        let shard_count = forwarder_shards::count_from_env().map_err(|e| {
+            tracing::error!(error = %e, "invalid forwarder shard configuration");
+            Error {
+                kind: ErrorKind::ForwarderShardsConfiguration,
+                message_ty: None,
+                target_actor: None,
+            }
+        })?;
+        let pipeline = pipeline::PipelineRuntimes::from_env().map_err(|e| {
+            tracing::error!(error = %e, "starting packet pipeline thread");
+            Error {
+                kind: ErrorKind::PipelineUnavailable,
+                message_ty: None,
+                target_actor: None,
+            }
+        })?;
+        if shard_count > 1 && matches!(&config.transport_mode, ts_control::TransportMode::Tun(_)) {
+            return Err(Error {
+                kind: ErrorKind::ForwarderShardsRequireNetstack,
+                message_ty: None,
+                target_actor: None,
+            });
+        }
+        let mut shard_threads = Vec::new();
+        if shard_count > 1 {
+            for i in 0..shard_count {
+                shard_threads.push(
+                    pipeline::PipelineThread::named(&format!("ts-fwd-shard-{i}")).map_err(|e| {
+                        tracing::error!(error=%e, "starting forwarder shard thread");
+                        Error {
+                            kind: ErrorKind::ForwarderShardsUnavailable,
+                            message_ty: None,
+                            target_actor: None,
+                        }
+                    })?,
+                );
+            }
+        }
+        let shard_supervisor = if shard_count > 1 {
+            Some(
+                pipeline::PipelineThread::named("ts-security-guard").map_err(|e| {
+                    tracing::error!(error=%e, "starting shard supervisor");
+                    Error {
+                        kind: ErrorKind::ForwarderShardsUnavailable,
+                        message_ty: None,
+                        target_actor: None,
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // The exit-node selector, accept-routes, and accept-dns preferences are live `watch` cells so
@@ -182,13 +246,38 @@ impl Runtime {
         // `new_with_runtime_txs` returns each `Sender` (mutation capability) grouped in `pref_cells`
         // so they are retained privately on the `Runtime`, while only the `Receiver`s (the readers'
         // contract) live on the cloned `Env`. Initial values come from `ForwarderConfig`.
-        let (env, pref_cells) = Env::new_with_runtime_txs(
+        let (mut env, pref_cells) = Env::new_with_runtime_txs(
             keys,
             shutdown_rx,
             env::ForwarderConfig::from_control_config(&config),
         );
 
-        let mut security = security::SecurityGuard::new(shutdown_tx.clone());
+        env.forwarder_shards = shard_count;
+        env.forwarder_stops = Arc::new(
+            shard_threads
+                .iter()
+                .map(pipeline::PipelineThread::stop_handle)
+                .collect(),
+        );
+        env.forwarder_handles = Arc::new(
+            shard_threads
+                .iter()
+                .map(pipeline::PipelineThread::handle)
+                .collect(),
+        );
+        env.packet_runtime = pipeline.as_ref().map(pipeline::PipelineRuntimes::handle);
+        env.supervisor_runtime = pipeline
+            .as_ref()
+            .map(pipeline::PipelineRuntimes::supervisor_handle)
+            .or_else(|| {
+                shard_supervisor
+                    .as_ref()
+                    .map(pipeline::PipelineThread::handle)
+            });
+        env.caller_runtime = pipeline.as_ref().map(|_| tokio::runtime::Handle::current());
+
+        let mut security =
+            security::SecurityGuard::new(shutdown_tx.clone(), env.supervisor_runtime.clone());
         security.watch(&env.bus);
         security.ready(&env.bus).await?;
 
@@ -205,7 +294,7 @@ impl Runtime {
         };
         let netstack_config = netstack_config_from(config.tcp_buffer_size, configured_mtu);
 
-        let dataplane = DataplaneActor::spawn(env.clone());
+        let dataplane = env.on_packet_runtime(|| DataplaneActor::spawn(env.clone()));
         security.watch(&dataplane);
         security.ready(&dataplane).await?;
         security.packet_pump(dataplane.ask(dataplane::PacketPumpAbortHandle).await?);
@@ -234,9 +323,20 @@ impl Runtime {
         // Spawn the direct (disco) underlay manager before the route updater. Its `on_start`
         // binds the UDP socket and registers its transport synchronously, so by the time the
         // route updater asks it for the direct transport id it is guaranteed to be available.
-        let direct = DirectManager::spawn((env.clone(), dataplane.clone(), multiderp.clone()));
+        let direct = env.on_packet_runtime(|| {
+            DirectManager::spawn((env.clone(), dataplane.clone(), multiderp.clone()))
+        });
         security.watch(&direct);
         security.ready(&direct).await?;
+
+        let forwarder_up = if shard_count > 1 {
+            let (up,) = dataplane
+                .ask(dataplane::BoundForwarderEgress { up: forwarder_up })
+                .await?;
+            up
+        } else {
+            forwarder_up
+        };
 
         // Spawn the forwarder before the route updater. Its `on_start` builds the forwarder
         // netstack, enables any-IP acceptance, and starts the per-port accept loops synchronously,
@@ -250,6 +350,22 @@ impl Runtime {
         ));
         security.watch(&forwarder);
         security.ready(&forwarder).await?;
+        if shard_count > 1
+            && let Some(sink) = forwarder.ask(forwarder_actor::ShardDispatch).await?
+        {
+            let owners = forwarder
+                .ask(forwarder_actor::ShardOwnership)
+                .await?
+                .expect("shard dispatch has ownership ledger");
+            dataplane
+                .ask(dataplane::AuthenticatedForwarder {
+                    id: forwarder_id,
+                    sink,
+                    forwarder: forwarder.clone(),
+                    owners,
+                })
+                .await?;
+        }
         // Force `on_start` to finish (any-IP enabled, accept loops live) before the route updater
         // can route the first inbound flow to `forwarder_id`: an `ask` blocks until the actor has
         // started.
@@ -325,12 +441,9 @@ impl Runtime {
         //   mismatch knowable at spawn time). NEVER silently fall back to netstack.
         let (netstack, fallback_tcp, magic_dns) = match &config.transport_mode {
             ts_control::TransportMode::Netstack => {
-                let netstack = NetstackActor::spawn((
-                    env.clone(),
-                    netstack_config,
-                    netstack_up,
-                    netstack_down,
-                ));
+                let netstack = env.on_packet_runtime(|| {
+                    NetstackActor::spawn((env.clone(), netstack_config, netstack_up, netstack_down))
+                });
 
                 security.watch(&netstack);
                 security.ready(&netstack).await?;
@@ -493,6 +606,9 @@ impl Runtime {
             env,
             shutdown: shutdown_tx,
             _security: security,
+            _pipeline: pipeline,
+            _shard_threads: shard_threads,
+            _shard_supervisor: shard_supervisor,
             exit_node_tx: pref_cells.exit_node,
             accept_routes_tx: pref_cells.accept_routes,
             accept_dns_tx: pref_cells.accept_dns,

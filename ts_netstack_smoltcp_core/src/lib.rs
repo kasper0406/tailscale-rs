@@ -58,6 +58,7 @@ const ORPHAN_SWEEP_INTERVAL: smoltcp::time::Duration = smoltcp::time::Duration::
 
 /// Internally i/o free userspace network stack built around `smoltcp`.
 pub struct Netstack {
+    work_budget: Option<usize>,
     ingress_budget: Option<usize>,
     ingress_budget_exhausted: bool,
     metrics: Metrics,
@@ -95,6 +96,7 @@ pub struct Netstack {
 
     /// Count maintained by the socket wrappers; avoids a scan to arm maintenance.
     tcp_socket_count: usize,
+    tcp_socket_counter: Option<alloc::sync::Arc<core::sync::atomic::AtomicUsize>>,
     next_orphan_sweep: smoltcp::time::Instant,
 
     /// Set of TCP socket handles that are expected to close in the future, held onto for
@@ -145,6 +147,7 @@ impl Netstack {
         };
 
         Netstack {
+            work_budget: None,
             ingress_budget: None,
             ingress_budget_exhausted: false,
             metrics: Metrics::new(),
@@ -158,6 +161,7 @@ impl Netstack {
             socket_registry: BTreeMap::new(),
             next_gen: 0,
             tcp_socket_count: 0,
+            tcp_socket_counter: None,
             next_orphan_sweep: now + ORPHAN_SWEEP_INTERVAL,
             pending_tcp_closes: Default::default(),
             connecting_tcp_sockets: Default::default(),
@@ -190,6 +194,7 @@ impl Netstack {
         );
         if T::KIND == SocketKind::Tcp {
             self.tcp_socket_count += 1;
+            self.publish_tcp_count();
         }
         h
     }
@@ -207,10 +212,26 @@ impl Netstack {
             .is_some_and(|entry| entry.kind == SocketKind::Tcp)
         {
             self.tcp_socket_count -= 1;
+            self.publish_tcp_count();
         }
         self.pending_tcp_closes.remove(&handle);
         self.connecting_tcp_sockets.remove(&handle);
         self.socket_set.remove(handle);
+    }
+
+    /// Enable a live TCP socket gauge for one stack. Includes idle listeners, SYN backlog,
+    /// established connections and sockets closing or in TIME_WAIT, not just host splices.
+    pub fn tcp_socket_counter(&mut self) -> alloc::sync::Arc<core::sync::atomic::AtomicUsize> {
+        self.tcp_socket_counter
+            .get_or_insert_with(|| {
+                alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(self.tcp_socket_count))
+            })
+            .clone()
+    }
+    fn publish_tcp_count(&self) {
+        if let Some(counter) = &self.tcp_socket_counter {
+            counter.store(self.tcp_socket_count, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Current generation of `handle`, or `None` if no live socket occupies that slot.
@@ -245,8 +266,14 @@ impl Netstack {
         deadline
     }
 
+    /// Obtain per-stack metrics when TS_DEBUG_PIPELINE_METRICS=1.
+    pub fn metrics_handle(&self) -> Option<pipeline_metrics::Handle> {
+        self.metrics.handle()
+    }
+
     /// Report the amount of time until the netstack should next be polled.
     pub fn poll_delay(&mut self, now: smoltcp::time::Instant) -> Option<core::time::Duration> {
+        self.metrics.record(Metric::PollDelayScans, 1);
         self.poll_at(now).map(|deadline| {
             if deadline > now {
                 (deadline - now).into()
@@ -256,10 +283,21 @@ impl Netstack {
         })
     }
 
+    /// Bound async ingress/egress and command work per drain. None retains unbounded drains.
+    pub fn set_work_budget(&mut self, budget: Option<usize>) {
+        self.work_budget = budget.map(|n| n.max(1));
+    }
+    /// Configured maximum items per async drain.
+    pub fn work_budget(&self) -> Option<usize> {
+        self.work_budget
+    }
+
     /// Limit receive work per async poll without limiting transmit tokens or egress passes.
+    /// Full work budgeting, when configured, takes precedence.
     pub fn set_ingress_budget(&mut self, budget: Option<usize>) {
         self.ingress_budget = budget.map(|n| n.max(1));
     }
+
     /// Configured receive-only bound.
     pub fn ingress_budget(&self) -> Option<usize> {
         self.ingress_budget
@@ -267,14 +305,19 @@ impl Netstack {
     /// Whether the async runner should yield after the last I/O poll. Receive-only budgeting
     /// yields on exhaustion, rather than on every short receive or socket command.
     pub fn should_yield(&self) -> bool {
-        self.ingress_budget_exhausted
+        self.work_budget.is_some() || self.ingress_budget_exhausted
     }
 
     /// Process all commands available in the command queue.
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn process_cmds(&mut self) {
-        while let Ok(cmd) = self.command_rx.try_recv() {
+        let mut remaining = self.work_budget.unwrap_or(usize::MAX);
+        while remaining > 0 {
+            let Ok(cmd) = self.command_rx.try_recv() else {
+                break;
+            };
             self.process_one_cmd(cmd);
+            remaining -= 1;
         }
     }
 
@@ -504,7 +547,7 @@ impl Netstack {
     /// - `Poll::Ready(false)`: we received packets but socket state did not make progress
     /// - `Poll::Ready(true)`: socket state progressed, or a budgeted drain consumed packets
     ///
-    /// With no receive budget all available packets are drained. A bounded call may return
+    /// With neither a full nor receive-only budget all available packets are drained. A bounded call may return
     /// ready at the budget limit, requiring another driver turn.
     ///
     /// Unlike the synchronous [`poll_device_io`](Self::poll_device_io), this does **not** call
@@ -522,7 +565,7 @@ impl Netstack {
         let mut changed = false;
         let mut polled_successfully = false;
         let mut processed = false;
-        let budget = self.ingress_budget;
+        let budget = self.work_budget.or(self.ingress_budget);
         let budgeted = budget.is_some();
         self.ingress_budget_exhausted = false;
 
@@ -607,9 +650,25 @@ impl Netstack {
         core::task::ready!(dev.as_mut().poll_tx(cx));
         self.metrics.record(Metric::EgressPasses, 1);
 
-        let result = self
-            .iface
-            .poll_egress(now, dev.as_mut().get_mut(), &mut self.socket_set);
+        let (result, exhausted) = if let Some(budget) = self.work_budget {
+            let mut limited = TxBudget {
+                dev: dev.as_mut().get_mut(),
+                remaining: budget,
+            };
+            let result = self
+                .iface
+                .poll_egress(now, &mut limited, &mut self.socket_set);
+            (result, limited.remaining == 0)
+        } else {
+            (
+                self.iface
+                    .poll_egress(now, dev.as_mut().get_mut(), &mut self.socket_set),
+                false,
+            )
+        };
+        if exhausted {
+            self.metrics.record(Metric::EgressBudgetHits, 1);
+        }
         match result {
             PollResult::SocketStateChanged => {
                 tracing::trace!("socket state changed");
@@ -620,7 +679,7 @@ impl Netstack {
 
                 Poll::Ready(true)
             }
-            PollResult::None => Poll::Ready(false),
+            PollResult::None => Poll::Ready(exhausted),
         }
     }
 
@@ -698,7 +757,7 @@ impl Netstack {
 
     /// Attempt to send and receive packets on `dev`.
     ///
-    /// The future becomes ready when `dev` sends or receives packets on the network. With no receive budget all synchronously-available network I/O is performed.
+    /// The future becomes ready when `dev` sends or receives packets on the network. With no work budget all synchronously-available network I/O is performed.
     ///
     /// Assumes that alarms are handled separately and that `now` does not advance
     /// over the course of the polled future.
@@ -722,7 +781,7 @@ impl Netstack {
 /// A future that becomes ready when the contained `smoltcp::phy::Device` sends or receives
 /// packets on the network.
 ///
-/// Without a receive budget the future completes all synchronously-available network I/O, polling
+/// Without a work budget the future completes all synchronously-available network I/O, polling
 /// until `dev.poll_rx` and `dev.poll_tx` return `Poll::Pending`, and/or until the netstack
 /// reports that there are no more packets to be sent.
 /// A receive-only budget limits one ingress drain per poll while egress continues until idle.
@@ -788,7 +847,8 @@ where
         let mut egress_pending = false;
         let mut progress_made = false;
 
-        let ingress_only = stack.ingress_budget.is_some();
+        let budgeted = stack.work_budget.is_some();
+        let ingress_only = !budgeted && stack.ingress_budget.is_some();
         let mut ingress_polled = false;
         while !(ingress_pending && (*egress_done || egress_pending)) {
             tracing::trace_span!("poll_loop", ingress_pending, egress_done, egress_pending);
@@ -842,16 +902,60 @@ where
                     }
                 }
             }
+            if budgeted {
+                break;
+            }
         }
 
         stack.pump_targeted_commands();
         progress_made |= stack.drain_tcp_closes(now);
+        dev.as_mut().finish_turn();
         if progress_made {
             stack.metrics.record(Metric::IoReady, 1);
             Poll::Ready(())
         } else {
             Poll::Pending
         }
+    }
+}
+
+impl Drop for Netstack {
+    fn drop(&mut self) {
+        if let Some(counter) = &self.tcp_socket_counter {
+            counter.store(0, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Limit transmit tokens inside smoltcp's synchronous egress pass as well as ingress iterations.
+struct TxBudget<'a, D> {
+    dev: &'a mut D,
+    remaining: usize,
+}
+impl<D: smoltcp::phy::Device> smoltcp::phy::Device for TxBudget<'_, D> {
+    type RxToken<'a>
+        = D::RxToken<'a>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = D::TxToken<'a>
+    where
+        Self: 'a;
+    fn receive(
+        &mut self,
+        now: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.dev.receive(now)
+    }
+    fn transmit(&mut self, now: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        self.dev.transmit(now)
+    }
+    fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
+        self.dev.capabilities()
     }
 }
 

@@ -8,6 +8,9 @@ use core::{
 /// The point of this is to bolt a `poll` mechanism onto [`smoltcp::phy::Device`], as it
 /// internally lacks any awareness of an external event loop.
 pub trait AsyncWakeDevice {
+    /// Publish output buffered during this poll. Called before returning Ready or Pending.
+    fn finish_turn(self: Pin<&mut Self>) {}
+
     /// Poll the device to make progress on [`smoltcp::phy::Device::receive`].
     ///
     /// Must only return [`Poll::Ready`] when it's possible to call `receive` and get a

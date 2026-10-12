@@ -57,6 +57,7 @@ mod dialer;
 mod forwarder;
 mod ipv6_reject;
 mod port_gate;
+mod shard_resources;
 mod splice;
 pub mod splice_metrics;
 mod tcp;
@@ -65,8 +66,9 @@ mod udp;
 pub use class::{FlowClass, RouteTable};
 pub use dialer::{
     BenchRedirectDialer, DialError, DialedUdp, DirectDialer, ExitDnsDialer, HostExitDialer,
-    ProxyConfig, ProxyExitDialer, ProxyScheme, RealDialer,
+    ProxyConfig, ProxyExitDialer, ProxyScheme, RealDialer, exit_dst_is_forbidden,
 };
 pub use forwarder::{Forwarder, PortSpec, RouteUpdater};
 pub use ipv6_reject::reject_ipv6;
-pub use port_gate::{Admit, PortGate};
+pub use port_gate::{Admit, GateSnapshot, PortGate};
+pub use shard_resources::{ShardAdmission, ShardResources, task as shard_task};

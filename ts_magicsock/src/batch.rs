@@ -14,6 +14,27 @@ use tokio::{io::Interest, net::UdpSocket};
 /// Most datagrams per `sendmsg_x` call.
 pub(crate) const MAX_BATCH: usize = 64;
 
+static HIST_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static HIST: [std::sync::atomic::AtomicU64; 65] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 65];
+static OFFERED: [std::sync::atomic::AtomicU64; 65] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 65];
+/// Read cumulative completed kernel sends by actual batch size 0..64.
+pub fn histogram() -> [u64; 65] {
+    core::array::from_fn(|i| HIST[i].load(Ordering::Relaxed))
+}
+/// Read attempted kernel sends by offered size, including failures/retries.
+pub fn offered_histogram() -> [u64; 65] {
+    core::array::from_fn(|i| OFFERED[i].load(Ordering::Relaxed))
+}
+fn count(hist: &[std::sync::atomic::AtomicU64; 65], n: usize) {
+    if *HIST_ENABLED
+        .get_or_init(|| std::env::var("TS_DEBUG_PIPELINE_METRICS").as_deref() == Ok("1"))
+    {
+        hist[n.min(64)].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Cleared if `sendmsg_x` turns out to be unusable at runtime.
 static USABLE: AtomicBool = AtomicBool::new(true);
 
@@ -30,7 +51,14 @@ pub(crate) async fn send<P: AsRef<[u8]>>(sock: &UdpSocket, pkts: &[P]) -> usize 
     while sent < pkts.len() {
         let chunk = &pkts[sent..pkts.len().min(sent + MAX_BATCH)];
         match sock
-            .async_io(Interest::WRITABLE, || sys::send_batch(sock, chunk))
+            .async_io(Interest::WRITABLE, || {
+                count(&OFFERED, chunk.len());
+                let result = sys::send_batch(sock, chunk);
+                if let Ok(sent) = result {
+                    count(&HIST, sent);
+                }
+                result
+            })
             .await
         {
             // The kernel may take fewer than offered; continue with the rest.

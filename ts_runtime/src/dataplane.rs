@@ -113,6 +113,7 @@ impl Default for DatapathActivity {
 #[derive(Clone)]
 pub struct OverlayToDataplane {
     tx: mpsc::UnboundedSender<Vec<PacketMut>>,
+    bounded: Option<mpsc::Sender<Vec<PacketMut>>>,
     activity: DatapathActivity,
 }
 
@@ -126,11 +127,80 @@ impl OverlayToDataplane {
         &self,
         packets: Vec<PacketMut>,
     ) -> Result<(), mpsc::error::SendError<Vec<PacketMut>>> {
-        let sent = self.tx.send(packets);
+        let sent = if let Some(tx) = &self.bounded {
+            tx.try_send(packets)
+                .map_err(|e| mpsc::error::SendError(e.into_inner()))
+        } else {
+            self.tx.send(packets)
+        };
         if sent.is_ok() {
             self.activity.note_send();
         }
         sent
+    }
+
+    /// Reserve bounded capacity before converting buffers, so failure keeps the original batch.
+    pub(crate) fn try_send_bytes(
+        &self,
+        buffers: Vec<bytes::Bytes>,
+    ) -> Result<(), Vec<bytes::Bytes>> {
+        let Some(tx) = &self.bounded else {
+            return Err(buffers);
+        };
+        let Ok(permit) = tx.try_reserve() else {
+            return Err(buffers);
+        };
+        permit.send(
+            buffers
+                .into_iter()
+                .map(crate::netstack_actor::into_packet)
+                .collect(),
+        );
+        self.activity.note_send();
+        Ok(())
+    }
+
+    pub(crate) async fn send_wait_counted(
+        &self,
+        packets: Vec<PacketMut>,
+        metrics: Option<&crate::forwarder_shards::Metrics>,
+    ) -> Result<(), mpsc::error::SendError<Vec<PacketMut>>> {
+        if let Some(tx) = &self.bounded {
+            let sent = if let Some(metrics) = metrics {
+                use std::future::Future;
+                let mut send = std::pin::pin!(tx.send(packets));
+                let mut counted = false;
+                std::future::poll_fn(|cx| {
+                    let result = send.as_mut().poll(cx);
+                    if result.is_pending() && tx.capacity() == 0 && !counted {
+                        metrics.wg_wait();
+                        counted = true;
+                    }
+                    result
+                })
+                .await
+            } else {
+                tx.send(packets).await
+            };
+            if sent.is_ok() {
+                self.activity.note_send();
+            }
+            sent
+        } else {
+            self.send(packets)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_probe(
+        tx: mpsc::UnboundedSender<Vec<PacketMut>>,
+        bounded: Option<mpsc::Sender<Vec<PacketMut>>>,
+    ) -> Self {
+        Self {
+            tx,
+            bounded,
+            activity: DatapathActivity::default(),
+        }
     }
 
     /// A send half feeding `activity`, paired with its receiver, so a test can drive the real
@@ -139,7 +209,14 @@ impl OverlayToDataplane {
     #[cfg(test)]
     pub(crate) fn for_test(activity: DatapathActivity) -> (Self, OverlayFromDataplane) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Self { tx, activity }, rx)
+        (
+            Self {
+                tx,
+                bounded: None,
+                activity,
+            },
+            rx,
+        )
     }
 }
 
@@ -173,6 +250,7 @@ pub struct PeerDiscoKeyAdvertisement {
 }
 
 pub struct DataplaneActor {
+    forwarder_security: Option<ActorRef<crate::forwarder_actor::ForwarderActor>>,
     dataplane: Arc<ts_dataplane::async_tokio::DataPlane>,
     task: tokio::task::JoinHandle<()>,
     /// Forwards TSMP-learned peer disco keys from the dataplane onto the bus.
@@ -215,10 +293,35 @@ impl DataplaneActor {
             id,
             OverlayToDataplane {
                 tx,
+                bounded: None,
                 activity: self.datapath_activity.clone(),
             },
             rx,
         )
+    }
+
+    #[message]
+    pub async fn bound_forwarder_egress(
+        &self,
+        mut up: OverlayToDataplane,
+    ) -> (OverlayToDataplane,) {
+        up.bounded = Some(self.dataplane.bounded_forwarder_egress(64).await);
+        (up,)
+    }
+
+    /// Install the opt-in authenticated forwarder delivery without changing app transports.
+    #[message]
+    pub async fn authenticated_forwarder(
+        &mut self,
+        id: OverlayTransportId,
+        sink: ts_dataplane::AuthenticatedOverlaySink,
+        forwarder: ActorRef<crate::forwarder_actor::ForwarderActor>,
+        owners: ts_dataplane::ForwarderSourceOwners,
+    ) {
+        self.forwarder_security = Some(forwarder);
+        let dp = &mut *self.dataplane.inner().await;
+        dp.authenticated_overlay = Some((id, sink));
+        dp.forwarder_source_owners = Some(owners);
     }
 
     #[message]
@@ -269,19 +372,21 @@ impl kameo::Actor for DataplaneActor {
         dataplane.install_disco_key_sink(Some(disco_key_tx)).await;
 
         let disco_key_env = env.clone();
-        let disco_key_task = tokio::task::spawn(async move {
-            while let Some((peer, advert)) = disco_key_rx.recv().await {
-                let key = ts_keys::DiscoPublicKey::from(advert.key);
+        let disco_key_task = crate::pipeline::enter(env.caller_runtime.as_ref(), || {
+            tokio::task::spawn(async move {
+                while let Some((peer, advert)) = disco_key_rx.recv().await {
+                    let key = ts_keys::DiscoPublicKey::from(advert.key);
 
-                tracing::debug!(?peer, %key, "publishing TSMP-advertised peer disco key");
+                    tracing::debug!(?peer, %key, "publishing TSMP-advertised peer disco key");
 
-                if let Err(e) = disco_key_env
-                    .publish(PeerDiscoKeyAdvertisement { peer, key })
-                    .await
-                {
-                    tracing::error!(error = %e, "publishing TSMP disco-key advertisement");
+                    if let Err(e) = disco_key_env
+                        .publish(PeerDiscoKeyAdvertisement { peer, key })
+                        .await
+                    {
+                        tracing::error!(error = %e, "publishing TSMP disco-key advertisement");
+                    }
                 }
-            }
+            })
         });
 
         env.subscribe::<PeerRouteUpdate>(&slf).await?;
@@ -295,13 +400,19 @@ impl kameo::Actor for DataplaneActor {
 
         let task_dataplane = dataplane.clone();
 
+        let cooperative = env.packet_runtime.is_some();
         let task = tokio::task::spawn(async move {
-            task_dataplane.run().await;
+            if cooperative {
+                task_dataplane.run_cooperative().await;
+            } else {
+                task_dataplane.run().await;
+            }
         });
 
         tracing::trace!("dataplane running");
 
         Ok(Self {
+            forwarder_security: None,
             dataplane,
             task,
             disco_key_task,
@@ -347,7 +458,13 @@ impl Message<SelfRouteUpdate> for DataplaneActor {
 impl Message<PacketFilterState> for DataplaneActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: PacketFilterState, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, msg: PacketFilterState, ctx: &mut Context<Self, Self::Reply>) {
+        if let Some(forwarder) = &self.forwarder_security
+            && forwarder.ask(msg.clone()).await.is_err()
+        {
+            ctx.actor_ref().kill();
+            return;
+        }
         {
             let dp = &mut *self.dataplane.inner().await;
             dp.packet_filter = msg.0;
@@ -360,7 +477,13 @@ impl Message<PacketFilterState> for DataplaneActor {
 impl Message<SourceFilterState> for DataplaneActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: SourceFilterState, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, msg: SourceFilterState, ctx: &mut Context<Self, Self::Reply>) {
+        if let Some(forwarder) = &self.forwarder_security
+            && forwarder.ask(msg.clone()).await.is_err()
+        {
+            ctx.actor_ref().kill();
+            return;
+        }
         {
             let dp = &mut *self.dataplane.inner().await;
             dp.src_filter_in = msg.0;
