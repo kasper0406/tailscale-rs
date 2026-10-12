@@ -311,6 +311,13 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+ts_forwarder.workspace = true
+ts_tunnel.workspace = true
+ts_magicsock.workspace = true
+zeroize.workspace = true
+zerocopy.workspace = true
+libc = "0.2"
+socket2 = "0.6"
 # Dependencies for examples
 clap = { workspace = true, features = ["derive", "env", "string"] }
 chrono.workspace = true

@@ -42,7 +42,7 @@ pub use disco::{
     GeneveKind, Inbound, RelayHandshakeCommon, TxId, geneve_encap_disco, geneve_encap_wireguard,
     geneve_prefix, looks_like_disco, open, random_tx_id, seal_call_me_maybe,
     seal_call_me_maybe_via, seal_ping, seal_relay_bind, seal_relay_bind_answer,
-    seal_relay_bind_challenge,
+    seal_relay_bind_challenge, seal_pong,
 };
 pub use endpoint::{SelfEndpoint, SelfEndpointType};
 pub use error::{DiscoError, Error};
