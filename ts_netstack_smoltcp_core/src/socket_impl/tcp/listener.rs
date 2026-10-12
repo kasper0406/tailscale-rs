@@ -601,7 +601,7 @@ mod tests {
             "abort() reaches Closed synchronously"
         );
 
-        stack.drain_tcp_closes();
+        stack.drain_tcp_closes(stack.next_orphan_sweep);
 
         // After drain, the handle is gone from both the pending list and the socket set (its
         // buffers are freed). A `get` on a removed handle would panic, so assert via the registry.
