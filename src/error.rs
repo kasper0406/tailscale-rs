@@ -164,6 +164,8 @@ impl From<ts_runtime::Error> for Error {
     fn from(value: ts_runtime::Error) -> Self {
         match value.kind {
             ts_runtime::ErrorKind::Timeout => Error::Timeout,
+            // OS thread / Tokio reactor creation failed; the runtime logs the underlying I/O error.
+            ts_runtime::ErrorKind::PipelineUnavailable => Error::Internal(InternalErrorKind::Io),
             ts_runtime::ErrorKind::ActorGone
             | ts_runtime::ErrorKind::MailboxFull
             | ts_runtime::ErrorKind::ReplyErr => Error::Internal(InternalErrorKind::Actor),

@@ -411,6 +411,13 @@ type RelaySendTap = mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>;
 type RelaySendTapRx = mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>;
 
 impl MagicSock {
+    /// Place dynamically opened connected UDP sockets and their receive pumps on this runtime.
+    /// The owner must keep it alive until the socket has stopped. None keeps ambient placement.
+    pub fn with_packet_runtime(self, runtime: Option<tokio::runtime::Handle>) -> Self {
+        lock(&self.connected).packet_runtime = runtime;
+        self
+    }
+
     /// Bind the underlay UDP socket.
     ///
     /// Per the anti-leak rules this socket is the only egress path; bind it to the address

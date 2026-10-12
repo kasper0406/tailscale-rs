@@ -29,16 +29,21 @@ impl FailureState {
 pub(crate) struct SecurityGuard {
     failure: Arc<FailureState>,
     monitors: JoinSet<()>,
+    packet_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl SecurityGuard {
-    pub(crate) fn new(shutdown: watch::Sender<bool>) -> Self {
+    pub(crate) fn new(
+        shutdown: watch::Sender<bool>,
+        packet_runtime: Option<tokio::runtime::Handle>,
+    ) -> Self {
         Self {
             failure: Arc::new(FailureState {
                 shutdown,
                 stops: Mutex::new(Vec::new()),
             }),
             monitors: JoinSet::new(),
+            packet_runtime,
         }
     }
 
@@ -54,20 +59,24 @@ impl SecurityGuard {
         let failure = self.failure.clone();
         let mut shutdown = failure.shutdown.subscribe();
         let actor = actor.clone();
-        self.monitors.spawn(async move {
-            tokio::select! {
-                () = actor.wait_for_shutdown() => {
-                    // Drop the watch read guard before taking its write lock in stop().
-                    let stopping = *shutdown.borrow();
-                    if !stopping {
-                        tracing::error!(actor = std::any::type_name::<A>(),
-                            "security actor stopped; stopping forwarding");
-                        failure.stop();
+        crate::pipeline::spawn_on(
+            &mut self.monitors,
+            self.packet_runtime.as_ref(),
+            async move {
+                tokio::select! {
+                    () = actor.wait_for_shutdown() => {
+                        // Drop the watch read guard before taking its write lock in stop().
+                        let stopping = *shutdown.borrow();
+                        if !stopping {
+                            tracing::error!(actor = std::any::type_name::<A>(),
+                                "security actor stopped; stopping forwarding");
+                            failure.stop();
+                        }
                     }
+                    _ = async { drop(shutdown.wait_for(|stopping| *stopping).await); } => {}
                 }
-                _ = async { drop(shutdown.wait_for(|stopping| *stopping).await); } => {}
-            }
-        });
+            },
+        );
         // Covers actors added concurrently with an earlier actor's failure.
         let stopping = *self.failure.shutdown.borrow();
         if stopping {
@@ -134,14 +143,23 @@ mod tests {
         forwarder_actor::ForwarderActor,
     };
 
-    fn environment() -> (Env, watch::Sender<bool>) {
+    fn environment() -> (
+        Env,
+        watch::Sender<bool>,
+        Option<crate::pipeline::PipelineThread>,
+    ) {
         let (shutdown, rx) = watch::channel(false);
-        let env = Env::new(
+        let mut env = Env::new(
             ts_keys::NodeState::generate(),
             rx,
             ForwarderConfig::from_control_config(&ts_control::Config::default()),
         );
-        (env, shutdown)
+        let pipeline = crate::pipeline::PipelineThread::from_env().unwrap();
+        env.packet_runtime = pipeline
+            .as_ref()
+            .map(crate::pipeline::PipelineThread::handle);
+        env.caller_runtime = pipeline.as_ref().map(|_| tokio::runtime::Handle::current());
+        (env, shutdown, pipeline)
     }
 
     struct Probe {
@@ -190,8 +208,8 @@ mod tests {
     #[tokio::test]
     async fn saturated_subscriber_can_publish_from_handler_and_keeps_order() {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let (env, shutdown) = environment();
-            let mut guard = SecurityGuard::new(shutdown);
+            let (env, shutdown, _pipeline) = environment();
+            let mut guard = SecurityGuard::new(shutdown, env.packet_runtime.clone());
             guard.watch(&env.bus);
             let (seen, mut rx) = mpsc::unbounded_channel();
             let entered = Arc::new(Notify::new());
@@ -243,8 +261,8 @@ mod tests {
     #[tokio::test]
     async fn late_registration_ack_orders_future_publications_without_replay() {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let (env, shutdown) = environment();
-            let mut guard = SecurityGuard::new(shutdown);
+            let (env, shutdown, _pipeline) = environment();
+            let mut guard = SecurityGuard::new(shutdown, env.packet_runtime.clone());
             guard.watch(&env.bus);
             env.publish(7_u32).await.unwrap();
             let (seen, mut rx) = mpsc::unbounded_channel();
@@ -272,8 +290,8 @@ mod tests {
     #[tokio::test]
     async fn subscribe_waits_for_registration_behind_a_blocked_broker() {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let (env, shutdown) = environment();
-            let mut guard = SecurityGuard::new(shutdown);
+            let (env, shutdown, _pipeline) = environment();
+            let mut guard = SecurityGuard::new(shutdown, env.packet_runtime.clone());
             guard.watch(&env.bus);
             let (seen, _rx) = mpsc::unbounded_channel();
             let entered = Arc::new(Notify::new());
@@ -321,10 +339,10 @@ mod tests {
     async fn critical_subscriber_death_aborts_packet_pump_and_other_actors() {
         for kill in [false, true] {
             tokio::time::timeout(Duration::from_secs(5), async {
-                let (env, shutdown) = environment();
-                let mut guard = SecurityGuard::new(shutdown.clone());
+                let (env, shutdown, _pipeline) = environment();
+                let mut guard = SecurityGuard::new(shutdown.clone(), env.packet_runtime.clone());
                 guard.watch(&env.bus);
-                let dataplane = DataplaneActor::spawn(env.clone());
+                let dataplane = env.on_packet_runtime(|| DataplaneActor::spawn(env.clone()));
                 guard.watch(&dataplane);
                 guard.ready(&dataplane).await.unwrap();
                 let pump = dataplane.ask(PacketPumpAbortHandle).await.unwrap();
@@ -386,8 +404,8 @@ mod tests {
 
     #[tokio::test]
     async fn failed_startup_cannot_pass_security_barrier() {
-        let (env, shutdown) = environment();
-        let mut guard = SecurityGuard::new(shutdown.clone());
+        let (env, shutdown, _pipeline) = environment();
+        let mut guard = SecurityGuard::new(shutdown.clone(), env.packet_runtime.clone());
         guard.watch(&env.bus);
         let actor = FailedStart::spawn(());
         guard.watch(&actor);

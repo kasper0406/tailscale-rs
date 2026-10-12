@@ -196,11 +196,11 @@ impl kameo::Actor for NetstackActor {
 
         let mut joinset = JoinSet::new();
 
-        joinset.spawn(async move {
+        env.spawn_packet(&mut joinset, async move {
             netstack.run_tokio().await;
         });
 
-        joinset.spawn(async move {
+        env.spawn_packet(&mut joinset, async move {
             while let Some(first) = netstack_down_rx.recv_async().await {
                 // Hand the dataplane whatever is already queued as one batch, so encryption and the
                 // underlay send can work per batch rather than per packet.
@@ -219,7 +219,7 @@ impl kameo::Actor for NetstackActor {
             tracing::warn!("netstack downlink shut down!");
         });
 
-        joinset.spawn(async move {
+        env.spawn_packet(&mut joinset, async move {
             pump_ingress(netstack_down, netstack_down_tx, "application").await;
 
             tracing::warn!("netstack uplink shut down!");

@@ -174,13 +174,13 @@ impl kameo::Actor for ForwarderActor {
 
         let mut joinset = JoinSet::new();
 
-        joinset.spawn(async move {
+        env.spawn_packet(&mut joinset, async move {
             netstack.run_tokio().await;
         });
 
         // Pump packets emitted by the forwarder netstack down into the dataplane (out the overlay).
         let reject_up = netstack_up.clone();
-        joinset.spawn(async move {
+        env.spawn_packet(&mut joinset, async move {
             while let Some(first) = netstack_down_rx.recv_async().await {
                 // Hand the dataplane whatever is already queued as one batch, so encryption and the
                 // underlay send can work per batch rather than per packet.
@@ -297,7 +297,7 @@ impl kameo::Actor for ForwarderActor {
         // so every IPv6 packet is answered here with a TCP RST / ICMPv6 prohibited (or dropped if
         // it can't be answered safely) and never reaches the netstack, whose wildcard listeners
         // would otherwise accept it. IPv4 goes through the port gate in all-port mode.
-        joinset.spawn(async move {
+        env.spawn_packet(&mut joinset, async move {
             let mut reject_budget = RejectBudget::new();
             let admit = |b: &[u8]| {
                 if b.first().is_some_and(|v| v >> 4 == 6) {

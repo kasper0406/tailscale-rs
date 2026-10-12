@@ -269,19 +269,21 @@ impl kameo::Actor for DataplaneActor {
         dataplane.install_disco_key_sink(Some(disco_key_tx)).await;
 
         let disco_key_env = env.clone();
-        let disco_key_task = tokio::task::spawn(async move {
-            while let Some((peer, advert)) = disco_key_rx.recv().await {
-                let key = ts_keys::DiscoPublicKey::from(advert.key);
+        let disco_key_task = crate::pipeline::enter(env.caller_runtime.as_ref(), || {
+            tokio::task::spawn(async move {
+                while let Some((peer, advert)) = disco_key_rx.recv().await {
+                    let key = ts_keys::DiscoPublicKey::from(advert.key);
 
-                tracing::debug!(?peer, %key, "publishing TSMP-advertised peer disco key");
+                    tracing::debug!(?peer, %key, "publishing TSMP-advertised peer disco key");
 
-                if let Err(e) = disco_key_env
-                    .publish(PeerDiscoKeyAdvertisement { peer, key })
-                    .await
-                {
-                    tracing::error!(error = %e, "publishing TSMP disco-key advertisement");
+                    if let Err(e) = disco_key_env
+                        .publish(PeerDiscoKeyAdvertisement { peer, key })
+                        .await
+                    {
+                        tracing::error!(error = %e, "publishing TSMP disco-key advertisement");
+                    }
                 }
-            }
+            })
         });
 
         env.subscribe::<PeerRouteUpdate>(&slf).await?;

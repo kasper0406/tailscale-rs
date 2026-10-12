@@ -86,6 +86,7 @@ enum Entry {
 /// The connected sockets of one [`MagicSock`](crate::MagicSock).
 pub(crate) struct ConnectedSockets {
     settings: Settings,
+    pub(crate) packet_runtime: Option<tokio::runtime::Handle>,
     entries: HashMap<SocketAddr, Entry>,
     ready: usize,
     to_demux: mpsc::UnboundedSender<Received>,
@@ -97,6 +98,7 @@ impl ConnectedSockets {
         (
             Self {
                 settings,
+                packet_runtime: None,
                 entries: HashMap::new(),
                 ready: 0,
                 to_demux: tx,
@@ -143,6 +145,11 @@ impl ConnectedSockets {
         if sent < CONNECT_AFTER_BYTES || !self.make_room() {
             return None;
         }
+        // Enter only for synchronous socket registration and pump spawning, never await.
+        let _entered = self
+            .packet_runtime
+            .as_ref()
+            .map(tokio::runtime::Handle::enter);
         let opened = shared
             .local_addr()
             .and_then(|local| open(local, addr, self.settings.dont_fragment).map(|s| (s, local)));
@@ -370,6 +377,88 @@ mod tests {
         assert!(c.socket_for(remote_addr, 10, &shared).is_some());
         c.clear();
         assert_eq!(c.ready_count(), 0);
+    }
+
+    /// Maintenance on another runtime can cross the byte threshold. Both registration and
+    /// the new receive pump must use the supplied packet runtime, not that maintenance runtime.
+    #[cfg(target_vendor = "apple")]
+    #[tokio::test]
+    async fn connected_pump_runs_on_packet_runtime_when_caller_is_blocked() {
+        struct Owner(
+            Option<tokio::sync::oneshot::Sender<()>>,
+            Option<std::thread::JoinHandle<()>>,
+        );
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                if let Some(stop) = self.0.take() {
+                    let _ = stop.send(());
+                }
+                if let Some(thread) = self.1.take() {
+                    drop(thread.join());
+                }
+            }
+        }
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (ready, started) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("test-packet-runtime".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                ready.send(runtime.handle().clone()).unwrap();
+                runtime.block_on(async {
+                    let _ = stopped.await;
+                });
+            })
+            .unwrap();
+        let _owner = Owner(Some(stop), Some(thread));
+        let handle = started.recv().unwrap();
+        let shared = UdpSocket::from_std(
+            reuse_port_socket("127.0.0.1:0".parse().unwrap())
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+        let remote = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut c, mut demux) = ConnectedSockets::new(on());
+        c.packet_runtime = Some(handle.clone());
+        let connected = c
+            .socket_for(
+                remote.local_addr().unwrap(),
+                CONNECT_AFTER_BYTES as usize,
+                &shared,
+            )
+            .unwrap();
+        remote
+            .send_to(b"pipeline receive", connected.local_addr().unwrap())
+            .unwrap();
+        // Do not yield the caller's current-thread runtime at all. A misplaced receive pump
+        // cannot run here; the receiver's own reactor must deliver the datagram independently.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let received = loop {
+            if let Ok(value) = demux.try_recv() {
+                break value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "connected pump depends on caller runtime"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            received,
+            (b"pipeline receive".to_vec(), remote.local_addr().unwrap())
+        );
+        assert_eq!(
+            handle
+                .spawn(async { std::thread::current().name().unwrap().to_owned() })
+                .await
+                .unwrap(),
+            "test-packet-runtime"
+        );
+        c.clear();
     }
 
     #[tokio::test]

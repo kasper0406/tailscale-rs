@@ -228,6 +228,9 @@ pub struct RuntimePrefCells {
 
 #[derive(Clone)]
 pub struct Env {
+    /// Placement handles only: Runtime owns and joins the dedicated thread.
+    pub(crate) packet_runtime: Option<tokio::runtime::Handle>,
+    pub(crate) caller_runtime: Option<tokio::runtime::Handle>,
     pub bus: ActorRef<MessageBus>,
     pub keys: Arc<ts_keys::NodeState>,
 
@@ -377,6 +380,26 @@ pub struct Env {
 }
 
 impl Env {
+    pub(crate) fn on_packet_runtime<T>(&self, f: impl FnOnce() -> T) -> T {
+        crate::pipeline::enter(self.packet_runtime.as_ref(), f)
+    }
+
+    pub(crate) fn spawn_packet<F>(&self, tasks: &mut tokio::task::JoinSet<F::Output>, future: F)
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        crate::pipeline::spawn_on(tasks, self.packet_runtime.as_ref(), future);
+    }
+
+    pub(crate) fn spawn_background<F>(&self, tasks: &mut tokio::task::JoinSet<F::Output>, future: F)
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        crate::pipeline::spawn_on(tasks, self.caller_runtime.as_ref(), future);
+    }
+
     /// The currently-selected exit-node selector, re-read live (it can change at runtime via
     /// `Device::set_exit_node`). Callers resolve it against the live peer set each time.
     pub fn exit_node(&self) -> Option<ts_control::ExitNodeSelector> {
@@ -461,6 +484,8 @@ impl Env {
         });
 
         let env = Self {
+            packet_runtime: None,
+            caller_runtime: None,
             // Publishers must never wait for subscriber capacity: handlers themselves publish.
             // The broker serializes delivery and waits for bounded subscriber mailboxes.
             bus: MessageBus::spawn_with_mailbox(

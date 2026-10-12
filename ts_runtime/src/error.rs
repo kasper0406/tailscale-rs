@@ -156,6 +156,9 @@ pub enum ErrorKind {
     /// either panicked or exited. It's unlikely this operation can be retried successfully.
     ActorGone,
 
+    /// The explicitly requested packet pipeline thread/runtime could not be started.
+    PipelineUnavailable,
+
     /// The actor replied with an error.
     ReplyErr,
 
@@ -183,6 +186,7 @@ pub enum ErrorKind {
 impl core::fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PipelineUnavailable => write!(f, "packet pipeline thread unavailable"),
             Self::ActorGone => write!(f, "expected actor is unreachable"),
             Self::ReplyErr => write!(f, "actor replied with an error"),
             Self::MailboxFull => write!(f, "actor's mailbox was full"),

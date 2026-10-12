@@ -165,7 +165,7 @@ impl Multiderp {
         let direct_sock = self.direct_sock.clone();
         let observed_routes = self.observed_routes.clone();
 
-        self.tasks.spawn(async move {
+        self.env.spawn_packet(&mut self.tasks, async move {
             let mut backoff = DerpBackoff::default();
             while !*shutdown.borrow() {
                 tokio::select! {
