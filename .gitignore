@@ -5,3 +5,5 @@ target/
 *.log
 !codex/*.md
 bench/*/target/
+bin/
+__pycache__/

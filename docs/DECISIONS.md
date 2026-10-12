@@ -102,3 +102,19 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   Design-independent pieces of the 2-thread work (bounded drivers, RX coalescing, DNS off the pipeline,
   flood-proof supervision, metrics, harness) are kept. A load generator that doesn't need the Go client
   comes first, because scaling beyond ~1.7 Gbit/s can't be shown on this Mac with the co-located Go client.
+- **F16 Stage-0 baseline** (BENCHMARKS §4): two synthetic WireGuard peers through the real node to a
+  loopback sink. Default node: 3.9 Gbit/s on one download flow (3.0 CPU-s/GB), 7.3 Gbit/s aggregate at 2 × 8
+  flows, upload about twice the CPU/GB. CPU/GB grows with flow count (O(sockets) netstack loops), and the
+  node saturates around 3.4 cores.
+- **F17 Three netstack/forwarder bugs found by the harness**, all fixed with tests: dropped FIN/Close on a
+  full command channel (channel now unbounded: requests wait for responses anyway), abandoned receives
+  eating data, and the UDP reaper killing first-millisecond flows (my 938bed4 regression; it broke the
+  cold-port gate for UDP). Cherry-picked to `ts-exit/runner` and `perf-connected`; the live node runs them.
+- **D18 Pipeline thread stays opt-in and is not the design.** It saturates at 93% on one download flow
+  (1.6 Gbit/s, 2.4× CPU/GB). It wins on upload/many-flow CPU and on latency, so per-shard
+  run-to-completion is right, but it needs N threads. Next is sharding stage 1 per codex-10, measured on
+  the §4 harness.
+- **F18 Peer updates don't disturb a real client's flow** (Go client hostname change mid-download, no dip).
+  The synthetic stalls were the harness's fresh control sessions briefly reporting no endpoints. Fixed in the
+  harness (one `hold` session per peer per matrix, and the enrolled hostname is reported, so control doesn't
+  rename the nodes).

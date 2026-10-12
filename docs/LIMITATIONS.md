@@ -19,10 +19,10 @@ devices only, and don't route sensitive traffic through it.
 | # | Limitation |
 |---|---|
 | F1 | IPv4 egress only. `::/0` is advertised (official clients require the pair), but IPv6 is answered with TCP RST / ICMPv6 prohibited and never forwarded. This home network has no IPv6 anyway. |
-| F2 | No exit-node DNS (peerAPI DoH) service: `Config` hardcodes `peerapi_port: None`. Clients fall back to their configured/public resolvers, whose queries go through the exit node as ordinary UDP/TCP 53. To be verified on the iPad. |
+| F2 | ~~No exit-node DNS~~ **Fixed**: peerAPI DoH on `--peerapi-port` (default 41643), forwarding to the host resolver (`--exit-dns`, default from `/etc/resolv.conf`). Verified from the laptop; to be verified on the iPad. |
 | F3 | No ICMP forwarding (ping through the exit node fails) and no PMTU/ICMP error relay. Fragmented first datagrams to a cold UDP port get port-unreachable. |
 | F4 | TCP: the overlay handshake completes before the upstream dial (Go dials first), so a client sees "connected" and then a close if the upstream is unreachable. Failures close gracefully instead of with RST. |
 | F5 | Single-flow throughput ≈ `tcp_buffer_size / RTT` (no autotuning, 256 KiB default). smoltcp has no SACK, so it handles loss and reordering worse than kernel TCP. |
 | F6 | Network changes: rebind exists but the receive loop can stay parked on the old socket until traffic arrives (codex-audit-01 "Rebind receive stall"). The `network-monitor` feature isn't enabled in the runner. |
-| F7 | Underlay: by default one unconnected UDP socket, per-packet syscalls and allocations (BENCHMARKS §1b). `ts-exit/perf-connected` adds opt-in connected sockets + DF (`TS_DEBUG_MAGICSOCK_CONNECTED_SOCKETS=1`, `TS_DEBUG_DONT_FRAGMENT=1`); no batching (`sendmsg_x`) yet. |
+| F7 | Underlay: by default one unconnected UDP socket, per-packet syscalls and allocations (BENCHMARKS §1b). `ts-exit/perf-connected` adds opt-in connected sockets + DF (`TS_DEBUG_MAGICSOCK_CONNECTED_SOCKETS=1`, `TS_DEBUG_DONT_FRAGMENT=1`); opt-in `sendmsg_x` send batching (`TS_DEBUG_MAGICSOCK_BATCHED_IO=1`). No receive batching (`recvmsg_x`) yet; per-packet cost also grows with the number of open sockets (BENCHMARKS §4). |
 | F8 | The runner doesn't daemonize under launchd. `start.sh` uses `nohup`, so it doesn't survive reboot. Intentional for experiments. |

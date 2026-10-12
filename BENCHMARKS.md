@@ -210,9 +210,78 @@ spread, with the path (direct/DERP) from the runner log quoted per run:
 | A/B knobs | `--tcp-buffer-size` 256K vs 2M vs 4M | Mbps at the real RTT |
 | stability | iPad streaming ≥ 60 min | stalls, reconnects, RSS/CPU over time |
 
+## 4. Stage-0 scaling baseline: synthetic peers through the real node (2026-10-12)
+
+Reference point before any sharding work (`docs/codex-10-sharding-design.md`). Binary `bin/exit_node-stage0b`
+(branch `ts-exit/bench-scaling` @ `47b4714`, `ring-aead`, connected sockets + DF + `sendmsg_x` on, 4 tokio
+workers, 256 KiB TCP buffers).
+
+**Method.** Two enrolled tailnet nodes (`synthetic-load-1/2`, login-link enrolled, same user) are driven by
+`examples/synthetic_peer`: its own WireGuard + smoltcp stack, no Go client, so the generator isn't the
+~1.7 Gbit/s ceiling of §1c. Each peer holds one control session for the whole matrix that advertises its LAN
+endpoint (`192.168.50.76:4170N`), because the node only learns private addresses from the netmap. Flows go to
+`198.18.0.1:9000`, which the node redirects to a loopback sink (`TS_BENCH_EXIT_REDIRECT`, benchmark range →
+loopback only, logged as a warning). So this measures the node's tunnel + forwarder + host-socket path, not the
+internet. Generator, node and sink share the Mac mini (4 P + 6 E cores), so throughput is a lower bound and
+**node CPU-s/GB is the comparable number**. Each cell: 3 runs, median. Transfers are 2 GB per flow (1-flow
+loads), 250 MB (8 flows) and 30 MB (64 flows). Drivers: `runner/bench-node.sh`, `runner/stage0-matrix.sh`,
+`runner/stage0-summary.py`. Raw data: `bench/results/stage0/{tokio4-fixed,pipeline1}/`.
+
+| load | dir | default: Mbit/s (min–max) | node CPU-s/GB | node cores | generator cores | pipeline thread: Mbit/s | node CPU-s/GB |
+|---|---|---|---|---|---|---|---|
+| 1 peer × 1 flow | down | 3919 (3837–3928) | 3.02 | 1.5 | 0.9 | 1580 (1534–1613) | 7.26 |
+| 1 peer × 1 flow | up | 2561 (2549–2584) | 6.60 | 2.1 | 1.2 | 2704 (2703–2713) | 4.52 |
+| 2 peers × 1 flow | down | 6229 (6222–6244) | 3.06 | 2.4 | 1.6 | 2191 (2174–2213) | 5.70 |
+| 2 peers × 1 flow | up | 3784 (3778–3795) | 6.40 | 3.0 | 2.3 | 3732 (3731–3739) | 3.88 |
+| 2 peers × 8 flows | down | 7292 (7268–7347) | 3.30 | 3.0 | 2.3 | 3935 (3929–3940) | 2.93 |
+| 2 peers × 8 flows | up | 2834 (2834–2836) | 8.90 | 3.2 | 2.2 | 3220 (3214–3294) | 4.22 |
+| 2 peers × 64 flows | down | 4750 (4380–4790) | 5.75 | 3.4 | 2.6 | 2856 (2836–2866) | 3.97 |
+| 2 peers × 64 flows | up | 2338 (2313–2412) | 11.15 | 3.3 | 2.3 | 2041 (2019–2079) | 6.26 |
+
+"Down" is sink → node → peer (the node encrypts); "up" is peer → node → sink (the node decrypts). The
+pipeline-thread columns are the same binary with `TS_EXPERIMENT_PIPELINE_THREAD=1`.
+
+Latency through the node (64-byte echo from the Go client via SOCKS, 300–1500 samples, p50/p90/p99 ms):
+idle 0.75/0.95/1.11. During the 2 × 8 download load: default 3.69/12.0/13.6, pipeline thread 0.72/0.99/1.18
+(but the pipeline-thread load ran at about half the throughput).
+
+**What it says:**
+
+1. **The node is fast but doesn't scale with flows.** Per-GB cost rises with the number of flows: download
+   3.0 → 5.8 CPU-s/GB and upload 6.6 → 11.2 from 1 to 64 flows per peer, while aggregate throughput falls
+   from the 8-flow peak. smoltcp's `poll_egress` and the netstack's blocked-command replay both walk every
+   socket per poll, so per-packet cost grows with the socket count. Sharding (N stacks, n/N sockets each)
+   and/or making those loops readiness-driven are the two fixes.
+2. **Upload costs about twice download** (6.4–11 vs 3.0–5.8 CPU-s/GB). The receive path (`recvfrom` per
+   datagram, decrypt, netstack ingress, host write) is the bigger target. There's no receive batching
+   (`recvmsg_x`) yet.
+3. **The default node tops out around 3.4 cores** (4 tokio workers), and both 8/64-flow loads are near that.
+   More throughput needs more cores used efficiently, not just less work per packet.
+4. **A single pipeline thread is a hard ceiling.** It is 93% busy on one download flow (profile
+   `scratch/prof/stage0-pipeline-down1.txt`) and caps it at 1.6 Gbit/s, with 2.4× the CPU/GB (and 3.4× on
+   the generator: smaller bursts, more wakeups per packet). It wins on CPU/GB for uploads and many flows,
+   and on latency, which is the case for run-to-completion. One thread can't be the design, which matches
+   D17. Keep it opt-in, don't make it a default.
+5. Generator headroom: at most 2.6 generator cores alongside 3.4 node cores. That's below the machine
+   total, but the E cores are slower, so the 6–7 Gbit/s download peaks are partly machine-bound.
+
+**Bugs this harness found (all fixed, with regression tests, on `ts-exit/runner`, `perf-connected` and
+`bench-scaling`):**
+
+- FIN/Close dropped on a full netstack command channel (bounded at 32): a lost half-close left peers
+  waiting for the idle timeout. 1 of 64 concurrent uploads hung (`47b4714`).
+- A cancelled receive (`select!`/`timeout`) left its command queued, and it consumed the next datagram
+  (`652b74b`).
+- The UDP reaper killed a brand-new flow in its port's first millisecond, so the gate's held first datagram
+  to a cold port lost its reply (`cbf9f8c`). This was a regression from my own 938bed4, and
+  `gated_all_ports_answers_first_datagram_to_cold_port` had been failing whenever run alone.
+
+A real Go client's throughput was unaffected by peer updates (hostname changes mid-download, no dip), so the
+synthetic stalls I saw during setup (a new control session briefly reporting no endpoints) were harness
+artifacts. The harness now holds one session per peer for the whole matrix.
+
 ## Next
 
-- Live baselines (above).
-- Phase 3A: connected per-peer underlay sockets + DF in `ts_magicsock`, with an A/B switch.
-- Phase 3B: `sendmsg_x`/`recvmsg_x` batching behind a feature flag with a safe fallback.
-- Loss/reorder injection in the forwarder bench to measure smoltcp's recovery.
+- Live laptop/iPad confirmation of the current stable build (2 MiB buffers, connected sockets as default).
+- Sharding stage 1 (exit-flow ownership across N netstacks), A/B'd on this harness against §4.
+- Receive-side batching (`recvmsg_x`) and readiness-driven socket polling (the O(sockets) loops in §4).

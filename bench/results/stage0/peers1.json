@@ -1,0 +1,15 @@
+[
+ {
+  "key_file": "state/bench-peers/1/node.key",
+  "disco_key_file": "state/bench-peers/1/disco.key",
+  "node_key": "23f7e5019ea1f115651f6314e489f14999550f3f94de96a1e5ef897024b07f19",
+  "node_disco_key": "9a5434f5c80d753f14b06d83350c697785bd8bc5bcf4ec5120b8ea541b2a5b76",
+  "endpoint": "192.168.50.76:41642",
+  "source": "100.127.38.40",
+  "destination": "198.18.0.1:9000",
+  "identity_file": "state/bench-peers/1/identity.json",
+  "bind": "0.0.0.0:41701",
+  "advertise": "192.168.50.76:41701",
+  "hostname": "synthetic-load-1"
+ }
+]
