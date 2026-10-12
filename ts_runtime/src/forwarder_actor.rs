@@ -170,6 +170,9 @@ impl kameo::Actor for ForwarderActor {
                 tx: netstack_down_tx,
             },
         ) = crate::netstack_actor::piped_ingress_bounded(config);
+        if env.packet_runtime.is_some() {
+            netstack.set_work_budget(Some(128));
+        }
         let channel = netstack.command_channel();
 
         let mut joinset = JoinSet::new();
@@ -181,7 +184,9 @@ impl kameo::Actor for ForwarderActor {
         // Pump packets emitted by the forwarder netstack down into the dataplane (out the overlay).
         let reject_up = netstack_up.clone();
         let counters = crate::pipeline_metrics::enabled();
+        let cooperative = env.packet_runtime.is_some();
         env.spawn_packet(&mut joinset, async move {
+            let mut turns = 0;
             while let Some(first) = netstack_down_rx.recv_async().await {
                 // Hand the dataplane whatever is already queued as one batch, so encryption and the
                 // underlay send can work per batch rather than per packet.
@@ -192,9 +197,16 @@ impl kameo::Actor for ForwarderActor {
                 {
                     batch.push(crate::netstack_actor::into_packet(more));
                 }
-                if counters { crate::pipeline_metrics::egress(1, batch.len()); }
+                if counters {
+                    crate::pipeline_metrics::egress(1, batch.len());
+                }
                 if netstack_up.send(batch).is_err() {
                     break;
+                }
+                turns += 1;
+                if cooperative && turns == 4 {
+                    tokio::task::yield_now().await;
+                    turns = 0;
                 }
             }
 
@@ -318,7 +330,13 @@ impl kameo::Actor for ForwarderActor {
                     None => netstack_down_tx.try_send(b),
                 }
             };
-            crate::netstack_actor::pump_ingress_with(netstack_down, admit, "forwarder").await;
+            crate::netstack_actor::pump_ingress_with_budget(
+                netstack_down,
+                admit,
+                "forwarder",
+                cooperative,
+            )
+            .await;
 
             tracing::warn!("forwarder netstack uplink shut down!");
         });

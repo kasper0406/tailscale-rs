@@ -169,6 +169,16 @@ impl DataPlane {
         }
     }
 
+    /// Run with bounded batches between cooperative yields (experimental pipeline placement).
+    pub async fn run_cooperative(&self) -> Infallible {
+        loop {
+            for _ in 0..8 {
+                self.step().await;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Run the data plane for a single step.
     #[tracing::instrument(level = "trace", skip_all)]
     pub async fn step(&self) {

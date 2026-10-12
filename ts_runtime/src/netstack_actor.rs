@@ -85,6 +85,7 @@ pub(crate) fn piped_ingress_bounded(
 ///
 /// Drops are logged at `debug!` only, once when a run of drops starts and once when it ends: the
 /// rate is peer-driven, so it must not be able to drive an operator's default-level log.
+#[cfg(test)]
 pub(crate) async fn pump_ingress(
     from_dataplane: OverlayFromDataplane,
     to_netstack: netstack::WakingPipeSender,
@@ -95,19 +96,36 @@ pub(crate) async fn pump_ingress(
 
 /// [`pump_ingress`] with a custom admission step: `admit` takes each packet and returns whether
 /// it was accepted (`false` counts as a drop). It must not wait.
+#[cfg(test)]
 pub(crate) async fn pump_ingress_with(
+    from_dataplane: OverlayFromDataplane,
+    admit: impl FnMut(&[u8]) -> bool,
+    netstack_name: &'static str,
+) -> u64 {
+    pump_ingress_with_budget(from_dataplane, admit, netstack_name, false).await
+}
+
+/// Admission pump with bounded packet work between yields, independent of channel readiness.
+pub(crate) async fn pump_ingress_with_budget(
     mut from_dataplane: OverlayFromDataplane,
     mut admit: impl FnMut(&[u8]) -> bool,
     netstack_name: &'static str,
+    cooperative: bool,
 ) -> u64 {
     let counters = crate::pipeline_metrics::enabled();
     let index = crate::pipeline_metrics::stack_index(netstack_name);
     let mut dropped: u64 = 0;
     let mut dropping = false;
+    let mut processed = 0;
 
     while let Some(bufs) = from_dataplane.recv().await {
         let before = dropped;
         for buf in bufs {
+            if cooperative && processed == 128 {
+                tokio::task::yield_now().await;
+                processed = 0;
+            }
+            processed += 1;
             let buf: PacketMut = buf;
             if admit(buf.as_ref()) {
                 if dropping {
@@ -130,7 +148,9 @@ pub(crate) async fn pump_ingress_with(
                 }
             }
         }
-        if counters { crate::pipeline_metrics::drops(index, dropped - before); }
+        if counters {
+            crate::pipeline_metrics::drops(index, dropped - before);
+        }
     }
 
     dropped
@@ -196,6 +216,9 @@ impl kameo::Actor for NetstackActor {
                 tx: netstack_down_tx,
             },
         ) = piped_ingress_bounded(config);
+        if env.packet_runtime.is_some() {
+            netstack.set_work_budget(Some(128));
+        }
         let channel = netstack.command_channel();
 
         let mut joinset = JoinSet::new();
@@ -205,7 +228,9 @@ impl kameo::Actor for NetstackActor {
         });
 
         let counters = crate::pipeline_metrics::enabled();
+        let cooperative = env.packet_runtime.is_some();
         env.spawn_packet(&mut joinset, async move {
+            let mut turns = 0;
             while let Some(first) = netstack_down_rx.recv_async().await {
                 // Hand the dataplane whatever is already queued as one batch, so encryption and the
                 // underlay send can work per batch rather than per packet.
@@ -216,9 +241,16 @@ impl kameo::Actor for NetstackActor {
                 {
                     batch.push(crate::netstack_actor::into_packet(more));
                 }
-                if counters { crate::pipeline_metrics::egress(0, batch.len()); }
+                if counters {
+                    crate::pipeline_metrics::egress(0, batch.len());
+                }
                 if netstack_up.send(batch).is_err() {
                     break;
+                }
+                turns += 1;
+                if cooperative && turns == 4 {
+                    tokio::task::yield_now().await;
+                    turns = 0;
                 }
             }
 
@@ -226,7 +258,13 @@ impl kameo::Actor for NetstackActor {
         });
 
         env.spawn_packet(&mut joinset, async move {
-            pump_ingress(netstack_down, netstack_down_tx, "application").await;
+            pump_ingress_with_budget(
+                netstack_down,
+                |b| netstack_down_tx.try_send(b),
+                "application",
+                cooperative,
+            )
+            .await;
 
             tracing::warn!("netstack uplink shut down!");
         });

@@ -51,6 +51,7 @@ pub use wake_device::AsyncWakeDevice;
 
 /// Internally i/o free userspace network stack built around `smoltcp`.
 pub struct Netstack {
+    work_budget: Option<usize>,
     config: Config,
 
     iface: smoltcp::iface::Interface,
@@ -128,6 +129,7 @@ impl Netstack {
         };
 
         Netstack {
+            work_budget: None,
             iface,
             socket_set: smoltcp::iface::SocketSet::new(vec![]),
             command_tx: tx,
@@ -191,11 +193,25 @@ impl Netstack {
             .map(|x| x.into())
     }
 
+    /// Bound async ingress/egress and command work per drain. None retains unbounded drains.
+    pub fn set_work_budget(&mut self, budget: Option<usize>) {
+        self.work_budget = budget.map(|n| n.max(1));
+    }
+    /// Configured maximum items per async drain.
+    pub fn work_budget(&self) -> Option<usize> {
+        self.work_budget
+    }
+
     /// Process all commands available in the command queue.
     #[tracing::instrument(level = "trace", skip_all)]
     pub fn process_cmds(&mut self) {
-        while let Ok(cmd) = self.command_rx.try_recv() {
+        let mut remaining = self.work_budget.unwrap_or(usize::MAX);
+        while remaining > 0 {
+            let Ok(cmd) = self.command_rx.try_recv() else {
+                break;
+            };
             self.process_one_cmd(cmd);
+            remaining -= 1;
         }
     }
 
@@ -415,10 +431,10 @@ impl Netstack {
     /// - `Poll::Pending`: no packets were processed because we were waiting for them to
     ///   arrive from `dev.
     /// - `Poll::Ready(false)`: we received packets but socket state did not make progress
-    /// - `Poll::Ready(true)`: we received packets and socket state _did_ make progress
+    /// - `Poll::Ready(true)`: socket state progressed, or a budgeted drain consumed packets
     ///
-    /// When this function returns, it is guaranteed that all packets currently available to
-    /// receive from `dev` have been processed.
+    /// With no work budget all available packets are drained. A budgeted call may return
+    /// ready at the budget limit, requiring another driver turn.
     ///
     /// Unlike the synchronous [`poll_device_io`](Self::poll_device_io), this does **not** call
     /// `drain_tcp_closes`: the async driver loop (the netstack `Future`'s `poll`) owns that, calling
@@ -435,8 +451,17 @@ impl Netstack {
     ) -> Poll<bool> {
         let mut changed = false;
         let mut polled_successfully = false;
+        let mut processed = false;
+        let budgeted = self.work_budget.is_some();
 
+        let mut remaining = self.work_budget.unwrap_or(usize::MAX);
+        let mut exhausted = false;
         loop {
+            if remaining == 0 {
+                exhausted = true;
+                break;
+            }
+            remaining -= 1;
             match dev.as_mut().poll_rx(cx) {
                 Poll::Ready(()) => {
                     polled_successfully = true;
@@ -445,7 +470,7 @@ impl Netstack {
                     // If we get a pending now but we have already polled successfully, don't return
                     // pending (we need to report that we made progress).
                     return if polled_successfully {
-                        Poll::Ready(changed)
+                        Poll::Ready(changed || (budgeted && processed))
                     } else {
                         Poll::Pending
                     };
@@ -460,8 +485,9 @@ impl Netstack {
                 PollIngressSingleResult::None => {
                     break;
                 }
-                PollIngressSingleResult::PacketProcessed => {}
+                PollIngressSingleResult::PacketProcessed => { processed = true; }
                 PollIngressSingleResult::SocketStateChanged => {
+                    processed = true;
                     changed = true;
                     self.pump_tcp_accept();
                     tracing::trace!("socket state changed");
@@ -484,7 +510,7 @@ impl Netstack {
             self.pump_waiters();
         }
 
-        Poll::Ready(changed)
+        Poll::Ready(changed || exhausted || (budgeted && processed))
     }
 
     /// Send all packets the netstack wants to transmit on the network.
@@ -504,10 +530,23 @@ impl Netstack {
     ) -> Poll<bool> {
         core::task::ready!(dev.as_mut().poll_tx(cx));
 
-        match self
-            .iface
-            .poll_egress(now, dev.as_mut().get_mut(), &mut self.socket_set)
-        {
+        let (result, exhausted) = if let Some(budget) = self.work_budget {
+            let mut limited = TxBudget {
+                dev: dev.as_mut().get_mut(),
+                remaining: budget,
+            };
+            let result = self
+                .iface
+                .poll_egress(now, &mut limited, &mut self.socket_set);
+            (result, limited.remaining == 0)
+        } else {
+            (
+                self.iface
+                    .poll_egress(now, dev.as_mut().get_mut(), &mut self.socket_set),
+                false,
+            )
+        };
+        match result {
             PollResult::SocketStateChanged => {
                 tracing::trace!("socket state changed");
 
@@ -517,7 +556,7 @@ impl Netstack {
 
                 Poll::Ready(true)
             }
-            PollResult::None => Poll::Ready(false),
+            PollResult::None => Poll::Ready(exhausted),
         }
     }
 
@@ -579,8 +618,7 @@ impl Netstack {
 
     /// Attempt to send and receive packets on `dev`.
     ///
-    /// The future becomes ready when `dev` sends or receives packets on the network. All
-    /// synchronously-available network I/O is always performed.
+    /// The future becomes ready when `dev` sends or receives packets on the network. With no work budget all synchronously-available network I/O is performed.
     ///
     /// Assumes that alarms are handled separately and that `now` does not advance
     /// over the course of the polled future.
@@ -604,7 +642,7 @@ impl Netstack {
 /// A future that becomes ready when the contained `smoltcp::phy::Device` sends or receives
 /// packets on the network.
 ///
-/// The future always completes _all_ synchronously-available network I/O, i.e. it polls
+/// Without a work budget the future completes all synchronously-available network I/O, polling
 /// until `dev.poll_rx` and `dev.poll_tx` return `Poll::Pending`, and/or until the netstack
 /// reports that there are no more packets to be sent.
 ///
@@ -666,6 +704,7 @@ where
         let mut egress_pending = false;
         let mut progress_made = false;
 
+        let budgeted = stack.work_budget.is_some();
         while !(ingress_pending && (*egress_done || egress_pending)) {
             tracing::trace_span!("poll_loop", ingress_pending, egress_done, egress_pending);
 
@@ -711,6 +750,9 @@ where
                     }
                 }
             }
+            if budgeted {
+                break;
+            }
         }
 
         if progress_made {
@@ -719,6 +761,38 @@ where
         } else {
             Poll::Pending
         }
+    }
+}
+
+/// Limit transmit tokens inside smoltcp's synchronous egress pass as well as ingress iterations.
+struct TxBudget<'a, D> {
+    dev: &'a mut D,
+    remaining: usize,
+}
+impl<D: smoltcp::phy::Device> smoltcp::phy::Device for TxBudget<'_, D> {
+    type RxToken<'a>
+        = D::RxToken<'a>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = D::TxToken<'a>
+    where
+        Self: 'a;
+    fn receive(
+        &mut self,
+        now: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.dev.receive(now)
+    }
+    fn transmit(&mut self, now: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        self.dev.transmit(now)
+    }
+    fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
+        self.dev.capabilities()
     }
 }
 

@@ -297,8 +297,13 @@ impl kameo::Actor for DataplaneActor {
 
         let task_dataplane = dataplane.clone();
 
+        let cooperative = env.packet_runtime.is_some();
         let task = tokio::task::spawn(async move {
-            task_dataplane.run().await;
+            if cooperative {
+                task_dataplane.run_cooperative().await;
+            } else {
+                task_dataplane.run().await;
+            }
         });
 
         tracing::trace!("dataplane running");
