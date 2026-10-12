@@ -81,11 +81,11 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     sink_port: u16,
 
-    /// Tokio worker threads. More threads cost CPU in cross-thread wakeups for no throughput
-    /// gain at this node's packet rates: in the tunnel benchmark 2 used 30% less CPU per GB than
-    /// one per core, with the same latency under load; 1 was cheaper still but dropped packets
-    /// under load (1-3 s stalls).
-    #[arg(long, default_value_t = 2)]
+    /// Tokio worker threads. One per core (tokio's default) spends CPU on cross-thread wakeups;
+    /// too few lets bulk flows starve the serial packet pipeline, whose bounded ingress queue then
+    /// drops packets (1-3 s TCP stalls). Tunnel benchmark, 8 parallel flows: 4 workers had the
+    /// lowest CPU per GB with no stalls; 2 stalled; 10 cost 40% more CPU.
+    #[arg(long, default_value_t = 4)]
     worker_threads: usize,
 
     /// Seconds between status lines (peers, direct vs DERP path). 0 disables.
