@@ -82,8 +82,10 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   (all default, `ts-exit/runner`); `ring` AEAD (feature `ring-aead`, opt-in because ring's key schedule
   can't be zeroized); connected sockets + DF and `sendmsg_x` batching (env opt-in, `ts-exit/perf-connected`);
   runner `--worker-threads 2`.
-- **D15 No hot-path restructure.** Estimated 15–25% from fewer actor handoffs. Capping tokio at 2 workers
-  gave 30% with no latency cost; 1 worker gave 61% but dropped packets under load (p99 1 s). The restructure
-  is deferred unless a faster line needs it.
+- **D15 (revised) Worker cap 4, then a dedicated pipeline thread.** Capping tokio at 2 workers gave 30%
+  on one flow, but with 8 concurrent flows it let per-flow tasks starve the serial packet pipeline (ingress
+  drops, 3–4 s stalls). The user questioned the cap, rightly. 4 workers is safe and cheaper than 10. The real
+  fix is to give the serial pipeline its own thread, so it can neither be starved nor bounce between
+  cores. 1 worker (3.6 CPU-s/GB vs ~9–10) bounds the gain, so it's being built on `ts-exit/pipeline-thread`.
 - **F14 `ring` and batching don't lower CPU/GB while the node is unsaturated** (the co-located Go client is
   the bottleneck at 5.2 cores), though each cuts its own share. They matter at saturation.

@@ -143,23 +143,34 @@ What remains is per-packet handoff overhead: each packet crosses 4–5 actor/cha
 time. Go's reference work reports the same wall (~30% scheduler) and the same fix: fewer handoffs. At this
 home line's ~750 Mbit/s the node has 2–3× headroom either way.
 
-**Tokio worker count** (same binary; `TOKIO_WORKER_THREADS`, now the runner's `--worker-threads`,
-default 2). Latency is a 64-byte echo through the tunnel (`runner/rttprobe.py`), idle and during a
-full-speed download:
+**Tokio worker count** (same binary; `TOKIO_WORKER_THREADS`, now the runner's `--worker-threads`).
+Latency is a 64-byte echo through the tunnel (`runner/rttprobe.py`) while the load runs.
 
-| workers | down Mbit/s | down CPU-s/GB | up Mbit/s | up CPU-s/GB | RTT p99 idle / loaded |
-|---|---|---|---|---|---|
-| 10 (default, one per core) | ~1,800 | 9.1 | ~1,900 | 10.2 | 0.87 / 1.78 ms |
-| **2** | ~1,940 | **6.4** | ~1,945 | **7.0** | 0.78 / 1.69 ms |
-| 1 | ~2,063 | 3.6 | ~1,720 | 4.4 | 0.77 / **1,004 ms** (max 3,016) |
+Single flow:
 
-Most of the "handoff" cost was threads waking each other across cores. One worker is the cheapest, but it
-drops packets under load: the loaded p99 sits at TCP's 1 s/3 s retransmit timeouts. Two workers keep the
-default's latency at 30% less CPU, so the restructure of the hot path was **not** done: this captured most
-of what it was estimated to save (15–25%).
+| workers | down Mbit/s | down CPU-s/GB | up CPU-s/GB | echo p99 under load |
+|---|---|---|---|---|
+| 10 (default, one per core) | ~1,800 | 9.1 | 10.2 | 1.8 ms |
+| 2 | ~1,940 | 6.4 | 7.0 | 1.7 ms |
+| 1 | ~2,063 | 3.6 | 4.4 | **1,004 ms** (max 3,016) |
+
+Eight parallel flows (500 MB each) plus the probe:
+
+| workers | aggregate Mbit/s | CPU-s/GB | echo p99 / max |
+|---|---|---|---|
+| 10 | 760 | 15.2 | 12.0 / 12.2 ms |
+| **4 (runner default)** | **1,127** | **10.6** | **12.1 / 12.3 ms** |
+| 2 | 904 | 13.0 | **3,016 / 4,002 ms** |
+
+More workers than needed cost CPU in cross-thread wakeups (tokio unparks idle workers to steal work, and
+each packet passes several tasks). Too few let bulk per-flow tasks starve the serial packet pipeline, whose
+bounded ingress queue (4,096 packets) then drops packets: the 1 s/3 s stalls are TCP retransmit timeouts.
+2 looked best on one flow but stalls with concurrency, so the runner defaults to 4. The 1-worker number
+(3.6 CPU-s/GB) bounds what a dedicated, unstarved packet-pipeline thread could save. That restructure is
+on branch `ts-exit/pipeline-thread` (in progress).
 
 **Through the exit node to the internet, end state** (`runner/perf.sh`, OVH 200 MB, connected + DF +
-batching + `ring`, 2 workers): 654 and 755 Mbit/s at **10.1 and 6.9 CPU-s/GB** (81% and 64% of one core).
+batching + `ring`, 2 workers; before the concurrency finding): 654 and 755 Mbit/s at **10.1 and 6.9 CPU-s/GB** (81% and 64% of one core).
 The release build of the original fork used 24.7–25.2 CPU-s/GB at the same rate (~2.2 cores).
 
 Through the exit node to the internet (same Go client, OVH test file, `runner/perf.sh`) the node
