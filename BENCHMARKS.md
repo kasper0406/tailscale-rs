@@ -169,6 +169,22 @@ bounded ingress queue (4,096 packets) then drops packets: the 1 s/3 s stalls are
 (3.6 CPU-s/GB) bounds what a dedicated, unstarved packet-pipeline thread could save. That restructure is
 on branch `ts-exit/pipeline-thread` (in progress).
 
+**Dedicated packet-pipeline thread** (branch `ts-exit/pipeline-thread`, opt-in
+`TS_EXPERIMENT_PIPELINE_THREAD=1`). Controlled A/B with the **same binary**, knob 0/1/1/0, 4 caller workers,
+256 KiB buffers (`bench/results/pipeline-controlled.txt`):
+
+| | off | on |
+|---|---|---|
+| 1 download: Mbit/s, CPU-s/GB | ~1,810, 8.8–8.9 | ~2,015, **4.6–4.8 (−47%)** |
+| 1 upload: Mbit/s, CPU-s/GB | ~1,930, 9.8–10.0 | ~1,790, **6.5–6.7 (−33%)** |
+| 8 flows: aggregate Mbit/s (typical), CPU-s/GB | ~1,715, 9.9–14.2 | **~1,235**, 5.4–7.8 |
+| 8 flows: runs with 1–4 s echo stalls | 1 / 4 | **2 / 4** |
+
+During 8 flows the pipeline thread runs at 86% of a core while the four caller workers idle at ~5%: one
+thread is a hard ceiling, and at it throughput drops and stalls appear. Codex's critique
+(`docs/codex-08-pipeline-critique.md`) predicted this and judged the mechanism overstated: its prior was
+0–30% savings, and the measured single-flow saving exceeds that. Kept **opt-in**.
+
 **Through the exit node to the internet, end state** (`runner/perf.sh`, OVH 200 MB, connected + DF +
 batching + `ring`, 2 workers; before the concurrency finding): 654 and 755 Mbit/s at **10.1 and 6.9 CPU-s/GB** (81% and 64% of one core).
 The release build of the original fork used 24.7–25.2 CPU-s/GB at the same rate (~2.2 cores).

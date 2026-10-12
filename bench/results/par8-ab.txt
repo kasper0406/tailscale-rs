@@ -1,0 +1,6 @@
+A-run1,par8,927 Mbit/s,15.73 s/GB | p50=9.60 p90=11.16 p99=13.09 max=15.86 ms
+A-run2,par8,1720 Mbit/s,9.86 s/GB | p50=9.85 p90=11.67 p99=12.19 max=12.22 ms
+A-run3,par8,224 Mbit/s,13.30 s/GB | p50=9.81 p90=11.42 p99=12.97 max=15.81 ms
+B-run1,par8,1088 Mbit/s,7.51 s/GB | p50=10.11 p90=18.04 p99=2017.03 max=4003.74 ms
+B-run2,par8,1662 Mbit/s,5.33 s/GB | p50=9.86 p90=12.04 p99=13.63 max=14.06 ms
+B-run3,par8,1685 Mbit/s,5.36 s/GB | p50=9.82 p90=12.28 p99=13.25 max=13.93 ms

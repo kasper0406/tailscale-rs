@@ -89,3 +89,8 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   cores. 1 worker (3.6 CPU-s/GB vs ~9–10) bounds the gain, so it's being built on `ts-exit/pipeline-thread`.
 - **F14 `ring` and batching don't lower CPU/GB while the node is unsaturated** (the co-located Go client is
   the bottleneck at 5.2 cores), though each cuts its own share. They matter at saturation.
+- **F15 Pipeline thread A/B** (same binary, both orders): −47% CPU/GB single download, −33% upload, −35%
+  with 8 flows, but 8-flow aggregate −28% and more stalls, because the single pipeline thread saturates (86%).
+  Codex's critique agreed with the isolation idea but not the mechanism or bound, and asked for a controlled
+  A/B plus fairness budgets before any default. **D16**: keep it opt-in; candidate follow-ups are splitting
+  the pipeline into two threads (underlay+crypto | netstacks) and bounded drains.

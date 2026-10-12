@@ -8,7 +8,7 @@ label=$1 bin=$2 n=${3:-3} mb=${4:-1000}; shift $(( $# < 4 ? $# : 4 ))
 R=/Volumes/git/ts-exit; S=$R/state/rust-exit; IP=100.112.127.25
 [[ -f $S/exit_node.pid ]] && kill $(cat $S/exit_node.pid) 2>/dev/null; sleep 3
 python3 -I $R/runner/detach.py $S/exit_node.log /usr/bin/env TS_RS_EXPERIMENT=this_is_unstable_software RUST_LOG=info "$@" \
-  $bin --state-dir $S --hostname rust-exit --port 41642 --interactive --status-interval 10 --sink-port 9000 > $S/exit_node.pid
+  $bin --state-dir $S --hostname rust-exit --port 41642 --interactive --status-interval 10 --sink-port 9000 ${=RUNNER_ARGS:-} > $S/exit_node.pid
 pid=$(cat $S/exit_node.pid)
 until sed 's/\x1b\[[0-9;]*m//g' $S/exit_node.log | grep -q "benchmark sink listening"; do sleep 1; done; sleep 6
 $R/runner/tsc ping -c 2 rust-exit >/dev/null 2>&1
