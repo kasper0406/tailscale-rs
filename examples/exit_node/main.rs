@@ -81,13 +81,28 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     sink_port: u16,
 
+    /// Tokio worker threads. More threads cost CPU in cross-thread wakeups for no throughput
+    /// gain at this node's packet rates: in the tunnel benchmark 2 used 30% less CPU per GB than
+    /// one per core, with the same latency under load; 1 was cheaper still but dropped packets
+    /// under load (1-3 s stalls).
+    #[arg(long, default_value_t = 2)]
+    worker_threads: usize,
+
     /// Seconds between status lines (peers, direct vs DERP path). 0 disables.
     #[arg(long, default_value_t = 30)]
     status_interval: u64,
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.worker_threads.max(1))
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::builder()
@@ -95,8 +110,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .from_env_lossy(),
         )
         .init();
-
-    let args = Args::parse();
 
     tokio::fs::create_dir_all(&args.state_dir).await?;
     let key_file = args.state_dir.join("keys.json");
