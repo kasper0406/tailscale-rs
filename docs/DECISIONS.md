@@ -154,3 +154,9 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   16) and re-measure RX batching alone. Loopback-sink attribution was checked and rejected: the sink pays
   for its own receives (5.8 s per 6 GB received vs 0.5 s per 6 GB sent), so the up/down asymmetry is real
   node cost.
+- **F24 Budget decoupled (codex-16).** The full work budget stopped after one egress pass, so a single TCP
+  socket sent one segment per poll. RX batching now keeps only receive-side bounds. A/B: RX alone 2 × 64
+  upload 9.75 → 7.97 CPU-s/GB (+14% throughput) with download unaffected (1 flow 2.86, 4.17 Gbit/s); the
+  budget control reproduces the regression. Cumulative vs stage 0 in BENCHMARKS §5. **D22**: targeted replay
+  and RX batching are the candidate defaults, pending a live laptop/iPad soak. Next build is sharding
+  stage 1 on top of `ts-exit/netstack-scans`.

@@ -280,6 +280,32 @@ A real Go client's throughput was unaffected by peer updates (hostname changes m
 synthetic stalls I saw during setup (a new control session briefly reporting no endpoints) were harness
 artifacts. The harness now holds one session per peer for the whole matrix.
 
+## 5. Netstack and upload-path work (2026-10-13, branch `ts-exit/netstack-scans`)
+
+Same harness and method as §4 (2 synthetic peers, loopback sink, 4 tokio workers, 256 KiB buffers, connected
+sockets + DF + `sendmsg_x` on). CPU-s/GB, median of 3. Each step is the same binary as its control, A/B'd by
+environment flag. Raw data: `bench/results/stage0/{scans,replay-*,batch-*,batch2-*}/`.
+
+| step | 1 flow down | 1 flow up | 2×64 down | 2×64 up |
+|---|---|---|---|---|
+| §4 baseline | 3.02 (3919 Mbit/s) | 6.60 (2561) | 5.75 (4750) | 11.15 (2338) |
+| + O(log n) socket validation, bounded orphan sweeps (codex, default) | 2.83 | 6.59 | 5.37 | 11.00 |
+| + targeted waiter replay (`TS_EXPERIMENT_TARGETED_REPLAY=1`) | 2.82 | 6.56 | 4.67 | 10.57 |
+| + receive copy/alloc/tracing cleanup (default) | 2.78 | 6.32 | 4.64 | 9.75 |
+| + receive batching (`TS_EXPERIMENT_RX_BATCH=1`) | **2.86 (4173)** | **5.42 (2524)** | **4.61 (5391)** | **7.97 (2997)** |
+
+Net change at 2 × 64: download −20% CPU/GB and +13% throughput; upload −29% and +28%. Single flows are
+neutral to better. No stalls in any run once the listener-orphan fix (F20) was in.
+
+Rejected or controls: ACK send batching (`TS_EXPERIMENT_ACK_BATCH`) is neutral. The old full work budget
+(`TS_EXPERIMENT_NETSTACK_BUDGET=1`, also pipeline mode) costs single-flow download ~60% CPU/GB because it
+stops after one egress pass, i.e. one TCP segment per socket per poll (codex-16). It's kept only as a
+control and for pipeline mode.
+
+Counters showed why targeted replay matters: before it, 120 blocked-command replays per completion (99.2%
+wasted). After the remaining work, upload's top costs are host TCP writes (the real egress), receive
+syscalls, crypto and copies.
+
 ## Next
 
 - Live laptop/iPad confirmation of the current stable build (2 MiB buffers, connected sockets as default).
