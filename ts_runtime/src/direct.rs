@@ -1164,7 +1164,10 @@ impl kameo::Actor for DirectManager {
             dataplane.ask(NewUnderlayTransport).await?;
 
         let transport = env
-            .on_packet_runtime(|| DirectTransport::new(sock.clone()))
+            .on_packet_runtime(|| {
+                DirectTransport::new(sock.clone())
+                    .with_receive_batching(env.packet_runtime.is_some())
+            })
             .with_key_lookup(DiscoPeerLookup(peer_db.clone()));
 
         env.spawn_packet(

@@ -2922,6 +2922,7 @@ impl AsRef<MagicSock> for MagicSock {
 /// trace if there is no path — the data plane will retransmit, and the route layer keeps the
 /// peer on DERP). `recv` yields one batch of WireGuard datagrams.
 pub struct DirectTransport {
+    receive_batching: bool,
     inner: Arc<MagicSock>,
     /// Buffers data received via the background pump so `recv` can hand it to the runtime.
     inbox: tokio::sync::Mutex<mpsc::UnboundedReceiver<ReceivedData>>,
@@ -2951,10 +2952,17 @@ impl DirectTransport {
         });
 
         Self {
+            receive_batching: false,
             inner,
             inbox: tokio::sync::Mutex::new(rx),
             _pump: pump,
         }
+    }
+
+    /// Drain already queued packets as peer batches, without waiting to fill a batch.
+    pub fn with_receive_batching(mut self, enabled: bool) -> Self {
+        self.receive_batching = enabled;
+        self
     }
 
     /// Access the underlying socket (to register endpoints, send pings, etc).
@@ -2966,6 +2974,20 @@ impl DirectTransport {
 impl Drop for DirectTransport {
     fn drop(&mut self) {
         self._pump.abort();
+    }
+}
+
+enum ReceivedPackets {
+    One(core::array::IntoIter<ts_packet::PacketMut, 1>),
+    Many(std::vec::IntoIter<ts_packet::PacketMut>),
+}
+impl Iterator for ReceivedPackets {
+    type Item = ts_packet::PacketMut;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::One(i) => i.next(),
+            Self::Many(i) => i.next(),
+        }
     }
 }
 
@@ -2987,15 +3009,37 @@ impl UnderlayTransport for DirectTransport {
     }
 
     async fn recv(&self) -> impl BatchRecvIter<Self::PeerKey, Error = Self::Error> {
-        let received = {
-            let mut inbox = self.inbox.lock().await;
-            inbox.recv().await
+        let mut inbox = self.inbox.lock().await;
+        let Some(first) = inbox.recv().await else {
+            return Vec::new();
         };
-
-        match received {
-            Some(data) => vec![Ok((data.from_disco, [data.data]))],
-            None => vec![],
+        if !self.receive_batching {
+            return vec![Ok((
+                first.from_disco,
+                ReceivedPackets::One([first.data].into_iter()),
+            ))];
         }
+        // Each group is one dataplane message; preserve order within each peer's sequence.
+        let mut groups = HashMap::new();
+        groups
+            .entry(first.from_disco)
+            .or_insert_with(Vec::new)
+            .push(first.data);
+        if self.receive_batching {
+            for _ in 1..64 {
+                let Ok(data) = inbox.try_recv() else {
+                    break;
+                };
+                groups
+                    .entry(data.from_disco)
+                    .or_insert_with(Vec::new)
+                    .push(data.data);
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(peer, packets)| Ok((peer, ReceivedPackets::Many(packets.into_iter()))))
+            .collect::<Vec<_>>()
     }
 }
 
@@ -3004,6 +3048,56 @@ mod tests {
     use core::net::SocketAddrV4;
 
     use super::*;
+
+    #[tokio::test]
+    async fn receive_bridge_coalesces_ready_packets_with_a_bound_and_peer_fifo() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let key = ts_keys::DiscoPrivateKey::random().public_key();
+        let other = ts_keys::DiscoPrivateKey::random().public_key();
+        let sock = Arc::new(plain_sock().await);
+        let transport = DirectTransport {
+            inner: sock,
+            receive_batching: true,
+            inbox: tokio::sync::Mutex::new(rx),
+            _pump: tokio::spawn(std::future::pending()),
+        };
+        for n in 0..65u8 {
+            tx.send(ReceivedData {
+                from_disco: if n % 2 == 0 { key } else { other },
+                from_addr: localhost(),
+                data: PacketMut::from(&[n][..]),
+            })
+            .unwrap();
+        }
+        let batches = transport.recv().await;
+        let mut count = 0;
+        for result in batches.batch_iter() {
+            let (peer, packets) = result.unwrap();
+            let expected: Vec<_> = (0..64u8)
+                .filter(|n| (*n % 2 == 0) == (peer == key))
+                .collect();
+            assert_eq!(
+                packets
+                    .into_iter()
+                    .map(|p| p.as_ref()[0])
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            count += expected.len();
+        }
+        assert_eq!(count, 64);
+        let batches = tokio::time::timeout(std::time::Duration::from_millis(100), transport.recv())
+            .await
+            .unwrap();
+        let (_, packets) = batches.batch_iter().next().unwrap().unwrap();
+        assert_eq!(
+            packets
+                .into_iter()
+                .map(|p| p.as_ref()[0])
+                .collect::<Vec<_>>(),
+            [64]
+        );
+    }
 
     fn localhost() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
