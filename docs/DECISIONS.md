@@ -72,3 +72,18 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   request): branches `ts-exit/runner`, `ts-exit/perf-connected`. They carry the GeiserX tree's unrelated history,
   so they don't compare against the fork's `main`. This workspace (docs/scripts) isn't pushed: the permission
   classifier blocked it, pending the user's decision.
+
+## 2026-10-12
+
+- **F13 Profiling** (macOS `sample` under the tunnel benchmark, `scratch/categorize.py`): spans at INFO on
+  the packet path (16%), per-packet allocation/copies, tiny UDP buffers, a path-choice bug (hairpin), crypto,
+  syscalls, and finally cross-thread wakeups.
+- **D14 Optimizations kept**: trace-level spans, egress batching, 7 MiB socket buffers, Go `betterAddr`
+  (all default, `ts-exit/runner`); `ring` AEAD (feature `ring-aead`, opt-in because ring's key schedule
+  can't be zeroized); connected sockets + DF and `sendmsg_x` batching (env opt-in, `ts-exit/perf-connected`);
+  runner `--worker-threads 2`.
+- **D15 No hot-path restructure.** Estimated 15–25% from fewer actor handoffs. Capping tokio at 2 workers
+  gave 30% with no latency cost; 1 worker gave 61% but dropped packets under load (p99 1 s). The restructure
+  is deferred unless a faster line needs it.
+- **F14 `ring` and batching don't lower CPU/GB while the node is unsaturated** (the co-located Go client is
+  the bottleneck at 5.2 cores), though each cuts its own share. They matter at saturation.

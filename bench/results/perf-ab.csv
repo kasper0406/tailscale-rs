@@ -11,3 +11,5 @@ exitnode-O3,3,0,0.01,0.05,9
 O3-connected-DF,1,732,3.47,17.35,157
 O3-connected-DF,2,0,0.00,0.00,0
 O3-connected-DF,3,0,0.00,0.00,0
+exit-2workers,1,654,2.01,10.05,81
+exit-2workers,2,755,1.37,6.85,64

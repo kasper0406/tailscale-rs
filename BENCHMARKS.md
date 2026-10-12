@@ -143,6 +143,25 @@ What remains is per-packet handoff overhead: each packet crosses 4–5 actor/cha
 time. Go's reference work reports the same wall (~30% scheduler) and the same fix: fewer handoffs. At this
 home line's ~750 Mbit/s the node has 2–3× headroom either way.
 
+**Tokio worker count** (same binary; `TOKIO_WORKER_THREADS`, now the runner's `--worker-threads`,
+default 2). Latency is a 64-byte echo through the tunnel (`runner/rttprobe.py`), idle and during a
+full-speed download:
+
+| workers | down Mbit/s | down CPU-s/GB | up Mbit/s | up CPU-s/GB | RTT p99 idle / loaded |
+|---|---|---|---|---|---|
+| 10 (default, one per core) | ~1,800 | 9.1 | ~1,900 | 10.2 | 0.87 / 1.78 ms |
+| **2** | ~1,940 | **6.4** | ~1,945 | **7.0** | 0.78 / 1.69 ms |
+| 1 | ~2,063 | 3.6 | ~1,720 | 4.4 | 0.77 / **1,004 ms** (max 3,016) |
+
+Most of the "handoff" cost was threads waking each other across cores. One worker is the cheapest, but it
+drops packets under load: the loaded p99 sits at TCP's 1 s/3 s retransmit timeouts. Two workers keep the
+default's latency at 30% less CPU, so the restructure of the hot path was **not** done: this captured most
+of what it was estimated to save (15–25%).
+
+**Through the exit node to the internet, end state** (`runner/perf.sh`, OVH 200 MB, connected + DF +
+batching + `ring`, 2 workers): 654 and 755 Mbit/s at **10.1 and 6.9 CPU-s/GB** (81% and 64% of one core).
+The release build of the original fork used 24.7–25.2 CPU-s/GB at the same rate (~2.2 cores).
+
 Through the exit node to the internet (same Go client, OVH test file, `runner/perf.sh`) the node
 reached ~740–760 Mbit/s, the home line's ceiling (direct from the Mac: 737–767 Mbit/s). The release build
 used 24.7–25.2 CPU-s/GB there, the `exitnode` profile 22.7–23.2, and with connected sockets + DF 17.4.
