@@ -68,5 +68,9 @@ wycheproof.workspace = true
 name = "constant_time"
 harness = false
 
+[[bench]]
+name = "transport_data"
+harness = false
+
 [lints]
 workspace = true
