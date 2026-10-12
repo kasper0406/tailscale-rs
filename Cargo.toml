@@ -318,6 +318,7 @@ zeroize.workspace = true
 zerocopy.workspace = true
 libc = "0.2"
 socket2 = "0.6"
+futures-util.workspace = true
 # Dependencies for examples
 clap = { workspace = true, features = ["derive", "env", "string"] }
 chrono.workspace = true

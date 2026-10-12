@@ -87,6 +87,17 @@ enum Command {
         timeout: u64,
         #[arg(long, default_value_t = 256)]
         tcp_buf_kb: usize,
+        /// Enrolled identity (from `enroll`). With `--advertise`, hold a control session for the
+        /// run and report that address as this peer's endpoint, so the node learns it from the
+        /// netmap (the node never trusts a private source address learned from disco alone).
+        #[arg(long, requires_all = ["advertise", "bind"])]
+        identity_file: Option<PathBuf>,
+        /// Local UDP bind for the WireGuard socket (default: an ephemeral port).
+        #[arg(long)]
+        bind: Option<SocketAddr>,
+        /// Endpoint to report to control, e.g. this host's LAN address and the `--bind` port.
+        #[arg(long, requires = "identity_file")]
+        advertise: Option<SocketAddr>,
     },
     /// Test fixture only: raw WG + production PortGate/forwarder, virtual dst mapped to local sink.
     Fixture {
@@ -325,6 +336,42 @@ async fn enroll(
     Ok(())
 }
 
+/// Open a control session for an enrolled identity and report `advertise` as its only endpoint.
+/// The returned client keeps the session (and so the peer's netmap endpoint) alive while held.
+async fn advertise_endpoint(
+    key: &PathBuf,
+    disco_file: Option<&PathBuf>,
+    identity: &PathBuf,
+    advertise: SocketAddr,
+) -> Result<ts_control::AsyncControlClient> {
+    let disco_file = disco_file.ok_or("--advertise needs --disco-key-file")?;
+    let node_key = private(key)?;
+    let text = zeroize::Zeroizing::new(std::fs::read_to_string(disco_file)?);
+    let disco_key: DiscoPrivateKey = (*unhex(&text)?).into();
+    let text = zeroize::Zeroizing::new(std::fs::read_to_string(identity)?);
+    let mut keys = ts_keys::NodeState::from(serde_json::from_str::<ts_keys::PersistState>(&text)?);
+    keys.disco_keys = disco_key.into();
+    if keys.node_keys.public != node_key.public_key() {
+        return Err("identity file does not match the key file".into());
+    }
+    let (auth_url, _) = tokio::sync::watch::channel(None);
+    let (mut client, stream) =
+        ts_control::AsyncControlClient::connect(&Default::default(), &keys, None, auth_url).await?;
+    // Drain netmap updates so the session's broadcast never backs up.
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        let mut stream = std::pin::pin!(stream);
+        while stream.next().await.is_some() {}
+    });
+    client
+        .set_endpoints(vec![ts_control::Endpoint {
+            endpoint: advertise,
+            ty: ts_control::EndpointType::Local,
+        }])
+        .await;
+    Ok(client)
+}
+
 /// One owner for mutable WG endpoint/replay/timers. Drain ready packets in bounded batches.
 async fn bridge(
     socket: UdpSocket,
@@ -551,6 +598,8 @@ async fn peer(
     buffer: usize,
     wait_for_start: bool,
     legacy_stream: bool,
+    bind: Option<SocketAddr>,
+    await_node_ping: bool,
 ) -> Result<()> {
     if !dst.is_ipv4() || flows == 0 || bytes == 0 || flows > 16000 {
         return Err("IPv4 destination, positive bytes and 1..16000 flows required".into());
@@ -559,11 +608,14 @@ async fn peer(
     let node = public(&node)?;
     let disco = disco(disco_file, node_disco, key.public_key(), node)?;
     let ep = endpoint(key, node);
-    let udp = std::net::UdpSocket::bind(if remote.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })?;
+    let udp = match bind {
+        Some(bind) => std::net::UdpSocket::bind(bind)?,
+        None => std::net::UdpSocket::bind(if remote.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        })?,
+    };
     let options = socket2::SockRef::from(&udp);
     options.set_recv_buffer_size(7 * 1024 * 1024)?;
     options.set_send_buffer_size(7 * 1024 * 1024)?;
@@ -573,10 +625,14 @@ async fn peer(
     if let Some(state) = disco.as_ref() {
         let tx = ts_magicsock::random_tx_id();
         let ping = ts_magicsock::seal_ping(&state.private, state.our_node, &state.peer, tx)?;
-        tokio::time::timeout(Duration::from_secs(10),async {
+        // With an advertised endpoint, also wait for the node to ping us: that only happens once
+        // the node holds our netmap endpoint, which is what lets it attribute our WireGuard data.
+        let (mut ponged, mut pinged) = (false, !await_node_ping);
+        tokio::time::timeout(Duration::from_secs(if await_node_ping { 60 } else { 10 }),async {
             let mut retry=tokio::time::interval(Duration::from_millis(500));
             let mut buffer=[0u8;2048];
             loop {
+                if ponged && pinged { return Ok::<_,Box<dyn Error+Send+Sync>>(()); }
                 tokio::select! {
                     _=retry.tick() => { socket.send(&ping).await?; }
                     result=socket.recv_from(&mut buffer) => {
@@ -584,11 +640,12 @@ async fn peer(
                         let packet=&mut buffer[..n];
                         match ts_magicsock::open(&state.private,packet) {
                             Ok(ts_magicsock::Inbound::Pong{sender,tx_id,..}) if sender==state.peer && tx_id==tx => {
-                                return Ok::<_,Box<dyn Error+Send+Sync>>(());
+                                ponged = true;
                             }
                             Ok(ts_magicsock::Inbound::Ping{sender,claimed_node_key,tx_id}) if sender==state.peer && claimed_node_key==Some(state.peer_node) => {
                                 let pong=ts_magicsock::seal_pong(&state.private,&state.peer,tx_id,from)?;
                                 socket.send(&pong).await?;
+                                pinged = true;
                             }
                             _ => {}
                         }
@@ -781,6 +838,13 @@ fn process_cpu() -> Option<f64> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // Off unless RUST_LOG is set; stdout carries the JSON protocol, so logs go to stderr.
+    if std::env::var_os("RUST_LOG").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .init();
+    }
     if let Command::Keygen { file } = args.command {
         return keygen(file);
     }
@@ -844,7 +908,16 @@ fn main() -> Result<()> {
                 node_disco_key,
                 wait_for_start,
                 legacy_stream,
+                identity_file,
+                bind,
+                advertise,
             } => {
+                let _control = match (identity_file, advertise) {
+                    (Some(identity), Some(advertise)) => {
+                        Some(advertise_endpoint(&key_file, disco_key_file.as_ref(), &identity, advertise).await?)
+                    }
+                    _ => None,
+                };
                 peer(
                     key_file,
                     node_key,
@@ -860,6 +933,8 @@ fn main() -> Result<()> {
                     tcp_buf_kb,
                     wait_for_start,
                     legacy_stream,
+                    bind,
+                    _control.is_some(),
                 )
                 .await
             }
