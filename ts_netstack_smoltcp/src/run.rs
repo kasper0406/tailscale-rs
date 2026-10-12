@@ -58,7 +58,7 @@ pub async fn run(
 
     loop {
         // Commands must get service even with a perpetually readable device.
-        if netstack.work_budget().is_some() {
+        if netstack.work_budget().is_some() || netstack.ingress_budget().is_some() {
             netstack.process_cmds();
         }
         let now = now();
@@ -96,7 +96,7 @@ pub async fn run(
                 });
             }
         ];
-        if netstack.work_budget().is_some() {
+        if netstack.should_yield() {
             #[cfg(feature = "tokio")]
             tokio::task::yield_now().await;
             #[cfg(not(feature = "tokio"))]

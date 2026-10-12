@@ -200,9 +200,8 @@ impl kameo::Actor for ForwarderActor {
         // Pump packets emitted by the forwarder netstack down into the dataplane (out the overlay).
         let reject_up = netstack_up.clone();
         let counters = crate::pipeline_metrics::enabled();
-        let cooperative = env.packet_runtime.is_some()
-            || std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1")
-            || std::env::var("TS_EXPERIMENT_ACK_BATCH").as_deref() == Ok("1");
+        let cooperative =
+            env.packet_runtime.is_some() || crate::netstack_actor::budget_experiment();
         env.spawn_packet(&mut joinset, async move {
             let mut turns = 0;
             while let Some(first) = netstack_down_rx.recv_async().await {
@@ -388,7 +387,7 @@ impl kameo::Actor for ForwarderActor {
                     }
                 },
                 "forwarder",
-                cooperative,
+                cooperative || batching,
             )
             .await;
 

@@ -123,6 +123,12 @@ impl<D> Netstack<D> {
         self.core.set_work_budget(budget);
     }
 
+    /// Bound only async receive work per poll. Egress continues draining normally; the runner
+    /// yields only when the receive bound is reached. A full work budget takes precedence.
+    pub fn set_ingress_budget(&mut self, budget: Option<usize>) {
+        self.core.set_ingress_budget(budget);
+    }
+
     /// Construct a new netstack with the given device and configuration.
     ///
     /// Uses [`std::time::Instant`] as a clock.

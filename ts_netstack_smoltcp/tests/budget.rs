@@ -8,6 +8,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+
 use ts_netstack_smoltcp::{
     HasChannel, Netstack,
     netcore::{
@@ -77,6 +78,15 @@ impl netcore::AsyncWakeDevice for Flood {
 }
 #[tokio::test]
 async fn flood_yields_to_timer_and_socket_commands() {
+    flood_yields(false).await;
+}
+
+#[tokio::test]
+async fn receive_only_flood_yields_to_timer_and_socket_commands() {
+    flood_yields(true).await;
+}
+
+async fn flood_yields(receive_only: bool) {
     let packets = Arc::new(AtomicU64::new(0));
     let escaped = Arc::new(AtomicBool::new(false));
     let device = Flood(packets.clone(), escaped.clone());
@@ -89,7 +99,11 @@ async fn flood_yields_to_timer_and_socket_commands() {
             .unwrap();
         runtime.block_on(async {
             let mut stack = Netstack::new(device, Default::default());
-            stack.set_work_budget(Some(8));
+            if receive_only {
+                stack.set_ingress_budget(Some(8));
+            } else {
+                stack.set_work_budget(Some(8));
+            }
             let channel = stack.command_channel();
             tokio::spawn(async move { stack.run_tokio().await });
             let (tick, timer) = tokio::sync::oneshot::channel();

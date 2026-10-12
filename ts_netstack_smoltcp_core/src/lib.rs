@@ -59,6 +59,8 @@ const ORPHAN_SWEEP_INTERVAL: smoltcp::time::Duration = smoltcp::time::Duration::
 /// Internally i/o free userspace network stack built around `smoltcp`.
 pub struct Netstack {
     work_budget: Option<usize>,
+    ingress_budget: Option<usize>,
+    ingress_budget_exhausted: bool,
     metrics: Metrics,
     targeted_replay: Option<targeted_replay::TargetedReplay>,
     config: Config,
@@ -145,6 +147,8 @@ impl Netstack {
 
         Netstack {
             work_budget: None,
+            ingress_budget: None,
+            ingress_budget_exhausted: false,
             metrics: Metrics::new(),
             targeted_replay: targeted_replay::TargetedReplay::from_env(now),
             iface,
@@ -261,6 +265,21 @@ impl Netstack {
     /// Configured maximum items per async drain.
     pub fn work_budget(&self) -> Option<usize> {
         self.work_budget
+    }
+
+    /// Limit receive work per async poll without limiting transmit tokens or egress passes.
+    /// Full work budgeting, when configured, takes precedence.
+    pub fn set_ingress_budget(&mut self, budget: Option<usize>) {
+        self.ingress_budget = budget.map(|n| n.max(1));
+    }
+    /// Configured receive-only bound.
+    pub fn ingress_budget(&self) -> Option<usize> {
+        self.ingress_budget
+    }
+    /// Whether the async runner should yield after the last I/O poll. Receive-only budgeting
+    /// yields on exhaustion, rather than on every short receive or socket command.
+    pub fn should_yield(&self) -> bool {
+        self.work_budget.is_some() || self.ingress_budget_exhausted
     }
 
     /// Process all commands available in the command queue.
@@ -502,7 +521,7 @@ impl Netstack {
     /// - `Poll::Ready(false)`: we received packets but socket state did not make progress
     /// - `Poll::Ready(true)`: socket state progressed, or a budgeted drain consumed packets
     ///
-    /// With no work budget all available packets are drained. A budgeted call may return
+    /// With neither a full nor receive-only budget all available packets are drained. A bounded call may return
     /// ready at the budget limit, requiring another driver turn.
     ///
     /// Unlike the synchronous [`poll_device_io`](Self::poll_device_io), this does **not** call
@@ -520,13 +539,17 @@ impl Netstack {
         let mut changed = false;
         let mut polled_successfully = false;
         let mut processed = false;
-        let budgeted = self.work_budget.is_some();
+        let budget = self.work_budget.or(self.ingress_budget);
+        let budgeted = budget.is_some();
+        self.ingress_budget_exhausted = false;
 
-        let mut remaining = self.work_budget.unwrap_or(usize::MAX);
+        let mut remaining = budget.unwrap_or(usize::MAX);
         let mut exhausted = false;
         loop {
             if remaining == 0 {
                 exhausted = true;
+                self.ingress_budget_exhausted = true;
+                self.metrics.record(Metric::IngressBudgetHits, 1);
                 break;
             }
             remaining -= 1;
@@ -599,6 +622,7 @@ impl Netstack {
         mut dev: Pin<&mut (impl AsyncWakeDevice + smoltcp::phy::Device + Unpin)>,
     ) -> Poll<bool> {
         core::task::ready!(dev.as_mut().poll_tx(cx));
+        self.metrics.record(Metric::EgressPasses, 1);
 
         let (result, exhausted) = if let Some(budget) = self.work_budget {
             let mut limited = TxBudget {
@@ -616,6 +640,9 @@ impl Netstack {
                 false,
             )
         };
+        if exhausted {
+            self.metrics.record(Metric::EgressBudgetHits, 1);
+        }
         match result {
             PollResult::SocketStateChanged => {
                 tracing::trace!("socket state changed");
@@ -731,6 +758,7 @@ impl Netstack {
 /// Without a work budget the future completes all synchronously-available network I/O, polling
 /// until `dev.poll_rx` and `dev.poll_tx` return `Poll::Pending`, and/or until the netstack
 /// reports that there are no more packets to be sent.
+/// A receive-only budget limits one ingress drain per poll while egress continues until idle.
 ///
 /// # Cancel safety
 ///
@@ -783,6 +811,8 @@ where
         } = self.get_mut();
 
         stack.service_replay_deadline(*now);
+        stack.ingress_budget_exhausted = false;
+        stack.metrics.record(Metric::IoPolls, 1);
         stack.pump_waiters();
 
         let now = *now;
@@ -792,10 +822,13 @@ where
         let mut progress_made = false;
 
         let budgeted = stack.work_budget.is_some();
+        let ingress_only = !budgeted && stack.ingress_budget.is_some();
+        let mut ingress_polled = false;
         while !(ingress_pending && (*egress_done || egress_pending)) {
             tracing::trace_span!("poll_loop", ingress_pending, egress_done, egress_pending);
 
             if !ingress_pending {
+                ingress_polled = true;
                 match stack.poll_device_ingress_async(cx, now, dev.as_mut()) {
                     // `dev` doesn't have any packets to receive
                     Poll::Pending => ingress_pending = true,
@@ -817,6 +850,12 @@ where
                 }
             }
 
+            // Only one bounded receive drain per poll, including on a loopback device. Keep
+            // iterating egress so a single flow can publish several segments before returning.
+            if ingress_only && ingress_polled {
+                ingress_pending = true;
+            }
+
             if !(*egress_done || egress_pending) {
                 match stack.poll_device_egress_async(cx, now, dev.as_mut()) {
                     // `dev` isn't ready to accept transmits, don't bother trying egress again this
@@ -832,7 +871,7 @@ where
                     // possibility of synchronous loopback.
                     Poll::Ready(true) => {
                         egress_pending = false;
-                        ingress_pending = false;
+                        ingress_pending = ingress_only && ingress_polled;
                         progress_made = true;
                     }
                 }
@@ -846,6 +885,7 @@ where
         progress_made |= stack.drain_tcp_closes(now);
         dev.as_mut().finish_turn();
         if progress_made {
+            stack.metrics.record(Metric::IoReady, 1);
             Poll::Ready(())
         } else {
             Poll::Pending

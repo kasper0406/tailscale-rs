@@ -199,8 +199,11 @@ async fn connect_with_retry(
 fn batch_experiments(stack: &mut Netstack<WakingPipeDev>) {
     let ack = std::env::var("TS_EXPERIMENT_ACK_BATCH").as_deref() == Ok("1");
     stack.set_egress_batching(ack);
-    if ack || std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1") {
+    if std::env::var("TS_EXPERIMENT_NETSTACK_BUDGET").as_deref() == Ok("1") {
         stack.set_work_budget(Some(128));
+    }
+    if std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1") {
+        stack.set_ingress_budget(Some(128));
     }
 }
 

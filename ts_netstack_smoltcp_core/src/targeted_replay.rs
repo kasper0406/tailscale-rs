@@ -369,7 +369,12 @@ mod tests {
         }
     }
     pub(super) fn pair() -> (Netstack, PipeDev, SocketHandle, SocketHandle) {
+        pair_with_buffer(64)
+    }
+
+    pub(super) fn pair_with_buffer(size: usize) -> (Netstack, PipeDev, SocketHandle, SocketHandle) {
         let mut stack = stack();
+        stack.config.tcp_buffer_size = size;
         let mut dev = dev();
         let listener = match request(
             &mut stack,
@@ -835,8 +840,21 @@ mod driver_tests {
 
     #[test]
     fn budgeted_async_ingress_services_dirty_recv_before_returning() {
+        budgeted_ingress_services_recv(false);
+    }
+
+    #[test]
+    fn receive_only_async_ingress_services_dirty_recv_before_returning() {
+        budgeted_ingress_services_recv(true);
+    }
+
+    fn budgeted_ingress_services_recv(receive_only: bool) {
         let (mut stack, dev, client, server) = pair();
-        stack.set_work_budget(Some(1));
+        if receive_only {
+            stack.set_ingress_budget(Some(1));
+        } else {
+            stack.set_work_budget(Some(1));
+        }
         let recv = request(
             &mut stack,
             Some(server),
@@ -865,6 +883,84 @@ mod driver_tests {
         assert_recv(&recv, b"hello");
         assert_eq!(stack.metrics.counts().targeted_replay_completions, 2);
         assert_eq!(stack.metrics.counts().safety_net_sweeps, 0);
+    }
+
+    #[test]
+    fn receive_only_budget_drains_single_tcp_egress_in_one_poll() {
+        for full_budget in [false, true] {
+            let (mut stack, dev, client, _) = pair_with_buffer(16 * 1024);
+            stack.set_ingress_budget(Some(1));
+            if full_budget {
+                stack.set_work_budget(Some(128));
+            }
+            request(
+                &mut stack,
+                Some(client),
+                crate::tcp::stream::Command::Send {
+                    buf: bytes::Bytes::from(alloc::vec![b'x'; 8000]),
+                },
+            )
+            .try_recv()
+            .unwrap();
+            let mut dev = AsyncDev {
+                inner: dev,
+                capacity: true,
+            };
+            let before = stack.metrics.counts().egress_passes;
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                Pin::new(&mut stack.wait_io_async(Instant::ZERO, &mut dev))
+                    .poll(&mut cx)
+                    .is_ready()
+            );
+            let packets: alloc::vec::Vec<_> = dev.inner.pipe.rx.drain().collect();
+            if full_budget {
+                // Preserve the old path as the independent A/B control: one socket pass, even
+                // though 127 transmit tokens were unused. The runner will yield here.
+                assert_eq!(packets.len(), 1);
+                assert_eq!(stack.metrics.counts().egress_passes - before, 1);
+                assert_eq!(stack.metrics.counts().egress_budget_hits, 0);
+                assert!(stack.should_yield());
+            } else {
+                assert!(packets.len() > 1, "single-flow egress must keep draining");
+                assert!(stack.metrics.counts().egress_passes - before > 1);
+                assert!(!stack.should_yield(), "no receive bound was hit");
+            }
+        }
+    }
+
+    #[test]
+    fn receive_only_limit_survives_egress_and_short_drains_do_not_yield() {
+        let mut stack = stack();
+        stack.set_ingress_budget(Some(2));
+        let mut dev = AsyncDev {
+            inner: dev(),
+            capacity: true,
+        };
+        for _ in 0..5 {
+            dev.inner
+                .pipe
+                .tx
+                .send(bytes::Bytes::from_static(&[0; 20]))
+                .unwrap();
+        }
+        let mut cx = Context::from_waker(Waker::noop());
+        for remaining in [3, 1, 0] {
+            assert!(
+                Pin::new(&mut stack.wait_io_async(Instant::ZERO, &mut dev))
+                    .poll(&mut cx)
+                    .is_ready()
+            );
+            assert_eq!(dev.inner.pipe.rx.len(), remaining);
+            assert_eq!(stack.should_yield(), remaining != 0);
+        }
+        assert!(
+            Pin::new(&mut stack.wait_io_async(Instant::ZERO, &mut dev))
+                .poll(&mut cx)
+                .is_pending()
+        );
+        assert!(!stack.should_yield());
+        assert_eq!(stack.metrics.counts().ingress_budget_hits, 2);
     }
 
     #[test]

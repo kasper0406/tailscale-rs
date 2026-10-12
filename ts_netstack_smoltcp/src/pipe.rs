@@ -644,12 +644,25 @@ mod tests {
 
     #[test]
     fn async_polls_flush_buffered_tokens_before_returning() {
+        polls_flush_buffered_tokens(false);
+    }
+
+    #[test]
+    fn receive_only_polls_flush_buffered_tokens_before_returning() {
+        polls_flush_buffered_tokens(true);
+    }
+
+    fn polls_flush_buffered_tokens(receive_only: bool) {
         use core::future::Future;
         let (pipe, mut caller) = WakingPipe::unbounded();
         let mut dev = device(pipe);
         dev.pipe.tx.pending_egress = Some(Vec::new());
         let mut stack = netcore::Netstack::new(Default::default(), Instant::ZERO);
-        stack.set_work_budget(Some(1));
+        if receive_only {
+            stack.set_ingress_budget(Some(1));
+        } else {
+            stack.set_work_budget(Some(1));
+        }
         // Simulate a partial output turn, then make the driver consume a malformed packet.
         dev.transmit(Instant::ZERO)
             .unwrap()

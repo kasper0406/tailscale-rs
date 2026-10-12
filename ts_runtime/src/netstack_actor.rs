@@ -51,6 +51,11 @@ pub(crate) const INGRESS_QUEUE_PACKETS: usize = 4096;
 /// Most packets a netstack egress pump hands the dataplane at once.
 pub(crate) const EGRESS_BATCH: usize = 64;
 
+/// Full driver/pump budgeting is independent of receive and egress publication batching.
+pub(crate) fn budget_experiment() -> bool {
+    std::env::var("TS_EXPERIMENT_NETSTACK_BUDGET").as_deref() == Ok("1")
+}
+
 /// A packet the netstack emitted, as a [`PacketMut`]: zero-copy when the pipe's buffer is uniquely
 /// owned (it always is: the pipe copies each packet in), a copy otherwise.
 pub(crate) fn into_packet(buf: bytes::Bytes) -> PacketMut {
@@ -77,8 +82,13 @@ pub(crate) fn piped_ingress_bounded(
         netstack::piped_ingress_bounded(config, INGRESS_QUEUE_PACKETS, max_bytes);
     let ack_batching = std::env::var("TS_EXPERIMENT_ACK_BATCH").as_deref() == Ok("1");
     stack.set_egress_batching(ack_batching);
-    if ack_batching || std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1") {
+    if budget_experiment() {
         stack.set_work_budget(Some(128));
+    }
+    if std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1") {
+        // A continuously refilled pipe must not monopolise the driver. Egress is deliberately
+        // unbounded here: a single TCP socket emits only one segment per smoltcp egress pass.
+        stack.set_ingress_budget(Some(128));
     }
     (stack, pipe)
 }
@@ -123,6 +133,8 @@ pub(crate) async fn pump_ingress_with_budget(
     pump_ingress_with_batch_wake(from_dataplane, admit, || {}, netstack_name, cooperative).await
 }
 
+/// RX batching keeps this admission-side bound even without full work budgeting: flush deferred
+/// wakes before yielding, including when one channel message carries more than 128 packets.
 pub(crate) async fn pump_ingress_with_batch_wake(
     mut from_dataplane: OverlayFromDataplane,
     mut admit: impl FnMut(&[u8]) -> bool,
@@ -250,9 +262,7 @@ impl kameo::Actor for NetstackActor {
         });
 
         let counters = crate::pipeline_metrics::enabled();
-        let cooperative = env.packet_runtime.is_some()
-            || std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1")
-            || std::env::var("TS_EXPERIMENT_ACK_BATCH").as_deref() == Ok("1");
+        let cooperative = env.packet_runtime.is_some() || budget_experiment();
         env.spawn_packet(&mut joinset, async move {
             let mut turns = 0;
             while let Some(first) = netstack_down_rx.recv_async().await {
@@ -298,7 +308,7 @@ impl kameo::Actor for NetstackActor {
                     }
                 },
                 "application",
-                cooperative,
+                cooperative || batching,
             )
             .await;
 
