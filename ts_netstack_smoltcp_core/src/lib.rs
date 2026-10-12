@@ -13,9 +13,8 @@ pub extern crate flume;
 pub extern crate smoltcp;
 
 use alloc::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     vec,
-    vec::Vec,
 };
 use core::{
     net::IpAddr,
@@ -31,6 +30,7 @@ use smoltcp::{
 mod command;
 mod config;
 mod pipe;
+mod registry;
 mod socket_impl;
 mod stack_control_impl;
 mod util;
@@ -43,6 +43,7 @@ pub use command::{
 };
 pub use config::Config;
 pub use pipe::{Pipe, PipeDev};
+use registry::{RegisteredSocket, SocketEntry};
 pub use socket_impl::tcp::ListenerHandle as TcpListenerHandle;
 pub use stack_control_impl::NetstackControl;
 use util::NoopCapDev;
@@ -72,12 +73,12 @@ pub struct Netstack {
     /// command is dropped with `missing_socket` instead of being mis-delivered to the new socket.
     blocked_commands: VecDeque<(Request, Option<u64>)>,
 
-    /// Per-handle generation counter, stamped on every `add` and cleared on every `remove` (see
+    /// Per-handle generation and socket kind, stamped on every `add` and cleared on every `remove` (see
     /// [`Netstack::add_socket`] / [`Netstack::remove_socket`]). A `SocketHandle` is just a slot
     /// index that smoltcp reuses on the next `add` after a `remove`, so the index alone cannot tell
     /// a recycled socket apart from the original; this map supplies the missing generation, checked
-    /// only on the requeue-replay path.
-    handle_gens: BTreeMap<SocketHandle, u64>,
+    /// on replay. Kind validates typed indexed access without walking socket storage.
+    socket_registry: BTreeMap<SocketHandle, SocketEntry>,
 
     /// Monotonic source for the next handle generation. Wraps on overflow (see
     /// [`Netstack::add_socket`]).
@@ -85,7 +86,7 @@ pub struct Netstack {
 
     /// Set of TCP socket handles that are expected to close in the future, held onto for
     /// graceful shutdown.
-    pending_tcp_closes: Vec<SocketHandle>,
+    pending_tcp_closes: BTreeSet<SocketHandle>,
 
     /// Active TCP listeners.
     ///
@@ -136,7 +137,7 @@ impl Netstack {
             command_rx: rx,
             config: ns_config,
             blocked_commands: Default::default(),
-            handle_gens: BTreeMap::new(),
+            socket_registry: BTreeMap::new(),
             next_gen: 0,
             pending_tcp_closes: Default::default(),
             tcp_listeners: Default::default(),
@@ -147,7 +148,7 @@ impl Netstack {
     /// Add a socket to the set, stamping it with a fresh generation.
     ///
     /// This is the single chokepoint for socket creation: it pairs the slot index smoltcp hands
-    /// back with a monotonically-increasing generation in [`Netstack::handle_gens`], so a later
+    /// back with a monotonically-increasing generation in [`Netstack::socket_registry`], so a later
     /// `add` that reuses the same freed slot gets a *different* generation. The requeue-replay path
     /// uses that to tell a recycled socket apart from the one a blocked command originally
     /// referenced.
@@ -155,14 +156,17 @@ impl Netstack {
     /// `next_gen` uses `wrapping_add`: a collision would require 2^64 intervening `add`s *and* the
     /// same slot to be reused with the exact same generation within a single queued command's
     /// lifetime, which is not reachable in practice.
-    pub(crate) fn add_socket<T: smoltcp::socket::AnySocket<'static>>(
-        &mut self,
-        sock: T,
-    ) -> SocketHandle {
+    pub(crate) fn add_socket<T: RegisteredSocket>(&mut self, sock: T) -> SocketHandle {
         let h = self.socket_set.add(sock);
         let g = self.next_gen;
         self.next_gen = self.next_gen.wrapping_add(1);
-        self.handle_gens.insert(h, g);
+        self.socket_registry.insert(
+            h,
+            SocketEntry {
+                generation: g,
+                kind: T::KIND,
+            },
+        );
         h
     }
 
@@ -172,13 +176,23 @@ impl Netstack {
     /// once removed, [`Netstack::handle_gen`] reports `None` for the (now-free) slot until it is
     /// re-added with a new generation.
     pub(crate) fn remove_socket(&mut self, handle: SocketHandle) {
-        self.handle_gens.remove(&handle);
+        self.socket_registry.remove(&handle);
+        self.pending_tcp_closes.remove(&handle);
         self.socket_set.remove(handle);
     }
 
     /// Current generation of `handle`, or `None` if no live socket occupies that slot.
     pub(crate) fn handle_gen(&self, handle: SocketHandle) -> Option<u64> {
-        self.handle_gens.get(&handle).copied()
+        self.socket_registry
+            .get(&handle)
+            .map(|entry| entry.generation)
+    }
+
+    /// O(log n) membership/type validation before smoltcp's panicking indexed getter.
+    pub(crate) fn socket_matches<T: RegisteredSocket>(&self, handle: SocketHandle) -> bool {
+        self.socket_registry
+            .get(&handle)
+            .is_some_and(|entry| entry.kind == T::KIND)
     }
 
     /// Report the next time the netstack should be polled.
@@ -485,7 +499,9 @@ impl Netstack {
                 PollIngressSingleResult::None => {
                     break;
                 }
-                PollIngressSingleResult::PacketProcessed => { processed = true; }
+                PollIngressSingleResult::PacketProcessed => {
+                    processed = true;
+                }
                 PollIngressSingleResult::SocketStateChanged => {
                     processed = true;
                     changed = true;
@@ -969,7 +985,7 @@ mod handle_aba_tests {
         // different socket" without going through close/rebind. The queued gen (captured at requeue)
         // no longer matches the map.
         let new_gen = stack.handle_gen(handle).unwrap().wrapping_add(1);
-        stack.handle_gens.insert(handle, new_gen);
+        stack.socket_registry.get_mut(&handle).unwrap().generation = new_gen;
 
         stack.pump_blocked_commands();
 
@@ -1131,11 +1147,7 @@ mod handle_aba_tests {
         assert!(stack.blocked_commands.is_empty());
     }
 
-    /// tsr-ufm: `pending_tcp_closes` has no dedup, so the same handle can appear twice. The first
-    /// occurrence's `remove_socket` frees the slot; a naive `socket_set.get::<tcp::Socket>` on the
-    /// second occurrence would PANIC (smoltcp `get` panics on a removed handle), killing the actor.
-    /// `drain_tcp_closes` must instead existence-check each handle and drop the already-gone
-    /// duplicate without a second remove — and still fully reclaim the socket.
+    /// tsr-ufm: repeated close requests must deduplicate before draining and reclaim once.
     #[test]
     fn duplicate_pending_close_handle_does_not_panic_and_is_reclaimed() {
         let mut stack = Netstack::new(Config::default(), Instant::ZERO);
@@ -1151,11 +1163,13 @@ mod handle_aba_tests {
         let handle = stack.add_socket(sock);
         assert!(stack.handle_gen(handle).is_some());
 
-        // Push the SAME handle twice (the un-deduped Vec the eight push sites feed).
-        stack.pending_tcp_closes.push(handle);
-        stack.pending_tcp_closes.push(handle);
+        // Insert the SAME handle twice, as overlapping close paths can do.
+        stack.pending_tcp_closes.insert(handle);
+        stack.pending_tcp_closes.insert(handle);
 
-        // Must not panic on the second (now-stale) occurrence.
+        assert_eq!(stack.pending_tcp_closes.len(), 1);
+
+        // Drain the single pending close.
         stack.drain_tcp_closes();
 
         assert!(
@@ -1168,7 +1182,7 @@ mod handle_aba_tests {
         );
         assert!(
             stack.pending_tcp_closes.is_empty(),
-            "both occurrences (the live one + the stale duplicate) must drain"
+            "the deduplicated close must drain"
         );
     }
 
@@ -1185,7 +1199,7 @@ mod handle_aba_tests {
             smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; 64]),
         );
         let handle = stack.add_socket(sock);
-        stack.pending_tcp_closes.push(handle);
+        stack.pending_tcp_closes.insert(handle);
 
         // The socket is reclaimed elsewhere (orphan reap, an explicit Close, ...) and a UDP bind
         // recycles the slot, handing back an EQUAL handle.

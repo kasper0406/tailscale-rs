@@ -121,7 +121,7 @@ impl Netstack {
                 let sock = get_socket_mut!(self, tcp::Socket, Some(handle));
                 sock.close();
 
-                self.pending_tcp_closes.push(handle);
+                self.pending_tcp_closes.insert(handle);
 
                 Response::Ok
             }
@@ -146,28 +146,11 @@ impl Netstack {
     /// Drop all TCP sockets that have finished closing.
     #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn drain_tcp_closes(&mut self) {
-        // Take the list out so the `retain` closure doesn't hold a borrow of `*self`: removing a
-        // socket now goes through `remove_socket` (which needs `&mut self` for the gen-map), and a
-        // method call inside a `pending_tcp_closes.retain` closure would conflict with that borrow.
+        // Take the deduplicated set out to allow removal through the registry wrapper.
         let mut pending = core::mem::take(&mut self.pending_tcp_closes);
         pending.retain(|&handle| {
-            // `pending_tcp_closes` is a `Vec` with no dedup, and the eight push sites are not
-            // proven disjoint per handle, so the same handle CAN appear twice. The first
-            // occurrence's `remove_socket` then frees the slot, and a naive
-            // `socket_set.get::<tcp::Socket>(handle)` on the second occurrence PANICS (smoltcp's
-            // `get` panics on a removed handle), killing the netstack actor. Guard with the same
-            // existence scan `get_socket_mut!` uses: a handle no longer in the set is already gone
-            // (reaped here, by the orphan reap, or elsewhere) — drop it from `pending` without a
-            // second remove. (tsr-ufm)
-            //
-            // The slot may also have been recycled by a socket of ANOTHER type, in which case the
-            // existence check passes and the typed `get::<tcp::Socket>` below panics instead
-            // (#297). Match on the type as well as the handle.
-            let matches_type = self.socket_set.iter().any(|(h, socket)| {
-                h == handle
-                    && <tcp::Socket as smoltcp::socket::AnySocket<'_>>::downcast(socket).is_some()
-            });
-            if !matches_type {
+            // Covers a removed slot and #297's recycled slot of another socket type.
+            if !self.socket_matches::<tcp::Socket>(handle) {
                 return false;
             }
 
@@ -202,7 +185,7 @@ impl Netstack {
     /// second pass closes that gap.
     ///
     /// A reaped handle is freed via [`Netstack::remove_socket`], so its generation is cleared in
-    /// `handle_gens`; any blocked command still referencing it is dropped on replay by the
+    /// `socket_registry`; any blocked command still referencing it is dropped on replay by the
     /// generation guard (iter65, ABA fix). A consumer's *next* first-touch command against the
     /// reaped handle returns `missing_socket` rather than panicking — the four direct handlers in
     /// [`Netstack::process_tcp_stream`] route through `get_socket_mut!` for exactly this.
@@ -248,13 +231,13 @@ impl Netstack {
                 handle = ?h,
                 "reaping autonomously-closed consumer-owned TCP socket (tsr-9ue)"
             );
-            // `remove_socket` (not raw `socket_set.remove`) so `handle_gens` stays consistent.
+            // `remove_socket` (not raw `socket_set.remove`) so `socket_registry` stays consistent.
             self.remove_socket(h);
         }
     }
 
     fn check_conn(&mut self, handle: SocketHandle, orig_cmd: TcpStreamCommand) -> Response {
-        let sock = self.socket_set.get_mut::<tcp::Socket>(handle);
+        let sock = get_socket_mut!(self, tcp::Socket, Some(handle));
 
         match sock.state() {
             tcp::State::Established => {
@@ -269,7 +252,7 @@ impl Netstack {
 
             _ => {
                 tracing::warn!("connecting socket was reset or closed");
-                self.pending_tcp_closes.push(handle);
+                self.pending_tcp_closes.insert(handle);
                 Response::Error(Error::ConnectionReset)
             }
         }
