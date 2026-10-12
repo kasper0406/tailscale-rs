@@ -115,10 +115,12 @@ impl Message<MeasureNow> for DerpLatencyMeasurer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use kameo::actor::Spawn;
     use std::time::Duration;
+
+    use kameo::actor::Spawn;
     use tokio::sync::watch;
+
+    use super::*;
 
     /// A minimal `ForwarderConfig` for standing up an `Env` in these bus tests (mirrors the inline
     /// configs the sibling actor tests use; nothing here depends on the forwarding fields).

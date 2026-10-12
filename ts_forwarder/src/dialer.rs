@@ -236,6 +236,61 @@ impl<D: RealDialer> RealDialer for ExitDnsDialer<D> {
     }
 }
 
+/// Benchmark-only: send exit flows aimed at one address in the RFC 2544 benchmarking range
+/// (198.18.0.0/15) to a sink on this host's loopback instead, so exit-path load tests can run
+/// without a public server. Everything else goes to the inner dialer unchanged, including its
+/// destination guard. Only constructed from an explicit opt-in (`TS_BENCH_EXIT_REDIRECT`), never
+/// by default; the constructor refuses any mapping that is not benchmark-range to loopback.
+#[derive(Clone, Debug)]
+pub struct BenchRedirectDialer<D> {
+    inner: D,
+    redirect: Option<(SocketAddr, SocketAddr)>,
+}
+
+impl<D> BenchRedirectDialer<D> {
+    /// Wrap `inner`; with `redirect = Some((from, to))`, exit flows to `from` dial `to`.
+    pub fn new(inner: D, redirect: Option<(SocketAddr, SocketAddr)>) -> Result<Self, DialError> {
+        if let Some((from, to)) = redirect {
+            let bench_range = matches!(from.ip(), IpAddr::V4(v4) if v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18);
+            if !bench_range || !to.ip().is_loopback() {
+                return Err(DialError::ForbiddenDestination(from));
+            }
+        }
+        Ok(Self { inner, redirect })
+    }
+
+    fn target(&self, class: FlowClass, dst: SocketAddr) -> Option<SocketAddr> {
+        match self.redirect {
+            Some((from, to)) if class == FlowClass::ExitNode && dst == from => Some(to),
+            _ => None,
+        }
+    }
+}
+
+impl<D: RealDialer> RealDialer for BenchRedirectDialer<D> {
+    async fn dial_tcp(
+        &self,
+        class: FlowClass,
+        dst: SocketAddr,
+    ) -> Result<tokio::net::TcpStream, DialError> {
+        match self.target(class, dst) {
+            Some(to) => self.inner.dial_tcp(FlowClass::Subnet, to).await,
+            None => self.inner.dial_tcp(class, dst).await,
+        }
+    }
+
+    async fn dial_udp(&self, class: FlowClass, dst: SocketAddr) -> Result<DialedUdp, DialError> {
+        match self.target(class, dst) {
+            Some(to) => {
+                let mut d = self.inner.dial_udp(FlowClass::Subnet, to).await?;
+                d.spoof_src = dst.ip();
+                Ok(d)
+            }
+            None => self.inner.dial_udp(class, dst).await,
+        }
+    }
+}
+
 /// Refuse an exit-node flow aimed at a non-internet destination (see [`exit_dst_is_forbidden`]).
 fn refuse_forbidden_exit_dst(class: FlowClass, dst: SocketAddr) -> Result<(), DialError> {
     if class == FlowClass::ExitNode && exit_dst_is_forbidden(dst) {
@@ -730,6 +785,42 @@ mod tests {
         }
         assert!(!d.redirect(FlowClass::ExitNode, "1.1.1.1:53".parse().unwrap()));
         assert!(!d.redirect(FlowClass::Subnet, "192.168.1.1:53".parse().unwrap()));
+    }
+
+    /// The benchmark redirect only accepts benchmark-range -> loopback, and only redirects that one
+    /// exit destination; everything else still meets the guard.
+    #[tokio::test]
+    async fn bench_redirect_is_narrow() {
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let to = sink.local_addr().unwrap();
+        let from: SocketAddr = "198.18.0.1:9000".parse().unwrap();
+        assert!(
+            BenchRedirectDialer::new(
+                HostExitDialer,
+                Some(("192.168.50.1:80".parse().unwrap(), to))
+            )
+            .is_err()
+        );
+        assert!(
+            BenchRedirectDialer::new(
+                HostExitDialer,
+                Some((from, "192.168.50.1:80".parse().unwrap()))
+            )
+            .is_err()
+        );
+        let d = BenchRedirectDialer::new(HostExitDialer, Some((from, to))).unwrap();
+        let s = d.dial_tcp(FlowClass::ExitNode, from).await.unwrap();
+        assert_eq!(s.peer_addr().unwrap(), to);
+        // Another port on the same benchmark IP, and loopback itself, are still refused.
+        assert!(matches!(
+            d.dial_tcp(FlowClass::ExitNode, "198.18.0.1:9001".parse().unwrap())
+                .await,
+            Err(DialError::ForbiddenDestination(_)) | Err(DialError::Io(_))
+        ));
+        assert!(matches!(
+            d.dial_tcp(FlowClass::ExitNode, to).await,
+            Err(DialError::ForbiddenDestination(_))
+        ));
     }
 
     /// Public destinations pass the guard (the connect itself is never attempted here).

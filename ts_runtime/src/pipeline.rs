@@ -141,12 +141,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::{
         sync::Arc,
         time::{Duration, Instant},
     };
+
     use tokio::sync::{Notify, mpsc};
+
+    use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn packet_thread_progresses_while_caller_worker_is_cpu_bound() {
@@ -182,6 +184,9 @@ mod tests {
     /// Listener setup stays on the caller; subsequent packet progress must survive its busy worker.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn application_and_forwarder_packet_pumps_survive_caller_starvation() {
+        use kameo::actor::Spawn;
+        use netstack::{CreateSocket, netcore::NetstackControl};
+
         use crate::{
             Env,
             dataplane::{DatapathActivity, OverlayToDataplane},
@@ -189,8 +194,6 @@ mod tests {
             forwarder_actor::ForwarderActor,
             netstack_actor::{GetChannel, NetstackActor},
         };
-        use kameo::actor::Spawn;
-        use netstack::{CreateSocket, netcore::NetstackControl};
 
         tokio::time::timeout(Duration::from_secs(5), async {
             let pipeline = PipelineThread::start().unwrap();
