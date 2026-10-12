@@ -685,6 +685,8 @@ async fn peer(
         let down = direction == "down";
         let external_start = external_start.clone();
         let mut started = external_start.subscribe();
+        let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen = progress.clone();
         jobs.spawn(async move {
             let run = async {
                 let local = SocketAddr::new(source.into(), base_port + n as u16);
@@ -735,6 +737,7 @@ async fn peer(
                         size
                     };
                     moved += amount as u64;
+                    progress.store(moved, std::sync::atomic::Ordering::Relaxed);
                 }
                 if !down {
                     stream.shutdown().await?;
@@ -752,7 +755,13 @@ async fn peer(
             };
             tokio::time::timeout(Duration::from_secs(timeout), run)
                 .await
-                .map_err(|_| "flow timed out")?
+                .map_err(|_| {
+                    format!(
+                        "flow {n} (local port {}) timed out after {} of {bytes} bytes",
+                        base_port + n as u16,
+                        seen.load(std::sync::atomic::Ordering::Relaxed)
+                    )
+                })?
         });
     }
 
