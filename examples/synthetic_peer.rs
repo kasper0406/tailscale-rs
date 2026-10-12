@@ -98,6 +98,24 @@ enum Command {
         /// Endpoint to report to control, e.g. this host's LAN address and the `--bind` port.
         #[arg(long, requires = "identity_file")]
         advertise: Option<SocketAddr>,
+        /// Before load, also wait for the node to ping us (it holds our netmap endpoint). Implied
+        /// by `--advertise`; use it with `--bind` when a `hold` process advertises instead.
+        #[arg(long)]
+        await_node_ping: bool,
+    },
+    /// Hold one control session that reports `--advertise` as the peer's endpoint, until killed.
+    /// Run it for a whole benchmark matrix, so short-lived `peer` runs (with `--bind` and
+    /// `--await-node-ping`) don't each reconnect: back-to-back sessions of one node race in
+    /// control, and a late "offline" can strip the endpoint from the node mid-run.
+    Hold {
+        #[arg(long)]
+        key_file: PathBuf,
+        #[arg(long)]
+        disco_key_file: PathBuf,
+        #[arg(long)]
+        identity_file: PathBuf,
+        #[arg(long)]
+        advertise: SocketAddr,
     },
     /// Test fixture only: raw WG + production PortGate/forwarder, virtual dst mapped to local sink.
     Fixture {
@@ -882,6 +900,19 @@ fn main() -> Result<()> {
                 )
                 .await
             }
+            Command::Hold {
+                key_file,
+                disco_key_file,
+                identity_file,
+                advertise,
+            } => {
+                let _control =
+                    advertise_endpoint(&key_file, Some(&disco_key_file), &identity_file, advertise)
+                        .await?;
+                println!("{}", serde_json::json!({"holding": advertise.to_string()}));
+                std::future::pending::<()>().await;
+                Ok(())
+            }
             Command::Fixture {
                 key_file,
                 peer_key,
@@ -920,6 +951,7 @@ fn main() -> Result<()> {
                 identity_file,
                 bind,
                 advertise,
+                await_node_ping,
             } => {
                 let _control = match (identity_file, advertise) {
                     (Some(identity), Some(advertise)) => {
@@ -943,7 +975,7 @@ fn main() -> Result<()> {
                     wait_for_start,
                     legacy_stream,
                     bind,
-                    _control.is_some(),
+                    await_node_ping || _control.is_some(),
                 )
                 .await
             }
