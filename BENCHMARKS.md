@@ -127,6 +127,22 @@ Profile after these changes (download): UDP syscalls 26% of busy CPU (one `sendt
 tracing down from 16% to 2.5%. Next: `ring` AEAD (microbench 2.6x faster than RustCrypto here, in
 progress), `sendmsg_x`/`recvmsg_x` batching, and fewer per-packet allocations.
 
+Later steps (5 × 1 GB, connected + DF on; `bench/results/tunnel-ab.csv`):
+
+| variant | down Mbit/s | down CPU-s/GB | up CPU-s/GB | profile change |
+|---|---|---|---|---|
+| combined (above, + `betterAddr`) | 1,757 | 8.9 | 9.9 | |
+| + `ring` AEAD (`--features ring-aead`) | 1,765 | 9.2 | 10.3 | crypto 21% → 12% of busy |
+| + `sendmsg_x` batched sends (opt-in) | 1,800 | 9.1 | 10.2 | send syscalls 23% → 14% |
+
+Both cut their own cost as expected, but **CPU per GB doesn't move**. The node is not saturated in this
+setup: the co-located Go client needs 5.2 cores to receive 1.75 Gbit/s while the node uses 2.1. An
+unsaturated node idles between packets, so work saved per packet becomes smaller batches and more wakeups.
+What remains is per-packet handoff overhead: each packet crosses 4–5 actor/channel hops
+(netstack → dataplane → underlay → magicsock), and tokio, locks, clock and allocation make up ~40% of busy
+time. Go's reference work reports the same wall (~30% scheduler) and the same fix: fewer handoffs. At this
+home line's ~750 Mbit/s the node has 2–3× headroom either way.
+
 Through the exit node to the internet (same Go client, OVH test file, `runner/perf.sh`) the node
 reached ~740–760 Mbit/s, the home line's ceiling (direct from the Mac: 737–767 Mbit/s). The release build
 used 24.7–25.2 CPU-s/GB there, the `exitnode` profile 22.7–23.2, and with connected sockets + DF 17.4.
