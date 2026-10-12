@@ -1,4 +1,4 @@
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::{
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
@@ -33,7 +33,7 @@ pub struct WakingPipeReceiver {
     rx: flume::Receiver<PipeMessage>,
     /// [`flume::Receiver`] doesn't expose a way to poll until a value is ready without
     /// consuming it. This holds the consumed value.
-    buffered_rx: VecDeque<Bytes>,
+    buffered_rx: alloc::vec::IntoIter<Bytes>,
 
     /// The waker that this end of the pipe polls on in `poll_rx`.
     ///
@@ -55,6 +55,8 @@ pub struct WakingPipeReceiver {
 /// A [`flume::Sender`] that wakes a remote [`WakingPipeReceiver`] when a message is sent.
 pub struct WakingPipeSender {
     tx: flume::Sender<PipeMessage>,
+    // Channel capacity is immutable; avoid flume's capacity mutex on unbounded transmit polls.
+    bounded: bool,
     pub(crate) pending_egress: Option<Vec<Bytes>>,
 
     /// The waker this end of the pipe polls on in `poll_tx`.
@@ -85,6 +87,7 @@ impl Clone for WakingPipeSender {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
+            bounded: self.bounded,
             pending_egress: None,
             self_waker: self.self_waker.clone(),
             remote_waker: self.remote_waker.clone(),
@@ -197,13 +200,14 @@ impl WakingPipe {
             Self {
                 rx: WakingPipeReceiver {
                     rx: rx1,
-                    buffered_rx: VecDeque::new(),
+                    buffered_rx: Vec::new().into_iter(),
                     self_waker: pipe1_rx_waker.clone(),
                     remote_waker: pipe2_tx_waker.clone(),
                     budget: None,
                 },
                 tx: WakingPipeSender {
                     tx: tx1,
+                    bounded: egress.is_some(),
                     pending_egress: None,
                     remote_waker: pipe2_rx_waker.clone(),
                     self_waker: pipe1_tx_waker.clone(),
@@ -213,13 +217,14 @@ impl WakingPipe {
             Self {
                 rx: WakingPipeReceiver {
                     rx: rx2,
-                    buffered_rx: VecDeque::new(),
+                    buffered_rx: Vec::new().into_iter(),
                     self_waker: pipe2_rx_waker,
                     remote_waker: pipe1_tx_waker,
                     budget: None,
                 },
                 tx: WakingPipeSender {
                     tx: tx2,
+                    bounded: ingress.is_some(),
                     pending_egress: None,
                     remote_waker: pipe1_rx_waker,
                     self_waker: pipe2_tx_waker,
@@ -233,7 +238,7 @@ impl WakingPipe {
 impl WakingPipeReceiver {
     /// Receive a packet.
     pub fn recv(&mut self) -> Option<Bytes> {
-        if let Some(buf) = self.buffered_rx.pop_front() {
+        if let Some(buf) = self.buffered_rx.next() {
             return Some(buf);
         }
 
@@ -243,7 +248,7 @@ impl WakingPipeReceiver {
 
     /// Receive a packet asynchronously.
     pub async fn recv_async(&mut self) -> Option<Bytes> {
-        if let Some(buf) = self.buffered_rx.pop_front() {
+        if let Some(buf) = self.buffered_rx.next() {
             return Some(buf);
         }
 
@@ -253,7 +258,7 @@ impl WakingPipeReceiver {
 
     /// Receive a packet if it's possible to do so without blocking.
     pub fn try_recv(&mut self) -> Option<Bytes> {
-        if let Some(buf) = self.buffered_rx.pop_front() {
+        if let Some(buf) = self.buffered_rx.next() {
             return Some(buf);
         }
 
@@ -271,15 +276,15 @@ impl WakingPipeReceiver {
                 for buf in &bufs {
                     self.taken(Some(buf));
                 }
-                self.buffered_rx.extend(bufs);
-                self.buffered_rx.pop_front()
+                self.buffered_rx = bufs.into_iter();
+                self.buffered_rx.next()
             }
         }
     }
 
     /// Report whether there is a packet ready to be received.
     pub fn rx_ready(&self) -> bool {
-        !self.buffered_rx.is_empty() || !self.rx.is_empty()
+        self.buffered_rx.len() != 0 || !self.rx.is_empty()
     }
 
     /// Account for a packet just taken out of the channel: give its bytes back to the budget and
@@ -388,7 +393,7 @@ impl WakingPipeSender {
 
     /// Report whether we can currently transmit.
     pub fn tx_ready(&self) -> bool {
-        !self.tx.is_full()
+        !self.bounded || !self.tx.is_full()
     }
 }
 
@@ -455,6 +460,18 @@ impl smoltcp::phy::TxToken for &mut WakingPipeSender {
         self.remote_waker.wake();
 
         ret
+    }
+}
+
+// Preserve the sender's existing by-value TxToken API for external pipe users.
+impl smoltcp::phy::TxToken for WakingPipeSender {
+    fn consume<R, F>(mut self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let result = smoltcp::phy::TxToken::consume(&mut self, len, f);
+        self.flush_egress();
+        result
     }
 }
 
@@ -576,7 +593,9 @@ mod tests {
             "a third packet overflows the ring"
         );
 
+        assert!(!caller.tx.tx_ready());
         assert_eq!(device_takes(&mut dev), Some(1));
+        assert!(caller.tx.tx_ready());
         assert!(caller.tx.try_send(&[4]), "taking a packet frees its slot");
     }
 
@@ -734,6 +753,7 @@ mod tests {
             tx.consume(1280, |buf| buf[..4].copy_from_slice(&i.to_be_bytes()));
         }
 
+        assert!(dev.pipe.tx.tx_ready(), "unbounded egress is always ready");
         for i in 0..1000u32 {
             let buf = caller.rx.recv().expect("every emitted packet is delivered");
             assert_eq!(buf.len(), 1280);
