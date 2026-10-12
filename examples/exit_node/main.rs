@@ -76,6 +76,11 @@ struct Args {
     #[arg(long)]
     tcp_buffer_size: Option<usize>,
 
+    /// Serve a tunnel-only benchmark on this port of the node's tailnet address (0 = off). A client
+    /// that sends `d` gets an endless stream of zeros; one that sends `u` has everything discarded.
+    #[arg(long, default_value_t = 0)]
+    sink_port: u16,
+
     /// Seconds between status lines (peers, direct vs DERP path). 0 disables.
     #[arg(long, default_value_t = 30)]
     status_interval: u64,
@@ -163,6 +168,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "running"
     );
 
+    if args.sink_port != 0 {
+        let listener = dev
+            .tcp_listen(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::UNSPECIFIED,
+                args.sink_port,
+            )))
+            .await?;
+        tracing::info!(port = args.sink_port, "benchmark sink listening");
+        tokio::spawn(async move {
+            while let Ok(conn) = listener.accept().await {
+                tokio::spawn(serve_sink(conn));
+            }
+        });
+    }
+
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut ticker = (args.status_interval > 0)
         .then(|| tokio::time::interval(Duration::from_secs(args.status_interval)));
@@ -233,4 +253,19 @@ fn system_resolver() -> Option<std::net::SocketAddr> {
         .filter_map(|ip| ip.trim().parse::<std::net::Ipv4Addr>().ok())
         .map(|ip| std::net::SocketAddr::from((ip, 53)))
         .next()
+}
+
+/// One benchmark connection: `d` streams zeros to the client, `u` discards what it sends.
+async fn serve_sink(mut conn: tailscale::netstack::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 64 * 1024];
+    let Ok(n) = conn.read(&mut buf[..1]).await else { return };
+    match (n, buf[0]) {
+        (1, b'd') => {
+            buf.fill(0);
+            while conn.write_all(&buf).await.is_ok() {}
+        }
+        (1, b'u') => while matches!(conn.read(&mut buf).await, Ok(n) if n > 0) {},
+        _ => {}
+    }
 }
