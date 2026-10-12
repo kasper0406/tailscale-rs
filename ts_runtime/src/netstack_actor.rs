@@ -75,7 +75,11 @@ pub(crate) fn piped_ingress_bounded(
     let max_bytes = INGRESS_QUEUE_PACKETS.saturating_mul(config.mtu);
     let (mut stack, pipe) =
         netstack::piped_ingress_bounded(config, INGRESS_QUEUE_PACKETS, max_bytes);
-    stack.set_egress_batching(std::env::var("TS_EXPERIMENT_ACK_BATCH").as_deref() == Ok("1"));
+    let ack_batching = std::env::var("TS_EXPERIMENT_ACK_BATCH").as_deref() == Ok("1");
+    stack.set_egress_batching(ack_batching);
+    if ack_batching || std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1") {
+        stack.set_work_budget(Some(128));
+    }
     (stack, pipe)
 }
 
@@ -109,9 +113,20 @@ pub(crate) async fn pump_ingress_with(
 }
 
 /// Admission pump with bounded packet work between yields, independent of channel readiness.
+#[cfg(test)]
 pub(crate) async fn pump_ingress_with_budget(
+    from_dataplane: OverlayFromDataplane,
+    admit: impl FnMut(&[u8]) -> bool,
+    netstack_name: &'static str,
+    cooperative: bool,
+) -> u64 {
+    pump_ingress_with_batch_wake(from_dataplane, admit, || {}, netstack_name, cooperative).await
+}
+
+pub(crate) async fn pump_ingress_with_batch_wake(
     mut from_dataplane: OverlayFromDataplane,
     mut admit: impl FnMut(&[u8]) -> bool,
+    mut finish_batch: impl FnMut(),
     netstack_name: &'static str,
     cooperative: bool,
 ) -> u64 {
@@ -124,8 +139,11 @@ pub(crate) async fn pump_ingress_with_budget(
     while let Some(bufs) = from_dataplane.recv().await {
         let before = dropped;
         for buf in bufs {
-            if cooperative && processed == 128 {
-                tokio::task::yield_now().await;
+            if processed == 128 {
+                finish_batch();
+                if cooperative {
+                    tokio::task::yield_now().await;
+                }
                 processed = 0;
             }
             processed += 1;
@@ -151,6 +169,7 @@ pub(crate) async fn pump_ingress_with_budget(
                 }
             }
         }
+        finish_batch();
         if counters {
             crate::pipeline_metrics::drops(index, dropped - before);
         }
@@ -231,7 +250,9 @@ impl kameo::Actor for NetstackActor {
         });
 
         let counters = crate::pipeline_metrics::enabled();
-        let cooperative = env.packet_runtime.is_some();
+        let cooperative = env.packet_runtime.is_some()
+            || std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1")
+            || std::env::var("TS_EXPERIMENT_ACK_BATCH").as_deref() == Ok("1");
         env.spawn_packet(&mut joinset, async move {
             let mut turns = 0;
             while let Some(first) = netstack_down_rx.recv_async().await {
@@ -261,9 +282,21 @@ impl kameo::Actor for NetstackActor {
         });
 
         env.spawn_packet(&mut joinset, async move {
-            pump_ingress_with_budget(
+            let batching = std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1");
+            pump_ingress_with_batch_wake(
                 netstack_down,
-                |b| netstack_down_tx.try_send(b),
+                |b| {
+                    if batching {
+                        netstack_down_tx.try_send_deferred(b)
+                    } else {
+                        netstack_down_tx.try_send(b)
+                    }
+                },
+                || {
+                    if batching {
+                        netstack_down_tx.notify_receive();
+                    }
+                },
                 "application",
                 cooperative,
             )

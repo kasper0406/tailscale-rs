@@ -327,6 +327,21 @@ impl WakingPipeSender {
     /// [`WakingPipe::ingress_bounded`], a packet that would take the queue past its byte budget is
     /// refused the same way as one that finds the queue full.
     pub fn try_send(&self, buf: &[u8]) -> bool {
+        self.try_send_inner(buf, true)
+    }
+
+    /// Admit a packet without waking the device. Call `notify_receive` before yielding,
+    /// returning or waiting, including when some of the batch's packets were refused.
+    pub fn try_send_deferred(&self, buf: &[u8]) -> bool {
+        self.try_send_inner(buf, false)
+    }
+
+    /// Publish receive readiness after synchronous batch admission.
+    pub fn notify_receive(&self) {
+        self.remote_waker.wake();
+    }
+
+    fn try_send_inner(&self, buf: &[u8], wake: bool) -> bool {
         if let Some(budget) = &self.budget
             && !budget.try_charge(buf.len())
         {
@@ -338,7 +353,9 @@ impl WakingPipeSender {
             .try_send(PipeMessage::One(Bytes::copy_from_slice(buf)))
         {
             Ok(()) => {
-                self.remote_waker.wake();
+                if wake {
+                    self.remote_waker.wake();
+                }
                 true
             }
             Err(flume::TrySendError::Full(..)) => {
@@ -604,6 +621,63 @@ mod tests {
             caller.tx.try_send(&[0; 1000]),
             "the whole budget is free again"
         );
+    }
+
+    #[test]
+    fn async_polls_flush_buffered_tokens_before_returning() {
+        use core::future::Future;
+        let (pipe, mut caller) = WakingPipe::unbounded();
+        let mut dev = device(pipe);
+        dev.pipe.tx.pending_egress = Some(Vec::new());
+        let mut stack = netcore::Netstack::new(Default::default(), Instant::ZERO);
+        stack.set_work_budget(Some(1));
+        // Simulate a partial output turn, then make the driver consume a malformed packet.
+        dev.transmit(Instant::ZERO)
+            .unwrap()
+            .consume(1, |b| b[0] = 42);
+        caller.tx.send(&[0; 20]);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        {
+            let mut poller = stack.wait_io_async(Instant::ZERO, &mut dev);
+            assert!(Pin::new(&mut poller).poll(&mut cx).is_ready());
+        }
+        assert_eq!(caller.rx.try_recv().unwrap().as_ref(), &[42]);
+        // A partial turn also publishes when the stack makes no progress and is cancelled.
+        dev.transmit(Instant::ZERO)
+            .unwrap()
+            .consume(1, |b| b[0] = 43);
+        let mut poller = stack.wait_io_async(Instant::ZERO, &mut dev);
+        assert!(Pin::new(&mut poller).poll(&mut cx).is_pending());
+        drop(poller);
+        assert_eq!(caller.rx.try_recv().unwrap().as_ref(), &[43]);
+        assert!(caller.rx.try_recv().is_none());
+    }
+
+    #[test]
+    fn deferred_ingress_wakes_once_and_preserves_queue_limits() {
+        struct Count(AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let (dev, caller) = WakingPipe::ingress_bounded(2, 3);
+        let mut dev = device(dev);
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut dev).poll_rx(&mut cx).is_pending());
+        assert!(caller.tx.try_send_deferred(&[1]));
+        assert!(caller.tx.try_send_deferred(&[2, 3]));
+        assert!(!caller.tx.try_send_deferred(&[4]));
+        assert_eq!(count.0.load(Ordering::Relaxed), 0);
+        caller.tx.notify_receive();
+        assert_eq!(count.0.load(Ordering::Relaxed), 1);
+        assert_eq!(dev.pipe.rx.try_recv().unwrap().as_ref(), &[1]);
+        assert_eq!(dev.pipe.rx.try_recv().unwrap().as_ref(), &[2, 3]);
+        assert!(caller.tx.try_send_deferred(&[0; 3]), "all budget returned");
+        caller.tx.notify_receive();
     }
 
     #[test]

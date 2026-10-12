@@ -1165,8 +1165,10 @@ impl kameo::Actor for DirectManager {
 
         let transport = env
             .on_packet_runtime(|| {
-                DirectTransport::new(sock.clone())
-                    .with_receive_batching(env.packet_runtime.is_some())
+                DirectTransport::new(sock.clone()).with_receive_batching(
+                    env.packet_runtime.is_some()
+                        || std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1"),
+                )
             })
             .with_key_lookup(DiscoPeerLookup(peer_db.clone()));
 

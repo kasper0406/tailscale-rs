@@ -2,7 +2,7 @@
 
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -44,6 +44,30 @@ pub struct ReceivedData {
     pub from_addr: SocketAddr,
     /// The WireGuard datagram payload.
     pub data: PacketMut,
+}
+
+struct ReceiveState {
+    connected: mpsc::UnboundedReceiver<crate::connected::Received>,
+    pending: VecDeque<crate::receive_batch::Datagram>,
+    ready: VecDeque<ReceivedData>,
+    receiver: Option<crate::receive_batch::Receiver>,
+}
+
+async fn demux_receive_batch<
+    F: core::future::Future<Output = Result<Option<ReceivedData>, Error>> + Send,
+>(
+    state: &mut ReceiveState,
+    mut demux: impl FnMut(crate::receive_batch::Datagram) -> F + Send,
+) -> Result<Vec<ReceivedData>, Error> {
+    for _ in 0..crate::receive_batch::MAX_BATCH {
+        let Some(datagram) = state.pending.pop_front() else {
+            break;
+        };
+        if let Some(data) = demux(datagram).await? {
+            state.ready.push_back(data);
+        }
+    }
+    Ok(state.ready.drain(..).collect())
 }
 
 /// Shared, per-peer path state keyed by the peer's disco key.
@@ -245,7 +269,7 @@ pub struct MagicSock {
     /// disjointly from every other lock, never across an `.await`.
     connected: Mutex<ConnectedSockets>,
     /// Datagrams the connected sockets' receive pumps hand to [`MagicSock::recv_data`].
-    connected_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<crate::connected::Received>>,
+    connected_rx: tokio::sync::Mutex<ReceiveState>,
     our_disco: DiscoPrivateKey,
     our_node_key: NodePublicKey,
     paths: Paths,
@@ -453,7 +477,12 @@ impl MagicSock {
         Ok(Self {
             sock: Mutex::new(Arc::new(sock)),
             connected: Mutex::new(connected),
-            connected_rx: tokio::sync::Mutex::new(connected_rx),
+            connected_rx: tokio::sync::Mutex::new(ReceiveState {
+                connected: connected_rx,
+                pending: VecDeque::new(),
+                ready: VecDeque::new(),
+                receiver: crate::receive_batch::enabled().then(crate::receive_batch::Receiver::new),
+            }),
             our_disco,
             our_node_key,
             paths: Default::default(),
@@ -1482,103 +1511,143 @@ impl MagicSock {
     /// state, and the first non-disco (WireGuard) datagram is returned. Returns `Ok(None)`
     /// only if the socket is closed.
     pub async fn recv_data(&self) -> Result<Option<ReceivedData>, Error> {
-        let mut buf = vec![0u8; RECV_BUF];
-        let mut connected_rx = self.connected_rx.lock().await;
-
+        let mut state = self.connected_rx.lock().await;
         loop {
-            let sock = self.sock();
-            let (n, from) = tokio::select! {
-                r = sock.recv_from(&mut buf) => r?,
-                Some((data, from)) = connected_rx.recv() => {
-                    // Same truncation as a `recv_from` into `buf`.
-                    let n = data.len().min(buf.len());
-                    buf[..n].copy_from_slice(&data[..n]);
-                    (n, from)
+            if let Some(data) = state.ready.pop_front() {
+                return Ok(Some(data));
+            }
+            self.fill_receive(&mut state).await?;
+            if let Some(datagram) = state.pending.pop_front() {
+                if let Some(data) = self.demux_datagram(datagram).await? {
+                    return Ok(Some(data));
                 }
-            };
-            let datagram = &mut buf[..n];
-
-            // Active-STUN demux: a Binding Success Response to a request we sent on this same
-            // socket. Checked before the disco demux because STUN and disco share this one socket;
-            // only a response matching an in-flight transaction id is consumed here (fail-closed),
-            // anything else falls through to the disco/data demux below.
-            if crate::stun::looks_like_stun_success(datagram)
-                && self.handle_stun_response(from, datagram)
-            {
-                continue;
-            }
-
-            // Peer-relay demux, before the naked-disco check: a Geneve header means this
-            // datagram arrived over a UDP relay leg. Mirrors Go's `packetLooksLike` ordering
-            // (STUN, then Geneve, then naked disco, then naked WireGuard) — `geneve_prefix`
-            // returns `None` for anything that could still be a naked frame, so a naked
-            // datagram falls through to the checks below exactly as before.
-            if let Some((vni, kind, offset)) = disco::geneve_prefix(datagram) {
-                match kind {
-                    GeneveKind::Disco { control } => {
-                        self.handle_relay_disco(&mut datagram[offset..], from, vni, control)
-                            .await;
-                        continue;
-                    }
-                    GeneveKind::WireGuard => {
-                        // Attribute by (relay address, VNI): a relay endpoint is only ever
-                        // confirmed for one peer, and an unrecognized pair is dropped rather than
-                        // guessed at.
-                        let from_disco = lock(&self.relay_paths).peer_for_addr(from, vni);
-                        let Some(from_disco) = from_disco else {
-                            tracing::trace!(
-                                %from,
-                                vni,
-                                "dropping relayed data from an unknown relay endpoint"
-                            );
-                            continue;
-                        };
-                        let m = crate::metrics::metrics();
-                        m.recv_data_peer_relay.inc();
-                        let payload = &datagram[offset..];
-                        m.recv_data_peer_relay_bytes.add(payload.len() as i64);
-                        return Ok(Some(ReceivedData {
-                            from_disco,
-                            from_addr: from,
-                            data: PacketMut::from(payload),
-                        }));
-                    }
-                }
-            }
-
-            if !disco::looks_like_disco(datagram) {
-                // WireGuard data: attribute it to the peer that owns this source address.
-                let from_disco = {
-                    let a2d = self.addr_to_disco.lock().unwrap();
-                    a2d.get(&from).copied()
-                };
-
-                let Some(from_disco) = from_disco else {
-                    tracing::trace!(%from, "dropping data from unknown source address");
-                    continue;
-                };
-
-                // Silent disco's compensating half: this datagram is evidence the best path is
-                // alive, and with the heartbeat suppressed it is the only such evidence there is.
-                self.note_data_recv_activity(&from_disco, from);
-
-                let m = crate::metrics::metrics();
-                m.recv_data_udp.inc();
-                m.recv_data_bytes_udp.add(datagram.len() as i64);
-
-                return Ok(Some(ReceivedData {
-                    from_disco,
-                    from_addr: from,
-                    data: PacketMut::from(&*datagram),
-                }));
-            }
-
-            // Disco control traffic: handle it and keep looping for data.
-            match disco::open(&self.our_disco, datagram) {
-                Ok(msg) => self.handle_disco(msg, from).await?,
-                Err(e) => tracing::trace!(error = %e, %from, "ignoring undecodable disco datagram"),
             }
         }
+    }
+
+    /// Receive at most one kernel/pump batch. Empty results mean control traffic was consumed.
+    /// Unprocessed datagrams live in the socket, so cancelling this future retains the tail.
+    pub async fn recv_data_batch(&self) -> Result<Vec<ReceivedData>, Error> {
+        let mut state = self.connected_rx.lock().await;
+        if state.ready.is_empty() {
+            self.fill_receive(&mut state).await?;
+        }
+        demux_receive_batch(&mut state, |datagram| self.demux_datagram(datagram)).await
+    }
+
+    async fn fill_receive(&self, state: &mut ReceiveState) -> Result<(), Error> {
+        if !state.pending.is_empty() {
+            return Ok(());
+        }
+        let sock = self.sock();
+        if let Some(receiver) = &mut state.receiver {
+            let batch = tokio::select! {
+                r = receiver.recv(&sock, None) => r?,
+                Some(batch) = state.connected.recv() => batch,
+            };
+            // No await between consuming the kernel/channel batch and saving its tail.
+            state.pending.extend(batch);
+        } else {
+            let mut buf = vec![0u8; RECV_BUF];
+            let batch = tokio::select! {
+                r = sock.recv_from(&mut buf) => {
+                    let (n, from) = r?;
+                    vec![(buf[..n].to_vec(), from)]
+                },
+                Some(batch) = state.connected.recv() => batch,
+            };
+            state.pending.extend(batch);
+        }
+        Ok(())
+    }
+
+    async fn demux_datagram(
+        &self,
+        (mut buf, from): crate::receive_batch::Datagram,
+    ) -> Result<Option<ReceivedData>, Error> {
+        buf.truncate(RECV_BUF);
+        let datagram = &mut buf[..];
+        // Active-STUN demux: a Binding Success Response to a request we sent on this same
+        // socket. Checked before the disco demux because STUN and disco share this one socket;
+        // only a response matching an in-flight transaction id is consumed here (fail-closed),
+        // anything else falls through to the disco/data demux below.
+        if crate::stun::looks_like_stun_success(datagram)
+            && self.handle_stun_response(from, datagram)
+        {
+            return Ok(None);
+        }
+
+        // Peer-relay demux, before the naked-disco check: a Geneve header means this
+        // datagram arrived over a UDP relay leg. Mirrors Go's `packetLooksLike` ordering
+        // (STUN, then Geneve, then naked disco, then naked WireGuard) — `geneve_prefix`
+        // returns `None` for anything that could still be a naked frame, so a naked
+        // datagram falls through to the checks below exactly as before.
+        if let Some((vni, kind, offset)) = disco::geneve_prefix(datagram) {
+            match kind {
+                GeneveKind::Disco { control } => {
+                    self.handle_relay_disco(&mut datagram[offset..], from, vni, control)
+                        .await;
+                    return Ok(None);
+                }
+                GeneveKind::WireGuard => {
+                    // Attribute by (relay address, VNI): a relay endpoint is only ever
+                    // confirmed for one peer, and an unrecognized pair is dropped rather than
+                    // guessed at.
+                    let from_disco = lock(&self.relay_paths).peer_for_addr(from, vni);
+                    let Some(from_disco) = from_disco else {
+                        tracing::trace!(
+                            %from,
+                            vni,
+                            "dropping relayed data from an unknown relay endpoint"
+                        );
+                        return Ok(None);
+                    };
+                    let m = crate::metrics::metrics();
+                    m.recv_data_peer_relay.inc();
+                    let payload = &datagram[offset..];
+                    m.recv_data_peer_relay_bytes.add(payload.len() as i64);
+                    return Ok(Some(ReceivedData {
+                        from_disco,
+                        from_addr: from,
+                        data: PacketMut::from(payload),
+                    }));
+                }
+            }
+        }
+
+        if !disco::looks_like_disco(datagram) {
+            // WireGuard data: attribute it to the peer that owns this source address.
+            let from_disco = {
+                let a2d = self.addr_to_disco.lock().unwrap();
+                a2d.get(&from).copied()
+            };
+
+            let Some(from_disco) = from_disco else {
+                tracing::trace!(%from, "dropping data from unknown source address");
+                return Ok(None);
+            };
+
+            // Silent disco's compensating half: this datagram is evidence the best path is
+            // alive, and with the heartbeat suppressed it is the only such evidence there is.
+            self.note_data_recv_activity(&from_disco, from);
+
+            let m = crate::metrics::metrics();
+            m.recv_data_udp.inc();
+            m.recv_data_bytes_udp.add(datagram.len() as i64);
+
+            return Ok(Some(ReceivedData {
+                from_disco,
+                from_addr: from,
+                data: PacketMut::from(&*datagram),
+            }));
+        }
+
+        // Disco control traffic: handle it and keep looping for data.
+        match disco::open(&self.our_disco, datagram) {
+            Ok(msg) => self.handle_disco(msg, from).await?,
+            Err(e) => tracing::trace!(error = %e, %from, "ignoring undecodable disco datagram"),
+        }
+        Ok(None)
     }
 
     /// Handle a disco frame relayed to us over DERP (not received on the UDP socket).
@@ -2923,9 +2992,10 @@ impl AsRef<MagicSock> for MagicSock {
 /// peer on DERP). `recv` yields one batch of WireGuard datagrams.
 pub struct DirectTransport {
     receive_batching: bool,
+    kernel_receive_batching: bool,
     inner: Arc<MagicSock>,
     /// Buffers data received via the background pump so `recv` can hand it to the runtime.
-    inbox: tokio::sync::Mutex<mpsc::UnboundedReceiver<ReceivedData>>,
+    inbox: tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<ReceivedData>>>,
     _pump: tokio::task::JoinHandle<()>,
 }
 
@@ -2933,13 +3003,27 @@ impl DirectTransport {
     /// Wrap a [`MagicSock`] and spawn the receive pump that feeds [`UnderlayTransport::recv`].
     pub fn new(inner: Arc<MagicSock>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let kernel_receive_batching = crate::receive_batch::enabled();
         let pump_sock = inner.clone();
         let pump = tokio::spawn(async move {
+            let mut turns = 0;
             loop {
-                match pump_sock.recv_data().await {
+                match if kernel_receive_batching {
+                    pump_sock.recv_data_batch().await.map(Some)
+                } else {
+                    pump_sock
+                        .recv_data()
+                        .await
+                        .map(|data| data.map(|d| vec![d]))
+                } {
                     Ok(Some(data)) => {
-                        if tx.send(data).is_err() {
+                        if !data.is_empty() && tx.send(data).is_err() {
                             break;
+                        }
+                        turns += 1;
+                        if kernel_receive_batching && turns == 4 {
+                            tokio::task::yield_now().await;
+                            turns = 0;
                         }
                     }
                     Ok(None) => break,
@@ -2952,7 +3036,8 @@ impl DirectTransport {
         });
 
         Self {
-            receive_batching: false,
+            receive_batching: kernel_receive_batching,
+            kernel_receive_batching,
             inner,
             inbox: tokio::sync::Mutex::new(rx),
             _pump: pump,
@@ -2961,7 +3046,7 @@ impl DirectTransport {
 
     /// Drain already queued packets as peer batches, without waiting to fill a batch.
     pub fn with_receive_batching(mut self, enabled: bool) -> Self {
-        self.receive_batching = enabled;
+        self.receive_batching = enabled || self.kernel_receive_batching;
         self
     }
 
@@ -3014,26 +3099,34 @@ impl UnderlayTransport for DirectTransport {
             return Vec::new();
         };
         if !self.receive_batching {
-            return vec![Ok((
-                first.from_disco,
-                ReceivedPackets::One([first.data].into_iter()),
-            ))];
+            return first
+                .into_iter()
+                .map(|data| {
+                    Ok((
+                        data.from_disco,
+                        ReceivedPackets::One([data.data].into_iter()),
+                    ))
+                })
+                .collect::<Vec<_>>();
         }
-        // Each group is one dataplane message; preserve order within each peer's sequence.
         let mut groups = HashMap::new();
-        groups
-            .entry(first.from_disco)
-            .or_insert_with(Vec::new)
-            .push(first.data);
-        if self.receive_batching {
+        for data in first {
+            groups
+                .entry(data.from_disco)
+                .or_insert_with(Vec::new)
+                .push(data.data);
+        }
+        if !self.kernel_receive_batching {
             for _ in 1..64 {
-                let Ok(data) = inbox.try_recv() else {
+                let Ok(batch) = inbox.try_recv() else {
                     break;
                 };
-                groups
-                    .entry(data.from_disco)
-                    .or_insert_with(Vec::new)
-                    .push(data.data);
+                for data in batch {
+                    groups
+                        .entry(data.from_disco)
+                        .or_insert_with(Vec::new)
+                        .push(data.data);
+                }
             }
         }
         groups
@@ -3058,15 +3151,16 @@ mod tests {
         let transport = DirectTransport {
             inner: sock,
             receive_batching: true,
+            kernel_receive_batching: false,
             inbox: tokio::sync::Mutex::new(rx),
             _pump: tokio::spawn(std::future::pending()),
         };
         for n in 0..65u8 {
-            tx.send(ReceivedData {
+            tx.send(vec![ReceivedData {
                 from_disco: if n % 2 == 0 { key } else { other },
                 from_addr: localhost(),
                 data: PacketMut::from(&[n][..]),
-            })
+            }])
             .unwrap();
         }
         let batches = transport.recv().await;
@@ -3096,6 +3190,79 @@ mod tests {
                 .map(|p| p.as_ref()[0])
                 .collect::<Vec<_>>(),
             [64]
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_demux_preserves_sources_and_unknown_frames_are_dropped() {
+        let sock = plain_sock().await;
+        let a = ts_keys::DiscoPrivateKey::random().public_key();
+        let b = ts_keys::DiscoPrivateKey::random().public_key();
+        let source_a: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let source_b: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        sock.addr_to_disco.lock().unwrap().insert(source_a, a);
+        sock.addr_to_disco.lock().unwrap().insert(source_b, b);
+        {
+            let mut state = sock.connected_rx.lock().await;
+            for i in 0..20u8 {
+                state
+                    .pending
+                    .push_back((vec![i], if i % 2 == 0 { source_a } else { source_b }));
+            }
+        }
+        let first = sock.recv_data_batch().await.unwrap();
+        assert_eq!(first.len(), 16);
+        let second = sock.recv_data_batch().await.unwrap();
+        assert_eq!(second.len(), 4);
+        for (i, data) in first.into_iter().chain(second).enumerate() {
+            assert_eq!(data.from_disco, if i % 2 == 0 { a } else { b });
+            assert_eq!(data.from_addr, if i % 2 == 0 { source_a } else { source_b });
+            assert_eq!(data.data.as_ref(), &[i as u8]);
+        }
+        assert!(
+            sock.demux_datagram((vec![1], "127.0.0.1:9999".parse().unwrap()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_control_handler_retains_raw_tail_and_ready_data() {
+        let sock = plain_sock().await;
+        let peer = ts_keys::DiscoPrivateKey::random().public_key();
+        let source: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        sock.addr_to_disco.lock().unwrap().insert(source, peer);
+        {
+            let mut state = sock.connected_rx.lock().await;
+            state.pending.extend([
+                (b"ready".to_vec(), source),
+                (b"control".to_vec(), source),
+                (b"tail".to_vec(), source),
+            ]);
+            let sock_ref = &sock;
+            let demux = |datagram: crate::receive_batch::Datagram| async move {
+                if datagram.0 == b"control" {
+                    core::future::pending().await
+                } else {
+                    sock_ref.demux_datagram(datagram).await
+                }
+            };
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(10),
+                    demux_receive_batch(&mut state, demux)
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(state.ready.len(), 1);
+            assert_eq!(state.pending.len(), 1);
+        }
+        let result = sock.recv_data_batch().await.unwrap();
+        assert_eq!(
+            result.iter().map(|d| d.data.as_ref()).collect::<Vec<_>>(),
+            vec![&b"ready"[..], &b"tail"[..]]
         );
     }
 

@@ -34,6 +34,7 @@ mod endpoint;
 mod error;
 mod metrics;
 mod path;
+mod receive_batch;
 mod relay;
 mod sock;
 mod stun;
@@ -41,8 +42,8 @@ mod stun;
 pub use disco::{
     GeneveKind, Inbound, RelayHandshakeCommon, TxId, geneve_encap_disco, geneve_encap_wireguard,
     geneve_prefix, looks_like_disco, open, random_tx_id, seal_call_me_maybe,
-    seal_call_me_maybe_via, seal_ping, seal_relay_bind, seal_relay_bind_answer,
-    seal_relay_bind_challenge, seal_pong,
+    seal_call_me_maybe_via, seal_ping, seal_pong, seal_relay_bind, seal_relay_bind_answer,
+    seal_relay_bind_challenge,
 };
 pub use endpoint::{SelfEndpoint, SelfEndpointType};
 pub use error::{DiscoError, Error};
@@ -59,4 +60,9 @@ pub fn send_batch_histogram() -> [u64; 65] {
 }
 
 /// Kernel attempts by offered size, including retry/failure attempts.
-pub fn send_batch_offered_histogram() -> [u64; 65] { batch::offered_histogram() }
+pub fn send_batch_offered_histogram() -> [u64; 65] {
+    batch::offered_histogram()
+}
+
+/// Bounded kernel receive batch counters (Apple recvmsg_x / Linux recvmmsg).
+pub use receive_batch::{Snapshot as ReceiveBatchSnapshot, snapshot as receive_batch_snapshot};
