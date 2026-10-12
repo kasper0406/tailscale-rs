@@ -16,8 +16,8 @@ use netstack::{
 };
 use tokio::task::JoinSet;
 use ts_forwarder::{
-    Admit, DirectDialer, ExitDnsDialer, Forwarder, HostExitDialer, PortGate, ProxyExitDialer,
-    RealDialer, RouteTable, RouteUpdater,
+    Admit, BenchRedirectDialer, DirectDialer, ExitDnsDialer, Forwarder, HostExitDialer, PortGate,
+    ProxyExitDialer, RealDialer, RouteTable, RouteUpdater,
 };
 
 use crate::{
@@ -104,6 +104,22 @@ impl RejectBudget {
             false
         }
     }
+}
+
+/// `TS_BENCH_EXIT_REDIRECT=<198.18.x.y:port>=<127.0.0.1:port>`: benchmark-only exit redirect to a
+/// local sink. Unset or malformed (or not benchmark-range -> loopback, which the dialer refuses)
+/// means no redirect.
+fn bench_exit_redirect() -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+    let v = std::env::var("TS_BENCH_EXIT_REDIRECT").ok()?;
+    let (from, to) = v.split_once('=')?;
+    let pair: (std::net::SocketAddr, std::net::SocketAddr) =
+        (from.trim().parse().ok()?, to.trim().parse().ok()?);
+    if BenchRedirectDialer::new(DirectDialer, Some(pair)).is_err() {
+        tracing::error!(from = %pair.0, to = %pair.1, "TS_BENCH_EXIT_REDIRECT refused: must map 198.18.0.0/15 to loopback");
+        return None;
+    }
+    tracing::warn!(from = %pair.0, to = %pair.1, "BENCHMARK exit redirect enabled (TS_BENCH_EXIT_REDIRECT)");
+    Some(pair)
 }
 
 /// Which concrete dialer the forwarder is wired with — the anti-leak gate's only output.
@@ -260,26 +276,43 @@ impl kameo::Actor for ForwarderActor {
                     netstack_down_tx.clone(),
                 )
             }
-            DialerChoice::HostExit if env.exit_node_dns.is_some() => spawn_forwarder(
-                &mut joinset,
-                channel.clone(),
-                routes,
-                ExitDnsDialer::new(HostExitDialer, env.exit_node_dns.expect("checked by guard")),
-                all_ports,
-                tcp_ports,
-                udp_ports,
-                netstack_down_tx.clone(),
-            ),
-            DialerChoice::HostExit => spawn_forwarder(
-                &mut joinset,
-                channel.clone(),
-                routes,
-                HostExitDialer,
-                all_ports,
-                tcp_ports,
-                udp_ports,
-                netstack_down_tx.clone(),
-            ),
+            DialerChoice::HostExit => {
+                // Benchmark-only redirect (off unless TS_BENCH_EXIT_REDIRECT is set; refused unless
+                // benchmark range -> loopback).
+                let redirect = bench_exit_redirect();
+                match env.exit_node_dns {
+                    Some(dns) => spawn_forwarder(
+                        &mut joinset,
+                        channel.clone(),
+                        routes,
+                        BenchRedirectDialer::new(ExitDnsDialer::new(HostExitDialer, dns), redirect)
+                            .unwrap_or_else(|_| {
+                                BenchRedirectDialer::new(
+                                    ExitDnsDialer::new(HostExitDialer, dns),
+                                    None,
+                                )
+                                .expect("no redirect is always valid")
+                            }),
+                        all_ports,
+                        tcp_ports,
+                        udp_ports,
+                        netstack_down_tx.clone(),
+                    ),
+                    None => spawn_forwarder(
+                        &mut joinset,
+                        channel.clone(),
+                        routes,
+                        BenchRedirectDialer::new(HostExitDialer, redirect).unwrap_or_else(|_| {
+                            BenchRedirectDialer::new(HostExitDialer, None)
+                                .expect("no redirect is always valid")
+                        }),
+                        all_ports,
+                        tcp_ports,
+                        udp_ports,
+                        netstack_down_tx.clone(),
+                    ),
+                }
+            }
             DialerChoice::Direct => spawn_forwarder(
                 &mut joinset,
                 channel.clone(),
