@@ -28,6 +28,8 @@ pub(crate) fn egress(index: usize, n: usize) {
 /// Cheap cumulative snapshot; array order: app/forwarder and pipeline/security.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
+    /// Cumulative work across application and forwarder netstacks.
+    pub netstack: ts_netstack_smoltcp::netcore::pipeline_metrics::Snapshot,
     /// Packets refused by netstack admission (queue capacity or gate limits), indexed app/forwarder.
     pub ingress_drops: [u64; 2],
     /// Number of egress batches of each size, indexed app/forwarder then exact size 0..64.
@@ -42,6 +44,7 @@ pub struct Snapshot {
 /// Read counters without actor messaging or hot-path tracing.
 pub fn snapshot() -> Snapshot {
     Snapshot {
+        netstack: ts_netstack_smoltcp::netcore::pipeline_metrics::snapshot(),
         ingress_drops: core::array::from_fn(|i| DROPS[i].load(Ordering::Relaxed)),
         egress_batches: core::array::from_fn(|i| {
             core::array::from_fn(|j| EGRESS[i][j].load(Ordering::Relaxed))
