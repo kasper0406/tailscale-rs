@@ -1420,6 +1420,55 @@ impl MagicSock {
         }
     }
 
+    /// Send a batch of WireGuard datagrams to `peer`: [`send_wireguard`](Self::send_wireguard) for
+    /// each, except that on a direct path with a connected socket and batched I/O enabled they go
+    /// out in as few `sendmsg_x` calls as possible. A packet the batch path couldn't send falls back
+    /// to the per-packet path. Errors are as for `send_wireguard`, with [`Error::NoPath`] already
+    /// handled (the batch is dropped, the peer stays on DERP).
+    pub async fn send_wireguard_batch<P: AsRef<[u8]>>(
+        &self,
+        peer: &DiscoPublicKey,
+        pkts: &[P],
+    ) -> Result<(), Error> {
+        let mut rest = pkts;
+        if pkts.len() > 1
+            && !self.only_tcp_443()
+            && let Some(addr) = self.best_addr(peer)
+        {
+            let sock = self.sock();
+            let connected = {
+                let mut c = lock(&self.connected);
+                if c.batched_io() {
+                    let bytes = pkts.iter().map(|p| p.as_ref().len()).sum();
+                    c.socket_for(addr, bytes, &sock)
+                } else {
+                    None
+                }
+            };
+            if let Some(c) = connected {
+                let sent = crate::batch::send(&c, pkts).await;
+                let m = crate::metrics::metrics();
+                for p in &pkts[..sent] {
+                    m.send_udp.inc();
+                    m.send_udp_bytes.add(p.as_ref().len() as i64);
+                }
+                rest = &pkts[sent..];
+            }
+        }
+        for p in rest {
+            match self.send_wireguard(peer, p.as_ref()).await {
+                Ok(()) => {}
+                // No direct path: drop, fail-closed; the route layer keeps the peer on DERP.
+                Err(Error::NoPath) => {
+                    tracing::trace!(%peer, "no direct path, dropping (peer stays on DERP)");
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Receive the next WireGuard datagram, handling any disco traffic inline.
     ///
     /// This loops internally: disco pings are answered with pongs, disco pongs update path
@@ -2922,17 +2971,10 @@ impl UnderlayTransport for DirectTransport {
         packet_batch: impl BatchSendIter<Self::PeerKey>,
     ) -> Result<(), Self::Error> {
         for (peer, pkts) in packet_batch.batch_iter() {
-            for pkt in pkts {
-                match self.inner.send_wireguard(&peer, pkt.as_ref()).await {
-                    Ok(()) => {}
-                    Err(Error::NoPath) => {
-                        // No direct path: drop here, fail-closed. The route layer keeps this
-                        // peer on DERP; we never dial the host network directly.
-                        tracing::trace!(%peer, "no direct path, dropping (peer stays on DERP)");
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+            // No direct path drops the batch here (fail-closed); the route layer keeps this peer on
+            // DERP and we never dial the host network directly.
+            let pkts: Vec<_> = pkts.into_iter().collect();
+            self.inner.send_wireguard_batch(&peer, &pkts).await?;
         }
         Ok(())
     }
@@ -5390,6 +5432,7 @@ mod tests {
         let settings = crate::connected::Settings {
             connected_sockets: true,
             dont_fragment: true,
+            batched_io: true,
         };
         let a_disco = DiscoPrivateKey::random();
         let b_disco = DiscoPrivateKey::random();

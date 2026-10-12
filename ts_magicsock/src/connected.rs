@@ -46,6 +46,8 @@ pub(crate) type Received = (Vec<u8>, SocketAddr);
 pub(crate) struct Settings {
     pub(crate) connected_sockets: bool,
     pub(crate) dont_fragment: bool,
+    /// Send batches on connected sockets with `sendmsg_x` (`batch.rs`).
+    pub(crate) batched_io: bool,
 }
 
 impl Settings {
@@ -54,6 +56,7 @@ impl Settings {
         let wanted = Self {
             connected_sockets: on("TS_DEBUG_MAGICSOCK_CONNECTED_SOCKETS"),
             dont_fragment: on("TS_DEBUG_DONT_FRAGMENT"),
+            batched_io: on("TS_DEBUG_MAGICSOCK_BATCHED_IO"),
         };
         if cfg!(target_vendor = "apple") {
             wanted
@@ -104,6 +107,11 @@ impl ConnectedSockets {
 
     pub(crate) fn enabled(&self) -> bool {
         self.settings.connected_sockets
+    }
+
+    /// Whether sends on connected sockets may be batched (`sendmsg_x`).
+    pub(crate) fn batched_io(&self) -> bool {
+        self.settings.connected_sockets && self.settings.batched_io && crate::batch::usable()
     }
 
     /// The socket to send `len` bytes to `addr` on, or `None` for the `shared` socket. Counts
@@ -310,6 +318,7 @@ mod tests {
         Settings {
             connected_sockets: true,
             dont_fragment: true,
+            batched_io: true,
         }
     }
 

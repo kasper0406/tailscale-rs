@@ -758,9 +758,9 @@ impl PeerPaths {
             .filter_map(|(addr, c)| c.latency.map(|l| (*addr, l)))
             .collect();
         confirmed_paths.sort();
-        let challenger = confirmed_paths.into_iter().reduce(|best, x| {
-            if better_addr(x, best) { x } else { best }
-        });
+        let challenger = confirmed_paths
+            .into_iter()
+            .reduce(|best, x| if better_addr(x, best) { x } else { best });
 
         let Some((challenger_addr, challenger_lat)) = challenger else {
             // No confirmed candidate — nothing to trust. Leave `best`/`trust_until` as-is (an
@@ -1303,7 +1303,10 @@ mod tests {
         assert!(better_addr((ll, ms(10)), (lan, ms(10))));
         // Hysteresis: <= 1% better and no bonus on the other side is not better.
         let p2: SocketAddr = "203.0.113.2:1".parse().unwrap();
-        assert!(!better_addr((p2, Duration::from_micros(9_950)), (public, ms(10))));
+        assert!(!better_addr(
+            (p2, Duration::from_micros(9_950)),
+            (public, ms(10))
+        ));
         assert!(better_addr((p2, ms(9)), (public, ms(10))));
     }
 
