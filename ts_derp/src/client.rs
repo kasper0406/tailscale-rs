@@ -55,10 +55,20 @@ pub struct Client<Io> {
 pub async fn connect<'c>(
     region: impl IntoIterator<Item = &'c ServerConnInfo>,
 ) -> Result<Option<DefaultIo>, Error> {
+    connect_with_resolver(region, None).await
+}
+
+/// Connect with DNS on a supplied runtime, sockets on the calling runtime.
+pub async fn connect_with_resolver<'c>(
+    region: impl IntoIterator<Item = &'c ServerConnInfo>,
+    resolver: Option<crate::dial::Resolver>,
+) -> Result<Option<DefaultIo>, Error> {
     // A TLS-setup failure is a transient (`dial::Error::Io`); propagate it as `Err` so the caller's
     // reconnect loop retries, rather than `.unwrap()`-panicking and killing the region task. A
     // reachable-but-unconnectable region is still `Ok(None)`.
-    let Some((conn, _, addr)) = crate::dial::dial_region_tls(region).await? else {
+    let Some((conn, _, addr)) =
+        crate::dial::dial_region_tls_with_resolver(region, resolver).await?
+    else {
         return Ok(None);
     };
 
@@ -344,10 +354,23 @@ impl Client<DefaultIo> {
         region: impl IntoIterator<Item = &'c ServerConnInfo>,
         node_keypair: &NodeKeyPair,
     ) -> Result<Self, Error> {
+        Self::connect_with_resolver(region, node_keypair, None).await
+    }
+
+    /// Establish a DERP session using an isolated hostname resolver.
+    pub async fn connect_with_resolver<'c>(
+        region: impl IntoIterator<Item = &'c ServerConnInfo>,
+        node_keypair: &NodeKeyPair,
+        resolver: Option<crate::dial::Resolver>,
+    ) -> Result<Self, Error> {
         // `connect` returns `Ok(None)` when no server in the region was reachable. This method must
         // yield a `Client`, so a `None` is a (retryable) connection failure, not a success — surface
         // it as an `Err` for the caller's reconnect loop rather than `.unwrap()`-panicking.
-        let conn = connect(region).await?.ok_or_else(|| {
+        let conn = match resolver {
+            Some(resolver) => connect_with_resolver(region, Some(resolver)).await?,
+            None => connect(region).await?,
+        }
+        .ok_or_else(|| {
             Error::IoFailure(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "no derp server in region was reachable",

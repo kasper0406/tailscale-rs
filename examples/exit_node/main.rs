@@ -95,11 +95,20 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.worker_threads.max(1))
         .enable_all()
-        .build()?
-        .block_on(run(args))
+        .build()?;
+    let result = runtime.block_on(run(args));
+    // A system DNS lookup cannot be cancelled inside getaddrinfo. Device pipeline threads have
+    // joined by now; bound the caller pool teardown too. Process exit reclaims a stuck OS lookup.
+    if matches!(
+        std::env::var("TS_EXPERIMENT_PIPELINE_THREAD").as_deref(),
+        Ok("1")
+    ) {
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+    result
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn Error>> {

@@ -12,6 +12,37 @@ use ts_tls_util::ServerName;
 
 use crate::{IpUsage, ServerConnInfo, TlsValidationConfig};
 
+/// Cancellable asynchronous hostname lookup. TCP/TLS socket creation stays on the dialing runtime.
+pub type Resolver = std::sync::Arc<
+    dyn Fn(
+            String,
+            u16,
+        ) -> core::pin::Pin<
+            Box<dyn core::future::Future<Output = io::Result<Vec<SocketAddr>>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// Run system hostname resolution on the caller runtime, not a packet runtime's blocking pool.
+/// Cancelling a dial aborts the caller's async waiter. OS getaddrinfo itself is not cancellable;
+/// caller-runtime owners must use bounded shutdown if the entire process must exit on DNS failure.
+pub fn resolver_on(runtime: tokio::runtime::Handle) -> Resolver {
+    struct Lookup(tokio::task::JoinHandle<io::Result<Vec<SocketAddr>>>);
+    impl Drop for Lookup {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    std::sync::Arc::new(move |hostname, port| {
+        let mut lookup = Lookup(runtime.spawn(async move {
+            tokio::net::lookup_host((hostname, port))
+                .await
+                .map(|addrs| addrs.collect())
+        }));
+        Box::pin(async move { (&mut lookup.0).await.map_err(io::Error::other)? })
+    })
+}
+
 /// Error that may occur while dialing a derp server.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -49,7 +80,22 @@ pub async fn dial_region_tls<'c>(
     )>,
     Error,
 > {
-    let Some((conn, server)) = dial_region_tcp(servers).await else {
+    dial_region_tls_with_resolver(servers, None).await
+}
+
+/// Dial TLS with a supplied hostname resolver.
+pub async fn dial_region_tls_with_resolver<'c>(
+    servers: impl IntoIterator<Item = &'c ServerConnInfo>,
+    resolver: Option<Resolver>,
+) -> Result<
+    Option<(
+        impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        &'c ServerConnInfo,
+        SocketAddr,
+    )>,
+    Error,
+> {
+    let Some((conn, server)) = dial_region_tcp_with_resolver(servers, resolver).await else {
         return Ok(None);
     };
     let remote_addr = conn.peer_addr()?;
@@ -111,6 +157,14 @@ pub async fn dial_region_tls<'c>(
 pub async fn dial_region_tcp<'c>(
     servers: impl IntoIterator<Item = &'c ServerConnInfo>,
 ) -> Option<(TcpStream, &'c ServerConnInfo)> {
+    dial_region_tcp_with_resolver(servers, None).await
+}
+
+/// Dial TCP with DNS isolated from socket registration.
+pub async fn dial_region_tcp_with_resolver<'c>(
+    servers: impl IntoIterator<Item = &'c ServerConnInfo>,
+    resolver: Option<Resolver>,
+) -> Option<(TcpStream, &'c ServerConnInfo)> {
     for server in servers {
         if server.stun_only {
             tracing::trace!(%server.hostname, "server is stun only, skip");
@@ -120,7 +174,7 @@ pub async fn dial_region_tcp<'c>(
         // SelfSigned is now supported via SHA-256 cert pinning in dial_region_tls.
         // InsecureForTests is allowed through -- TLS verification is skipped in dial_region_tls.
 
-        match dial_server(server).await {
+        match dial_server_with_resolver(server, resolver.clone()).await {
             Ok(Some(conn)) => {
                 tracing::trace!(
                     remote_addr = %conn.peer_addr().unwrap_or((core::net::Ipv4Addr::UNSPECIFIED, 0).into()),
@@ -149,6 +203,14 @@ pub async fn dial_region_tcp<'c>(
 ///
 /// Returns `None` iff the server has both IPv4 and IPv6 configured as [`IpUsage::Disable`].
 pub async fn dial_server(server: &ServerConnInfo) -> Result<Option<TcpStream>, Error> {
+    dial_server_with_resolver(server, None).await
+}
+
+/// Dial one server with an optional caller-runtime resolver.
+pub async fn dial_server_with_resolver(
+    server: &ServerConnInfo,
+    resolver: Option<Resolver>,
+) -> Result<Option<TcpStream>, Error> {
     let mut js = JoinSet::new();
 
     // TODO(npry): respect ipv6 preference. The go client just adds a flat 200ms sleep to
@@ -158,11 +220,13 @@ pub async fn dial_server(server: &ServerConnInfo) -> Result<Option<TcpStream>, E
         server.ipv4,
         server.hostname.clone(),
         server.https_port,
+        resolver.clone(),
     ));
     js.spawn(dial_by_ipusage(
         server.ipv6,
         server.hostname.clone(),
         server.https_port,
+        resolver,
     ));
 
     let mut last_error = None;
@@ -194,6 +258,7 @@ async fn dial_by_ipusage(
     ip: IpUsage<impl Into<IpAddr>>,
     hostname: String,
     port: u16,
+    resolver: Option<Resolver>,
 ) -> io::Result<Option<TcpStream>> {
     match ip {
         IpUsage::Disable => Ok(None),
@@ -202,6 +267,128 @@ async fn dial_by_ipusage(
 
             TcpStream::connect((ip, port)).await.map(Some)
         }
-        IpUsage::UseDns => TcpStream::connect((hostname, port)).await.map(Some),
+        IpUsage::UseDns => match resolver {
+            Some(resolve) => {
+                let addrs = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    resolve(hostname, port),
+                )
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "DERP DNS lookup timed out")
+                })??;
+                TcpStream::connect(addrs.as_slice()).await.map(Some)
+            }
+            None => TcpStream::connect((hostname, port)).await.map(Some),
+        },
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use std::{
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
+
+    #[tokio::test]
+    async fn caller_dns_and_packet_socket_have_independent_lifetimes() {
+        let caller = tokio::runtime::Handle::current();
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let (ready, started) = mpsc::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("test-packet-dial".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let resolver = resolver_on(caller);
+                    let socket = dial_by_ipusage(
+                        IpUsage::<std::net::Ipv4Addr>::UseDns,
+                        "localhost".into(),
+                        address.port(),
+                        Some(resolver),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    ready.send(()).unwrap();
+                    let _ = stopped.await;
+                    drop(socket);
+                });
+            })
+            .unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(2), server.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        // Reader readiness on the packet runtime continues independently of the DNS waiter.
+        tokio::task::spawn_blocking(move || started.recv_timeout(Duration::from_secs(1)).unwrap())
+            .await
+            .unwrap();
+        drop(accepted);
+        stop.send(()).unwrap();
+        tokio::task::spawn_blocking(move || thread.join().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stalled_caller_resolver_does_not_hold_packet_runtime_shutdown() {
+        let (release, gate) = mpsc::channel();
+        let gate = Arc::new(std::sync::Mutex::new(Some(gate)));
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(std::sync::Mutex::new(Some(entered)));
+        let caller = tokio::runtime::Handle::current();
+        let resolver: Resolver = Arc::new(move |_, _| {
+            let gate = gate.clone();
+            let entered = entered.clone();
+            let task = caller.spawn_blocking(move || {
+                if let Some(tx) = entered.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                gate.lock().unwrap().take().unwrap().recv().unwrap();
+                Vec::new()
+            });
+            Box::pin(async move { task.await.map_err(io::Error::other) })
+        });
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (joined, done) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                tokio::spawn(async move {
+                    drop(
+                        dial_by_ipusage(
+                            IpUsage::<std::net::Ipv4Addr>::UseDns,
+                            "stalled.invalid".into(),
+                            443,
+                            Some(resolver),
+                        )
+                        .await,
+                    );
+                });
+                let _ = stopped.await;
+            });
+            drop(runtime);
+            let _ = joined.send(());
+        });
+        started.await.unwrap();
+        stop.send(()).unwrap();
+        let bounded = tokio::time::timeout(Duration::from_millis(500), done).await;
+        // Release even when the assertion fails: tests must not strand Tokio's blocking pool.
+        release.send(()).unwrap();
+        tokio::task::spawn_blocking(move || thread.join().unwrap())
+            .await
+            .unwrap();
+        bounded.unwrap().unwrap();
     }
 }
