@@ -73,7 +73,10 @@ pub(crate) fn piped_ingress_bounded(
     netstack::WakingPipe,
 ) {
     let max_bytes = INGRESS_QUEUE_PACKETS.saturating_mul(config.mtu);
-    netstack::piped_ingress_bounded(config, INGRESS_QUEUE_PACKETS, max_bytes)
+    let (mut stack, pipe) =
+        netstack::piped_ingress_bounded(config, INGRESS_QUEUE_PACKETS, max_bytes);
+    stack.set_egress_batching(std::env::var("TS_EXPERIMENT_ACK_BATCH").as_deref() == Ok("1"));
+    (stack, pipe)
 }
 
 /// Move packets the dataplane routed to a netstack into that netstack's ingress queue, dropping

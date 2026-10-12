@@ -108,6 +108,15 @@ pub fn piped_pair(config: netcore::Config) -> (Netstack<WakingPipeDev>, Netstack
     )
 }
 
+impl Netstack<WakingPipeDev> {
+    /// Coalesce async poll output in groups of at most 64, flushing before the poll returns.
+    /// Use only with the async driver; synchronous device polls do not flush partial batches.
+    pub fn set_egress_batching(&mut self, enabled: bool) {
+        self.dev.pipe.tx.flush_egress();
+        self.dev.pipe.tx.pending_egress = enabled.then(alloc::vec::Vec::new);
+    }
+}
+
 impl<D> Netstack<D> {
     /// Limit async work per turn; the async runner cooperatively yields between bounded turns.
     pub fn set_work_budget(&mut self, budget: Option<usize>) {

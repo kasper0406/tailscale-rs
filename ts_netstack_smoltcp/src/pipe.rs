@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use core::{
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
@@ -8,7 +8,7 @@ use core::{
 use bytes::{Bytes, BytesMut};
 use futures_util::task::AtomicWaker;
 use netcore::{
-    Pipe, flume, smoltcp,
+    flume, smoltcp,
     smoltcp::{
         phy::{ChecksumCapabilities, DeviceCapabilities, Medium},
         time::Instant,
@@ -30,10 +30,10 @@ pub struct WakingPipe {
 ///
 /// It wakes the remote [`WakingPipeSender`] when a message is received.
 pub struct WakingPipeReceiver {
-    rx: flume::Receiver<Bytes>,
+    rx: flume::Receiver<PipeMessage>,
     /// [`flume::Receiver`] doesn't expose a way to poll until a value is ready without
     /// consuming it. This holds the consumed value.
-    buffered_rx: Option<Bytes>,
+    buffered_rx: VecDeque<Bytes>,
 
     /// The waker that this end of the pipe polls on in `poll_rx`.
     ///
@@ -53,9 +53,9 @@ pub struct WakingPipeReceiver {
 }
 
 /// A [`flume::Sender`] that wakes a remote [`WakingPipeReceiver`] when a message is sent.
-#[derive(Clone)]
 pub struct WakingPipeSender {
-    tx: flume::Sender<Bytes>,
+    tx: flume::Sender<PipeMessage>,
+    pub(crate) pending_egress: Option<Vec<Bytes>>,
 
     /// The waker this end of the pipe polls on in `poll_tx`.
     ///
@@ -74,6 +74,23 @@ pub struct WakingPipeSender {
     /// The byte budget of this direction of the pipe, if it has one. Every packet put into `tx`
     /// charges its length to it.
     budget: Option<Arc<ByteBudget>>,
+}
+
+enum PipeMessage {
+    One(Bytes),
+    Batch(Vec<Bytes>),
+}
+
+impl Clone for WakingPipeSender {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            pending_egress: None,
+            self_waker: self.self_waker.clone(),
+            remote_waker: self.remote_waker.clone(),
+            budget: self.budget.clone(),
+        }
+    }
 }
 
 /// A cap on the bytes queued in one direction of a [`WakingPipe`], shared by the sender and the
@@ -133,16 +150,12 @@ impl WakingPipe {
 
     /// Construct a new unbounded pipe.
     pub fn unbounded() -> (Self, Self) {
-        let (pipe1, pipe2) = Pipe::unbounded();
-
-        Self::_new(pipe1, pipe2)
+        Self::channels(None, None)
     }
 
     /// Construct a new pipe that can carry at most `limit` packets.
     pub fn bounded(limit: usize) -> (Self, Self) {
-        let (pipe1, pipe2) = Pipe::bounded(limit);
-
-        Self::_new(pipe1, pipe2)
+        Self::channels(Some(limit), Some(limit))
     }
 
     /// Construct a pipe for a netstack device whose *ingress* is bounded and whose *egress* is not.
@@ -155,31 +168,25 @@ impl WakingPipe {
     /// which is synchronous and cannot wait, so a full egress queue would stall the stack's poll
     /// loop rather than shed load.
     pub fn ingress_bounded(max_packets: usize, max_bytes: usize) -> (Self, Self) {
-        let (to_device, device_rx) = flume::bounded(max_packets);
-        let (device_tx, from_device) = flume::unbounded();
-
         let budget = Arc::new(ByteBudget {
             queued: AtomicUsize::new(0),
             max: max_bytes,
         });
+        let (mut device, mut caller) = Self::channels(Some(max_packets), None);
 
-        let (mut device, mut caller) = Self::_new(
-            Pipe {
-                tx: device_tx,
-                rx: device_rx,
-            },
-            Pipe {
-                tx: to_device,
-                rx: from_device,
-            },
-        );
         device.rx.budget = Some(budget.clone());
         caller.tx.budget = Some(budget);
 
         (device, caller)
     }
 
-    fn _new(pipe1: Pipe, pipe2: Pipe) -> (Self, Self) {
+    fn channels(ingress: Option<usize>, egress: Option<usize>) -> (Self, Self) {
+        let channel = |limit| match limit {
+            Some(n) => flume::bounded(n),
+            None => flume::unbounded(),
+        };
+        let (tx2, rx1) = channel(ingress);
+        let (tx1, rx2) = channel(egress);
         let pipe1_rx_waker = Arc::new(AtomicWaker::new());
         let pipe2_rx_waker = Arc::new(AtomicWaker::new());
 
@@ -189,14 +196,15 @@ impl WakingPipe {
         (
             Self {
                 rx: WakingPipeReceiver {
-                    rx: pipe1.rx,
-                    buffered_rx: None,
+                    rx: rx1,
+                    buffered_rx: VecDeque::new(),
                     self_waker: pipe1_rx_waker.clone(),
                     remote_waker: pipe2_tx_waker.clone(),
                     budget: None,
                 },
                 tx: WakingPipeSender {
-                    tx: pipe1.tx,
+                    tx: tx1,
+                    pending_egress: None,
                     remote_waker: pipe2_rx_waker.clone(),
                     self_waker: pipe1_tx_waker.clone(),
                     budget: None,
@@ -204,14 +212,15 @@ impl WakingPipe {
             },
             Self {
                 rx: WakingPipeReceiver {
-                    rx: pipe2.rx,
-                    buffered_rx: None,
+                    rx: rx2,
+                    buffered_rx: VecDeque::new(),
                     self_waker: pipe2_rx_waker,
                     remote_waker: pipe1_tx_waker,
                     budget: None,
                 },
                 tx: WakingPipeSender {
-                    tx: pipe2.tx,
+                    tx: tx2,
+                    pending_egress: None,
                     remote_waker: pipe1_rx_waker,
                     self_waker: pipe2_tx_waker,
                     budget: None,
@@ -224,43 +233,53 @@ impl WakingPipe {
 impl WakingPipeReceiver {
     /// Receive a packet.
     pub fn recv(&mut self) -> Option<Bytes> {
-        if let Some(buf) = self.buffered_rx.take() {
+        if let Some(buf) = self.buffered_rx.pop_front() {
             return Some(buf);
         }
 
         let ret = self.rx.recv().ok();
-        self.taken(ret.as_ref());
-
-        ret
+        self.unpack(ret)
     }
 
     /// Receive a packet asynchronously.
     pub async fn recv_async(&mut self) -> Option<Bytes> {
-        if let Some(buf) = self.buffered_rx.take() {
+        if let Some(buf) = self.buffered_rx.pop_front() {
             return Some(buf);
         }
 
         let ret = self.rx.recv_async().await.ok();
-        self.taken(ret.as_ref());
-
-        ret
+        self.unpack(ret)
     }
 
     /// Receive a packet if it's possible to do so without blocking.
     pub fn try_recv(&mut self) -> Option<Bytes> {
-        if let Some(buf) = self.buffered_rx.take() {
+        if let Some(buf) = self.buffered_rx.pop_front() {
             return Some(buf);
         }
 
         let ret = self.rx.try_recv().ok();
-        self.taken(ret.as_ref());
+        self.unpack(ret)
+    }
 
-        ret
+    fn unpack(&mut self, message: Option<PipeMessage>) -> Option<Bytes> {
+        match message? {
+            PipeMessage::One(buf) => {
+                self.taken(Some(&buf));
+                Some(buf)
+            }
+            PipeMessage::Batch(bufs) => {
+                for buf in &bufs {
+                    self.taken(Some(buf));
+                }
+                self.buffered_rx.extend(bufs);
+                self.buffered_rx.pop_front()
+            }
+        }
     }
 
     /// Report whether there is a packet ready to be received.
     pub fn rx_ready(&self) -> bool {
-        self.buffered_rx.is_some() || !self.rx.is_empty()
+        !self.buffered_rx.is_empty() || !self.rx.is_empty()
     }
 
     /// Account for a packet just taken out of the channel: give its bytes back to the budget and
@@ -277,7 +296,7 @@ impl WakingPipeSender {
     /// Send a packet, blocking until complete.
     pub fn send(&self, buf: &[u8]) {
         charge(&self.budget, buf.len());
-        if let Err(_e) = self.tx.send(Bytes::copy_from_slice(buf)) {
+        if let Err(_e) = self.tx.send(PipeMessage::One(Bytes::copy_from_slice(buf))) {
             release(&self.budget, buf.len());
             tracing::warn!("send dropped: remote end of pipe is gone");
             return;
@@ -289,7 +308,11 @@ impl WakingPipeSender {
     /// Send a packet asynchronously.
     pub async fn send_async(&self, buf: &[u8]) {
         charge(&self.budget, buf.len());
-        if let Err(_e) = self.tx.send_async(Bytes::copy_from_slice(buf)).await {
+        if let Err(_e) = self
+            .tx
+            .send_async(PipeMessage::One(Bytes::copy_from_slice(buf)))
+            .await
+        {
             release(&self.budget, buf.len());
             tracing::warn!("send dropped: remote end of pipe is gone");
             return;
@@ -310,7 +333,10 @@ impl WakingPipeSender {
             return false;
         }
 
-        match self.tx.try_send(Bytes::copy_from_slice(buf)) {
+        match self
+            .tx
+            .try_send(PipeMessage::One(Bytes::copy_from_slice(buf)))
+        {
             Ok(()) => {
                 self.remote_waker.wake();
                 true
@@ -330,6 +356,19 @@ impl WakingPipeSender {
         }
     }
 
+    pub(crate) fn flush_egress(&mut self) {
+        if let Some(pending) = &mut self.pending_egress {
+            if pending.is_empty() {
+                return;
+            }
+            let bufs = core::mem::take(pending);
+            if self.tx.send(PipeMessage::Batch(bufs)).is_err() {
+                tracing::warn!("remote end of pipe dropped on batch send");
+            }
+            self.remote_waker.wake();
+        }
+    }
+
     /// Report whether we can currently transmit.
     pub fn tx_ready(&self) -> bool {
         !self.tx.is_full()
@@ -337,6 +376,10 @@ impl WakingPipeSender {
 }
 
 impl netcore::AsyncWakeDevice for WakingPipeDev {
+    fn finish_turn(self: Pin<&mut Self>) {
+        self.get_mut().pipe.tx.flush_egress();
+    }
+
     #[tracing::instrument(name = "WakingPipeDev::poll_tx", skip_all, level = "trace", ret)]
     fn poll_tx<'cx>(self: Pin<&mut Self>, cx: &mut Context<'cx>) -> Poll<()> {
         self.pipe.tx.self_waker.register(cx.waker());
@@ -364,7 +407,7 @@ impl netcore::AsyncWakeDevice for WakingPipeDev {
     }
 }
 
-impl smoltcp::phy::TxToken for WakingPipeSender {
+impl smoltcp::phy::TxToken for &mut WakingPipeSender {
     #[tracing::instrument(
         name = "WakingPipeSender::consume",
         skip_all,
@@ -379,7 +422,15 @@ impl smoltcp::phy::TxToken for WakingPipeSender {
 
         let ret = f(&mut b);
         charge(&self.budget, len);
-        if self.tx.send(b.freeze()).is_err() {
+        if let Some(pending) = &mut self.pending_egress {
+            pending.push(b.freeze());
+            // Bound publication size even without an async work budget.
+            if pending.len() == 64 {
+                self.flush_egress();
+            }
+            return ret;
+        }
+        if self.tx.send(PipeMessage::One(b.freeze())).is_err() {
             release(&self.budget, len);
             tracing::warn!("remote end of dropped on send");
         }
@@ -430,32 +481,25 @@ impl smoltcp::phy::Device for WakingPipeDev {
         Self: 'a;
 
     type TxToken<'a>
-        = WakingPipeSender
+        = &'a mut WakingPipeSender
     where
         Self: 'a;
 
     #[tracing::instrument(skip(self), level = "trace")]
     fn receive(&mut self, timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let tx = self.transmit(timestamp)?;
-
-        let b = if let Some(buf) = self.pipe.rx.buffered_rx.take() {
-            buf
-        } else {
-            let buf = self.pipe.rx.rx.try_recv().ok()?;
-            release(&self.pipe.rx.budget, buf.len());
-            buf
-        };
-
-        Some((RxToken(b), tx))
+        let _ = timestamp;
+        if self.pipe.tx.tx.is_disconnected() {
+            return None;
+        }
+        let b = self.pipe.rx.try_recv()?;
+        Some((RxToken(b), &mut self.pipe.tx))
     }
 
-    #[tracing::instrument(skip(self), level = "trace")]
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         if self.pipe.tx.tx.is_disconnected() {
             return None;
         }
-
-        Some(self.pipe.tx.clone())
+        Some(&mut self.pipe.tx)
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -481,7 +525,10 @@ mod tests {
         assert!(a.rx.try_recv().is_none());
     }
 
-    use netcore::smoltcp::phy::{Device, RxToken as _, TxToken as _};
+    use netcore::{
+        AsyncWakeDevice,
+        smoltcp::phy::{Device, RxToken as _, TxToken as _},
+    };
 
     use super::*;
 
@@ -556,6 +603,45 @@ mod tests {
         assert!(
             caller.tx.try_send(&[0; 1000]),
             "the whole budget is free again"
+        );
+    }
+
+    #[test]
+    fn egress_batches_are_published_at_turn_end_and_bounded() {
+        let (dev, mut caller) = WakingPipe::unbounded();
+        let mut dev = device(dev);
+        dev.pipe.tx.pending_egress = Some(Vec::new());
+        for i in 0..63u8 {
+            dev.transmit(Instant::ZERO)
+                .unwrap()
+                .consume(1, |b| b[0] = i);
+        }
+        assert!(caller.rx.try_recv().is_none());
+        Pin::new(&mut dev).finish_turn();
+        assert_eq!(
+            caller.rx.rx.len(),
+            1,
+            "one channel publication for the turn"
+        );
+        for i in 0..63u8 {
+            assert_eq!(caller.rx.try_recv().unwrap()[0], i);
+        }
+        assert!(caller.rx.try_recv().is_none());
+        for i in 0..65u8 {
+            dev.transmit(Instant::ZERO)
+                .unwrap()
+                .consume(1, |b| b[0] = i);
+        }
+        assert_eq!(caller.rx.rx.len(), 1, "full chunks publish without waiting");
+        Pin::new(&mut dev).finish_turn();
+        assert_eq!(caller.rx.rx.len(), 2);
+        for i in 0..65u8 {
+            assert_eq!(caller.rx.try_recv().unwrap()[0], i);
+        }
+        Pin::new(&mut dev).finish_turn();
+        assert!(
+            caller.rx.try_recv().is_none(),
+            "empty turns publish nothing"
         );
     }
 

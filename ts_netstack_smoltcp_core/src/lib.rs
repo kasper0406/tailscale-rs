@@ -844,6 +844,7 @@ where
 
         stack.pump_targeted_commands();
         progress_made |= stack.drain_tcp_closes(now);
+        dev.as_mut().finish_turn();
         if progress_made {
             Poll::Ready(())
         } else {
