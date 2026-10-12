@@ -560,3 +560,9 @@ check-cfg = ["cfg(fuzzing)"]
 
 [profile.release]
 debug = 2
+
+# Vendored for a backport (see PATCHES.md); keep upstream's code as is and don't surface its
+# warnings in the fork's builds.
+[lints.rust]
+unused = { level = "allow", priority = -1 }
+dead_code = "allow"

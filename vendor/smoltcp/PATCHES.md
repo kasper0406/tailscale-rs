@@ -21,3 +21,4 @@ RTO. Actual timeout backoff and Karn's sample invalidation remain in place.
 Remove this vendor override when adopting an upstream release containing that
 fix. Further upstream TCP changes (including fast recovery and congestion
 control) require separate review.
+- `Cargo.toml`: a `[lints.rust]` table that allows the crate's existing unused/dead-code warnings in the fork's builds (no source change).
