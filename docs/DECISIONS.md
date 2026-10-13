@@ -183,3 +183,16 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   survey in `docs/UPSTREAM.md`: nobody has done exit-node scaling. The official repo already fixed the
   listener orphan but still has the FIN-drop, abandoned-receive and global-replay issues. The Go
   counterpart of our macOS batching is tailscale/tailscale#21487 (open).
+- **F27 Shard overhead attribution (codex-19, `TS_EXPERIMENT_SHARD_BATCH`).** Codex attributed 417/503 sampled
+  mutex waits to a per-packet ownership-ledger lock, plus per-packet shard publications and a full shared WG
+  mailbox. It added four opt-in treatments (batched dispatch, per-shard ownership cache, ready WG merging,
+  inline egress); ownership locks went 352,115 → 3 in its probe. On the real harness they don't fix upload:
+  2 × 64 up N=1 7.82, N=4 13.53, N=4+batch 13.82 CPU-s/GB. They help 2 × 8 download throughput (6.42 →
+  7.73 Gbit/s). Codex's in-memory control with the generator's driver policy shows no N=4 single-flow
+  download gap, and the real generator sits near one core at N=4. So the single-flow loss is likely a
+  generator/testbed limit, not the node's. Generator + node + sink use ~6–7 of 10 cores (6 are E-cores), and
+  macOS scheduling of extra threads onto E-cores is a likely confounder for the upload CPU/GB as well.
+  Codex was cut off twice by model-capacity errors; Claude verified and committed the remainder (ace33ee).
+  **D26**: sharding is not evaluable further on this single Mac. Next evidence needs a remote generator
+  and/or a many-core Linux host. Until then sharding stays opt-in and off, and the consolidated N=1 build
+  is the product.
