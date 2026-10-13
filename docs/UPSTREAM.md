@@ -83,3 +83,12 @@ second fork, `kasper0406/geiserx-tailscale-rs`.
   #603 exit destination guard, #604 betterAddr.
 - Commit messages on all `ts-exit/*` layers were rewritten (codex-22, trees verified identical) after the reorg
   had left placeholder bodies. #597/#598 were updated with the same trees.
+
+## Porting onto official tailscale-rs (assessed 2026-10-13)
+
+GeiserX is official `29d87ee` (2026-05-27) plus ~136k lines. Our layers are 1.6k (fixes) + 2.0k (exit-node) +
+5.4k (perf). They depend on GeiserX code that official lacks: direct UDP connections (~22k incl. dataplane/runtime;
+official #151 is in progress), the forwarder (~3.9k), peerAPI/exit DNS (~2.9k) and route advertisement (#444).
+Official maintainers declined community features on #291. Decision: don't port now; port the exit node (~5–8k
+lines on official) once #151 lands. A weekly routine (trig_012KpXgYh9fkMu5QTsYbd5m8) watches for that and for a
+policy change.
