@@ -42,7 +42,7 @@ keeps all state in `/Volumes/git/ts-exit/state/`. Stopping the process is the fu
 /Volumes/git/ts-exit/runner/build.sh
 ```
 
-That runs `cargo build --release --locked --example exit_node` in the fork checkout (branch `ts-exit/runner`),
+That runs `cargo build --release --locked --example exit_node` in the fork checkout (branch `ts-exit/main`),
 for `aarch64-apple-darwin`.
 
 ## 2. Start / status / stop
