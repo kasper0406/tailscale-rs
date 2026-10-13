@@ -1,6 +1,6 @@
 You are a senior Rust/networking reviewer collaborating with another agent (Claude) on the plan in
 /Volumes/git/ts-exit/docs/PLAN.md (read it first). Machine: Mac mini M4, macOS 26.6.2. Repos are cloned in
-/Volumes/git/ts-exit/repos/: tailscale-rs (official, b44db0da), geiserx-tailscale-rs (fork, 719aa889; NOTE: no shared
+/Volumes/git/ts-exit/repos/: tailscale-rs (official, b44db0da), geiserx-tailscale-rs (fork, 24c18fcf; NOTE: no shared
 git history with official), tailscaled-rs (f95330a6), tailscale-go (3bb8a906, reference only).
 Release builds of both Rust workspaces are running in parallel; do NOT run `cargo build` on the whole workspace yourself
 (you may `cargo check -p <crate>` or run targeted `cargo test -p ts_forwarder` if useful; use CARGO_TARGET_DIR=/Volumes/git/ts-exit/scratch/codex-target).

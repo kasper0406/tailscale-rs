@@ -9,7 +9,7 @@ have real measurements from an independent load generator through the live node.
 - `docs/DECISIONS.md` F16–F18, D18
 - profile `scratch/prof/stage0-pipeline-down1.txt` (pipeline-thread mode, one download flow;
   `python3 scratch/categorize.py <file>` buckets it)
-- code: fork checkout `repos/geiserx-tailscale-rs`, branch `ts-exit/bench-scaling` (HEAD 9b9ce9f).
+- code: fork checkout `repos/geiserx-tailscale-rs`, branch `ts-exit/bench-scaling` (HEAD 818deb2).
   Relevant: `ts_netstack_smoltcp_core/src/lib.rs` (`poll_device_io`, `poll_device_ingress_async`,
   `IoPoller`, `pump_blocked_commands`), vendored `vendor/smoltcp` (`poll_egress` walks every socket),
   `ts_runtime/src/forwarder_actor.rs`, `ts_runtime/src/netstack_actor.rs`, `ts_magicsock` receive path.

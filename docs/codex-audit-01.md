@@ -2,7 +2,7 @@
 
 2026-10-11. Reviewed source at the supplied commits; no tailnet registration, route advertisement, OS network changes, or iPad test performed. **The fork has a functioning IPv4 socket forwarder, but is not yet a verified, safe exit node for the official iPad client.**
 
-Evidence notation: `F/` = `repos/geiserx-tailscale-rs/` (`719aa8891fd777daafab67700d3d05894e49b71f`); `O/` = `repos/tailscale-rs/` (`b44db0da2dc2cc4becd58d1337e81267cf426e17`); `D/` = `repos/tailscaled-rs/` (`f95330a6a9b18489b4311d08640d20a60096a6ff`); `G/` = `repos/tailscale-go/` (`3bb8a906c27738c7904ef301c9539da763181f85`). Paths below are relative to `/Volumes/git/ts-exit`; line numbers refer to these checkouts. Official and fork are separate source trees; do not assume cherry-pickable shared ancestry.
+Evidence notation: `F/` = `repos/geiserx-tailscale-rs/` (`24c18fcf0df612d9b5769567bfa929e523708f03`); `O/` = `repos/tailscale-rs/` (`b44db0da2dc2cc4becd58d1337e81267cf426e17`); `D/` = `repos/tailscaled-rs/` (`f95330a6a9b18489b4311d08640d20a60096a6ff`); `G/` = `repos/tailscale-go/` (`3bb8a906c27738c7904ef301c9539da763181f85`). Paths below are relative to `/Volumes/git/ts-exit`; line numbers refer to these checkouts. Official and fork are separate source trees; do not assume cherry-pickable shared ancestry.
 
 ## Ranked blockers / acceptance gates
 
@@ -61,7 +61,7 @@ TCP port “last activity” is refreshed **only by SYNs** because non-SYN packe
 
 ## Runner recommendation and validation
 
-**Write the ~200-line purpose-built runner against the pinned fork's `tailscale` crate, after the blockers above.** `tailnetd` is a real runnable daemon, with `tnet up/set --advertise-exit-node` (`D/src/bin/tnet.rs:113`, `:375`), but it does not wire HostExitDialer/all-port forwarding. Its Cargo dependencies also pin **eabd2cf2…**, not the audited fork commit (`D/Cargo.toml:83`, `:91`). It adds state/LocalAPI/proxy/OS lifecycle surface without solving these exit seams. Advertising through it is not evidence of working egress.
+**Write the ~200-line purpose-built runner against the pinned fork's `tailscale` crate, after the blockers above.** `tailnetd` is a real runnable daemon, with `tnet up/set --advertise-exit-node` (`D/src/bin/tnet.rs:113`, `:375`), but it does not wire HostExitDialer/all-port forwarding. Its Cargo dependencies also pin **817a2763…**, not the audited fork commit (`D/Cargo.toml:83`, `:91`). It adds state/LocalAPI/proxy/OS lifecycle surface without solving these exit seams. Advertising through it is not evidence of working egress.
 
 Runner configuration: distinct persisted key file/hostname, `ephemeral=false`, `transport_mode=Netstack`, `accept_routes=false`, `exit_node=None`, `exit_proxy=None`, `forward_exit_egress=true`, `forward_all_ports=true`; advertise only after validation, using a corrected paired-default policy. Enable feature + config for network monitoring; handle signals with `Device::shutdown(Some(timeout))`. APIs verified: `Config::default_with_key_file` (`F/src/config.rs:481`), `Device::new(&config, auth_key)` (`F/src/lib.rs:372`), `status()` (`:1292`), `set_advertise_exit_node()` (`:1587`), `shutdown()` (`:2051`). A small runner cannot by itself repair routing, authorization, or missing DNS API wiring.
 

@@ -1,7 +1,7 @@
 # Brief 14: targeted waiter replay (your B item 2), opt-in, with a full-sweep safety net
 
 Same worktree/branch as brief 13: `/Volumes/git/ts-exit/scratch/wt-codex-scans`, `ts-exit/netstack-scans`
-(HEAD 497b5fd). Same commit trailers, no push, `cargo +1.95.0`, format only touched files.
+(HEAD 0684e38). Same commit trailers, no push, `cargo +1.95.0`, format only touched files.
 
 ## Evidence (Claude measured your item 1 on the harness)
 

@@ -1,5 +1,5 @@
 Status: smoltcp stall fix (your patches) is merged and live; blocker 5 merged; everything pushed to
-github.com/kasper0406/tailscale-rs branch ts-exit/runner (now 752cf20). New: a local Go tailscaled client
+github.com/kasper0406/tailscale-rs branch ts-exit/runner (now 80e78b9). New: a local Go tailscaled client
 (bin/tailscaled, state/go-client) lets us benchmark the tunnel end to end on this Mac
 (runner/tunnel-bench.sh, results bench/results/tunnel-ab.csv). Profiling the node under load
 (scratch/prof/sample-{d,u}.txt, categorized by scratch/categorize.py) shows crypto at 15-19% of busy CPU,
@@ -22,5 +22,5 @@ RustCrypto unless switching it is trivial. Requirements:
    with ring and vice versa.
  - Measure: ts_tunnel unit benches if any, plus the per-packet ns in the data path before/after.
 Deliver format-patches in scratch/codex-ring-aead/ + README; DCO `Signed-off-by: "Kasper Nielsen" <kasper0406@gmail.com>`.
-Base on ts-exit/runner 752cf20 in your own worktree; CARGO_TARGET_DIR=/Volumes/git/ts-exit/scratch/codex-target.
+Base on ts-exit/runner 80e78b9 in your own worktree; CARGO_TARGET_DIR=/Volumes/git/ts-exit/scratch/codex-target.
 Do not touch the live node, the runner checkout, or the Go client.

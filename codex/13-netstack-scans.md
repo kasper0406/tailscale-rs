@@ -3,7 +3,7 @@
 Your analysis is in `docs/codex-12-stage0-replan.md`. Build its **B item 1** now; Claude benchmarks.
 
 Worktree: `/Volumes/git/ts-exit/scratch/wt-codex-scans`, branch `ts-exit/netstack-scans` (from
-`ts-exit/bench-scaling` @ 9b9ce9f). Work only there. Use `cargo +1.95.0`. Commit in small,
+`ts-exit/bench-scaling` @ 818deb2). Work only there. Use `cargo +1.95.0`. Commit in small,
 reviewable commits, message style like the existing history, each ending with:
 
     Signed-off-by: "Kasper Nielsen" <kasper0406@gmail.com>

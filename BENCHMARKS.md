@@ -1,7 +1,7 @@
 # BENCHMARKS
 
 Host: Mac mini M4 (10 cores, 16 GiB), macOS 26.6.2 (25G83), wired Ethernet. Fork `GeiserX/tailscale-rs`
-@ `719aa889` + series on branch `ts-exit/runner` (commit given per table). Release builds,
+@ `24c18fcf` + series on branch `ts-exit/runner` (commit given per table). Release builds,
 `aarch64-apple-darwin`, rustc 1.95.0. Raw outputs: `bench/results/`.
 
 Three levels, kept apart on purpose (PLAN: never present a tunnel-only number as exit-node throughput):
@@ -24,7 +24,7 @@ FWD_MODE={ports|raw|gated} RTT_MS=<ms> TCP_BUF_KB=<KiB> \
   cargo bench -p geiserx_ts_forwarder --bench forward_throughput -- <secs> <flows> <up|down>
 ```
 
-### Port mode: cold-port latency and per-packet cost (commit `ba175e7`)
+### Port mode: cold-port latency and per-packet cost (commit `50cce10`)
 
 One flow, down, 5 s. `cold connect` is the first connect to a port without a listener yet.
 
@@ -38,7 +38,7 @@ Raw-observer mode loses the first SYN to every new destination port, so the clie
 retransmit. smoltcp's initial RTO is 3 s; iOS/macOS use 1 s. It also copies every inbound packet to learn
 ports, which costs about 27% throughput. The gate removes both.
 
-### Single-flow window limit (commit `5e872d8`, explicit-port mode)
+### Single-flow window limit (commit `4d5f234`, explicit-port mode)
 
 | RTT | TCP buffer/direction | down Mbps | up Mbps | 
 |---|---|---|---|
@@ -110,10 +110,10 @@ Raw: `bench/results/tunnel-ab.csv`. Profiles: `scratch/prof/sample*.txt`.
 
 | variant (cumulative) | down Mbit/s | down CPU-s/GB | up Mbit/s | up CPU-s/GB |
 |---|---|---|---|---|
-| baseline (`runner` @ dceb1a3) | 1,178 | 18.6 | 1,860 | 11.6 |
-| + packet-path spans at trace (`752cf20`) | 1,282 | 15.7 | 1,870 | 10.5 |
-| + egress batching, zero-copy (`4124a9e`) | ~1,310 | 11.9 | ~1,850 | 10.5 |
-| + 7 MiB UDP socket buffers (`6f93451`) | ~1,280 | ~12.0 | ~1,850 | 10.5 |
+| baseline (`runner` @ a2327e3) | 1,178 | 18.6 | 1,860 | 11.6 |
+| + packet-path spans at trace (`80e78b9`) | 1,282 | 15.7 | 1,870 | 10.5 |
+| + egress batching, zero-copy (`3a5f0d7`) | ~1,310 | 11.9 | ~1,850 | 10.5 |
+| + 7 MiB UDP socket buffers (`6e21f8a`) | ~1,280 | ~12.0 | ~1,850 | 10.5 |
 | + connected sockets + DF (`perf-connected`, opt-in) | **1,760** | **8.9** | **1,950** | **9.9** |
 | connected + DF alone on the baseline | 1,433 | 14.6 | 1,875 | 11.9 |
 
@@ -213,7 +213,7 @@ spread, with the path (direct/DERP) from the runner log quoted per run:
 ## 4. Stage-0 scaling baseline: synthetic peers through the real node (2026-10-12)
 
 Reference point before any sharding work (`docs/codex-10-sharding-design.md`). Binary `bin/exit_node-stage0b`
-(branch `ts-exit/bench-scaling` @ `47b4714`, `ring-aead`, connected sockets + DF + `sendmsg_x` on, 4 tokio
+(branch `ts-exit/bench-scaling` @ `4e6490d`, `ring-aead`, connected sockets + DF + `sendmsg_x` on, 4 tokio
 workers, 256 KiB TCP buffers).
 
 **Method.** Two enrolled tailnet nodes (`synthetic-load-1/2`, login-link enrolled, same user) are driven by
@@ -269,11 +269,11 @@ idle 0.75/0.95/1.11. During the 2 × 8 download load: default 3.69/12.0/13.6, pi
 `bench-scaling`):**
 
 - FIN/Close dropped on a full netstack command channel (bounded at 32): a lost half-close left peers
-  waiting for the idle timeout. 1 of 64 concurrent uploads hung (`47b4714`).
+  waiting for the idle timeout. 1 of 64 concurrent uploads hung (`4e6490d`).
 - A cancelled receive (`select!`/`timeout`) left its command queued, and it consumed the next datagram
-  (`652b74b`).
+  (`13d4c4c`).
 - The UDP reaper killed a brand-new flow in its port's first millisecond, so the gate's held first datagram
-  to a cold port lost its reply (`cbf9f8c`). This was a regression from my own 938bed4, and
+  to a cold port lost its reply (`a55d5e2`). This was a regression from my own af993f6, and
   `gated_all_ports_answers_first_datagram_to_cold_port` had been failing whenever run alone.
 
 A real Go client's throughput was unaffected by peer updates (hostname changes mid-download, no dip), so the

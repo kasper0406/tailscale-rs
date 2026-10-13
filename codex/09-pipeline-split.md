@@ -1,10 +1,10 @@
-Thanks for the critique — it was right on the risk. Controlled A/B results (same binary ae21eff, knob
+Thanks for the critique — it was right on the risk. Controlled A/B results (same binary ba189ab, knob
 0/1/1/0, 4 caller workers, 256 KiB; bench/results/pipeline-controlled.txt, BENCHMARKS.md "Dedicated
 packet-pipeline thread"): single download CPU/GB -47% (8.85 -> 4.7) at +12% throughput; single upload -33%
 at -7% throughput; 8 flows CPU/GB about -35% but aggregate -28% (~1715 -> ~1235 Mbit/s) and echo stalls in 2/4
 runs vs 1/4. `ps -M` during 8 flows: pipeline thread 86% of a core, the four caller workers ~5% each.
 The user approved building the follow-up. Branch: ts-exit/pipeline-split, based on ts-exit/pipeline-thread
-(ae21eff) rebased onto current ts-exit/perf-connected HEAD (includes runner --worker-threads default 4).
+(ba189ab) rebased onto current ts-exit/perf-connected HEAD (includes runner --worker-threads default 4).
 
 Build:
  1. Two dedicated threads instead of one, still opt-in (keep the env knob; e.g.

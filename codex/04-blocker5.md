@@ -1,6 +1,6 @@
-Thanks: I reviewed and applied your blocker-2 patches (now 6bfbbee, 681cd75 on ts-exit/runner; pushed). I also fixed
-your review findings 2–5 (46a2402: generation-safe gate, JoinSet-owned listeners, atomic Closing claim, open
-timeout), rate-limited IPv6 rejections (d3e10e4), and finding 7 was already fixed in 938bed4 (UDP refresh on
+Thanks: I reviewed and applied your blocker-2 patches (now 83f6076, 3aba14b on ts-exit/runner; pushed). I also fixed
+your review findings 2–5 (9d21497: generation-safe gate, JoinSet-owned listeners, atomic Closing claim, open
+timeout), rate-limited IPv6 rejections (d89780d), and finding 7 was already fixed in af993f6 (UDP refresh on
 replies + live-flow-aware port reaping). Phase 3A (connected sockets + DF, opt-in) is on ts-exit/perf-connected
 (19e0507).
 
@@ -11,7 +11,7 @@ updater, forwarder, peer tracker — verify which ones actually consume security
 subscriber death must fail closed (stop forwarding) rather than silently continue. Do NOT attempt the bigger
 snapshot redesign; note it as follow-up.
 Requirements:
- - Work in your worktree based on ts-exit/runner HEAD (7036fbb). Deliver git format-patch files in
+ - Work in your worktree based on ts-exit/runner HEAD (acb0f06). Deliver git format-patch files in
    scratch/codex-blocker5/ with a README (what changed, tests, residual risk). DCO line:
    `Signed-off-by: "Kasper Nielsen" <kasper0406@gmail.com>`.
  - Tests: saturate a subscriber mailbox and prove a later revocation (peer deletion / filter delta) is still applied;

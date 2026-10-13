@@ -2,7 +2,7 @@
 
 2026-10-11. **Advertise the default-route pair, keep `enable_ipv6=false`, and reject IPv6 at the dedicated forwarder ingress before smoltcp or a dialer sees it.** Merely advertising `::/0` is insufficient: unmatched ports already reject promptly, but existing wildcard TCP/UDP listeners also accept IPv6.
 
-`F/` means fork source at **719aa889**, checked in detached worktree `scratch/wt-codex`; `G/` means `repos/tailscale-go` at **3bb8a906**. Line numbers below are for those baselines, not Claude's changing runner branch. `S/` means the actual dependency `/Users/knielsen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smoltcp-0.13.1/src/`. No runner-branch files were edited. The lack of global IPv6/default route on the Mac is an input from Claude; no host network configuration was changed.
+`F/` means fork source at **24c18fcf**, checked in detached worktree `scratch/wt-codex`; `G/` means `repos/tailscale-go` at **3bb8a906**. Line numbers below are for those baselines, not Claude's changing runner branch. `S/` means the actual dependency `/Users/knielsen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smoltcp-0.13.1/src/`. No runner-branch files were edited. The lack of global IPv6/default route on the Mac is an input from Claude; no host network configuration was changed.
 
 ## 1. Actual IPv6 path, with either `enable_ipv6` value
 
@@ -84,7 +84,7 @@ Export the enum from `ts_control/src/lib.rs:61` and public `src/lib.rs`. Also th
 
 **Rejection hook:** intercept every IPv6 packet in the dedicated forwarder ingress pump, after decrypt/source/filter/accepted-route dispatch but before smoltcp's bounded ingress queue. Emit a reversed-tuple TCP RST (SYN -> RST|ACK; ACK -> RST with its ACK as sequence) or ICMPv6 type 1/code 1 for ordinary UDP. Consume the packet regardless of whether a safe reply can be constructed. This prevents listener readiness, all-port reinjection, proxy choice and host network conditions from affecting rejection. It also avoids allocating an overlay TCP flow, a UDP mapping, or any host socket.
 
-The actual reviewable prototype is **[codex-02-ipv6-reject.patch](codex-02-ipv6-reject.patch)**, based on 719aa889, covering `ts_forwarder`'s rejection helper/tests and the runtime ingress hook. It intentionally omits configuration/advertisement changes above. Its dependency on `etherparse 0.19` is already present elsewhere in the lockfile; the lock diff only adds the forwarder dependency edge, with no version changes.
+The actual reviewable prototype is **[codex-02-ipv6-reject.patch](codex-02-ipv6-reject.patch)**, based on 24c18fcf, covering `ts_forwarder`'s rejection helper/tests and the runtime ingress hook. It intentionally omits configuration/advertisement changes above. Its dependency on `etherparse 0.19` is already present elsewhere in the lockfile; the lock diff only adds the forwarder dependency edge, with no version changes.
 
 Key runtime change, abbreviated from the checked prototype:
 

@@ -1,6 +1,6 @@
 # Flow sharding: independent design review
 
-2026-10-12. Evidence: worktree base `ae21eff` on `ts-exit/perf-connected` (`4168f38`), current runner source read only, `BENCHMARKS.md` §1c, `pipeline-controlled.txt`, and `scratch/prof/pipeline-single-8.txt`. Line references below use the worktree base unless described as current runner. No sharding implementation is proposed for merge in this delivery.
+2026-10-12. Evidence: worktree base `ba189ab` on `ts-exit/perf-connected` (`bfb17c1`), current runner source read only, `BENCHMARKS.md` §1c, `pipeline-controlled.txt`, and `scratch/prof/pipeline-single-8.txt`. Line references below use the worktree base unless described as current runner. No sharding implementation is proposed for merge in this delivery.
 
 **Agree with sticky flow ownership, including host sockets and per-flow tasks. Disagree that the sketch is already a complete scalable architecture.** Replace the fixed stage split with flow shards, but explicitly retain a peer/session control owner and platform-dependent socket owners. “Thread per core” is placement intent, not guaranteed macOS CPU affinity. A configurable number of sticky threads is the supported contract.
 

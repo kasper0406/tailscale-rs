@@ -4,8 +4,8 @@
 [`tokio4-fixed`](../bench/results/stage0/tokio4-fixed/) and
 [`pipeline1`](../bench/results/stage0/pipeline1/) JSONL, [F16–F18/D18](DECISIONS.md),
 the [one-flow download profile](../scratch/prof/stage0-pipeline-down1.txt), and
-`repos/geiserx-tailscale-rs` at `9b9ce9f` on `ts-exit/bench-scaling`.
-The measured node binary is documented at `47b4714`; the relevant netstack,
+`repos/geiserx-tailscale-rs` at `818deb2` on `ts-exit/bench-scaling`.
+The measured node binary is documented at `4e6490d`; the relevant netstack,
 runtime, magicsock and vendored smoltcp files have no differences between those
 commits. All raw cells use the same node SHA-256. Source paths below are relative
 to that checkout; `core/` abbreviates `ts_netstack_smoltcp_core/src/`.

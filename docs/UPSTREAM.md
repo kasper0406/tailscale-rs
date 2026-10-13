@@ -27,7 +27,7 @@ subnet router, scalability, listener/RST/half-open/FIN.
   | F17 FIN/Close dropped on a full command channel (`try_send` Full → Ok, bound 32) | **Still present** |
   | F17 abandoned blocked receive eats the next datagram | **Still present** (`pump_blocked_commands` replays without a disconnected check) |
   | F21 global blocked-command replay (120 attempts per completion) | **Still present** (same structure) |
-  | UDP reaper first-millisecond (cbf9f8c) | N/A (that was our own regression in the GeiserX-based code) |
+  | UDP reaper first-millisecond (a55d5e2) | N/A (that was our own regression in the GeiserX-based code) |
 
   The F17 pair and targeted replay are small, self-contained, upstreamable fixes even before any scaling work.
 

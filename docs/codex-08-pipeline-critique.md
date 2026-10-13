@@ -1,6 +1,6 @@
 # Pipeline premise: independent critique
 
-**Worth testing, but “five cross-thread hops explain 61%” and “3.6 bounds the gain” are overstated. Keep this opt-in.** Reviewed §1c, CSV, six profiles/categorizer and implementation `ae21eff`; no live action performed. New A/B rows appeared during the review and are distinguished below.
+**Worth testing, but “five cross-thread hops explain 61%” and “3.6 bounds the gain” are overstated. Keep this opt-in.** Reviewed §1c, CSV, six profiles/categorizer and implementation `ba189ab`; no live action performed. New A/B rows appeared during the review and are distinguished below.
 
 ## 1. Evidence versus explanation
 

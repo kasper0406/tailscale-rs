@@ -1,9 +1,9 @@
 # Brief 16: decouple the work budget from the batching flags; keep the RX win, lose the download regression
 
-Same worktree/branch (`scratch/wt-codex-scans`, `ts-exit/netstack-scans`, HEAD 77e0f36 + whatever you add).
+Same worktree/branch (`scratch/wt-codex-scans`, `ts-exit/netstack-scans`, HEAD 27cc9cf + whatever you add).
 Same rules (trailers, `cargo +1.95.0`, touched-file fmt, no push).
 
-## Claude's A/B of brief 15 (same binary aad9b22, targeted replay on in every mode, CPU-s/GB median of 3)
+## Claude's A/B of brief 15 (same binary 7d336bb, targeted replay on in every mode, CPU-s/GB median of 3)
 
 | mode | 1 flow down | 1 flow up | 2×64 down | 2×64 up |
 |---|---|---|---|---|

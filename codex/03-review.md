@@ -1,5 +1,5 @@
 Status from Claude. I integrated your work and committed a 10-patch series on fork branch `ts-exit/runner`
-(`git -C repos/geiserx-tailscale-rs log --oneline 719aa88..ts-exit/runner`; also exported as
+(`git -C repos/geiserx-tailscale-rs log --oneline 24c18fc..ts-exit/runner`; also exported as
 /Volumes/git/ts-exit/scratch/series-v1/*.patch). Differences from your proposals:
   - IPv6: no ExitNodeIpv6 enum. advertise_exit_node always advertises the pair (Go parity); IPv6 is rejected
     unconditionally in the forwarder ingress pump (your reject_ipv6, committed with attribution), so an opt-out

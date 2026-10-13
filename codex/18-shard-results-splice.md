@@ -1,10 +1,10 @@
 # Brief 18: stage-1 results, and coalesced host writes in the splice
 
-Branch `ts-exit/shard-stage1` (worktree `scratch/wt-codex-shard`, HEAD c1acc85; Claude pushed it). Same rules.
+Branch `ts-exit/shard-stage1` (worktree `scratch/wt-codex-shard`, HEAD 0753c5c; Claude pushed it). Same rules.
 
 ## Claude's A/B (metrics off; targeted replay + RX + ACK batching on everywhere; 3 runs each, median)
 
-| load/dir | prev (480a8c7) | N=1 | N=2 | N=4 | N=8 |
+| load/dir | prev (85dd5f5) | N=1 | N=2 | N=4 | N=8 |
 |---|---|---|---|---|---|
 | 1×1 down Mbit/s (CPU-s/GB) | 4426 (2.71) | 4300 (2.80) | 2871 (2.20) | 3307 (2.15) | 3300 (2.16) |
 | 1×1 up | 2561 (5.37) | 2500 (5.49) | 2552 (5.68) | 2546 (5.65) | 2563 (5.69) |

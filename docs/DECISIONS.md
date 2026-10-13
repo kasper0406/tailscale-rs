@@ -36,17 +36,17 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   prohibited), matching what a Go exit node does when its IPv6 dial fails: RST. No enum/opt-out (codex proposed
   `ExitNodeIpv6::{Reject,Off}`). With rejection unconditional, the knob would guard nothing.
 - **D7 Fixed (1)**: HostExitDialer refuses loopback/RFC1918/link-local/CGNAT/multicast/broadcast/0/8/class-E
-  for exit flows (`a958192`). Stricter than Go, which re-adds the host's own interface IPs.
+  for exit flows (`824f2d2`). Stricter than Go, which re-adds the host's own interface IPs.
 - **F6 Cold-port loss**: all-port mode dropped the first SYN/datagram per new destination port (3 s smoltcp,
   ~1 s iOS RTO) and copied every packet into a raw socket (~27% throughput). **D8**: replace with an ingress
-  `PortGate` (`47d3cd2`), not codex's reinjection/pinning idea. The gate holds the packet until the listener exists
+  `PortGate` (`417dd29`), not codex's reinjection/pinning idea. The gate holds the packet until the listener exists
   and needs no raw socket. Cold connect went from 3,032 ms to 27 ms (1 RTT) in the bench.
-- **F7 Upstream bug**: `WakingPipeReceiver::try_recv` blocked (`6ff66f4`). Latent in production paths.
+- **F7 Upstream bug**: `WakingPipeReceiver::try_recv` blocked (`99d4474`). Latent in production paths.
 - **F8 Window limit**: no TCP autotuning in the smoltcp netstack. One flow ≈ buffer/RTT (35 Mbit/s at 40 ms with the
   256 KiB default). RSS tracks bytes in flight, not the configured buffer size (BENCHMARKS §1a). **D9**: keep the fork default for
   the live baseline, A/B 2 MiB and 4 MiB via `--tcp-buffer-size`. That's config, not a code patch, so the Phase 1
   "no perf patching" gate holds.
-- **D10 UDP idle** (`938bed4`): refresh flows on replies too, use Go's 2 min / 30 s (port 53) timeouts, and don't
+- **D10 UDP idle** (`af993f6`): refresh flows on replies too, use Go's 2 min / 30 s (port 53) timeouts, and don't
   reap a gated UDP port with live flows.
 - **F9 macOS send path** (`bench/udp-send`): unconnected sendto 7.9 µs/pkt → connected 4.8 → +DF 3.3 →
   +sendmsg_x 1.9. The fork's magicsock uses unconnected `send_to` per packet, plus one buffer allocation, copy and
@@ -56,10 +56,10 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
 
 - **F10 Codex series review** (`docs/codex-03-review.md`) found real lifecycle bugs in the first PortGate manager:
   stale Ready/Exited events across port re-opens, non-atomic reaping, detached listener tasks surviving
-  cancellation, and Opening never timing out. Fixed in `46a2402` with per-port generations, an atomic Closing
+  cancellation, and Opening never timing out. Fixed in `9d21497` with per-port generations, an atomic Closing
   claim, JoinSet ownership and a 10 s open timeout, plus Codex's two probes as regression tests. IPv6 rejections are
-  rate-limited (`d3e10e4`).
-- **D11 Blocker 2 fixed** by Codex's patches (`6bfbbee`, `681cd75`), reviewed and applied by Claude.
+  rate-limited (`d89780d`).
+- **D11 Blocker 2 fixed** by Codex's patches (`83f6076`, `3aba14b`), reviewed and applied by Claude.
 - **F11 macOS delivery check** (`bench/reuseport-check`): with `SO_REUSEPORT`, a socket connected to a peer on the
   shared port receives that peer's datagrams, other senders still reach the wildcard socket, and replies leave
   from the shared port (loopback and en0).
@@ -108,7 +108,7 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   node saturates around 3.4 cores.
 - **F17 Three netstack/forwarder bugs found by the harness**, all fixed with tests: dropped FIN/Close on a
   full command channel (channel now unbounded: requests wait for responses anyway), abandoned receives
-  eating data, and the UDP reaper killing first-millisecond flows (my 938bed4 regression; it broke the
+  eating data, and the UDP reaper killing first-millisecond flows (my af993f6 regression; it broke the
   cold-port gate for UDP). Cherry-picked to `ts-exit/runner` and `perf-connected`; the live node runs them.
 - **D18 Pipeline thread stays opt-in and is not the design.** It saturates at 93% on one download flow
   (1.6 Gbit/s, 2.4× CPU/GB). It wins on upload/many-flow CPU and on latency, so per-shard
@@ -135,7 +135,7 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   Found by instrumenting the harness's intermittent "0 bytes after node restart" stall: the generator
   connected but `accept()` never returned. Handshake resets are routine (Happy Eyeballs, cancelled
   requests, network switches), so this hit real clients too. Fixed with a packet-level regression test
-  (`14402a7`), cherry-picked to `runner`/`perf-connected`. The live node runs it (`bin/exit_node-live3`).
+  (`1cfc018`), cherry-picked to `runner`/`perf-connected`. The live node runs it (`bin/exit_node-live3`).
   Four restart-then-matrix repros were clean (previously this failed in every fresh matrix).
 - **F21 Netstack scan work (codex, `ts-exit/netstack-scans`).** Registry validation: 2 × 64 download
   5.75 → 5.37 CPU-s/GB. Targeted waiter replay (opt-in `TS_EXPERIMENT_TARGETED_REPLAY=1`, smoltcp wakers
@@ -175,7 +175,7 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   `scratch/prof/co4-up-metrics.txt`. **D24**: coalescing joins the candidate defaults (with targeted
   replay and RX batching, pending a live soak). Sharding stays off. Its upload overhead must be profiled
   and fixed before stage 2/3 work.
-- **D25 Consolidate + soak, and keep sharding going (user, 2026-10-13).** `ts-exit/consolidated` (6f93d9f) makes
+- **D25 Consolidate + soak, and keep sharding going (user, 2026-10-13).** `ts-exit/consolidated` (e59e731) makes
   targeted replay, RX batching and splice coalescing default-on (opt out with `=0`). 1,109 tests pass both
   ways, and harness one-flow results match the coalesce run exactly. **It runs as the live node**
   (`bin/exit_node-consolidated`, smoke 6/6) with `runner/soak.sh` logging egress/HTTPS/RSS/CPU every
@@ -192,7 +192,7 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   download gap, and the real generator sits near one core at N=4. So the single-flow loss is likely a
   generator/testbed limit, not the node's. Generator + node + sink use ~6–7 of 10 cores (6 are E-cores), and
   macOS scheduling of extra threads onto E-cores is a likely confounder for the upload CPU/GB as well.
-  Codex was cut off twice by model-capacity errors; Claude verified and committed the remainder (ace33ee).
+  Codex was cut off twice by model-capacity errors; Claude verified and committed the remainder (41631e2).
   **D26**: sharding is not evaluable further on this single Mac. Next evidence needs a remote generator
   and/or a many-core Linux host. Until then sharding stays opt-in and off, and the consolidated N=1 build
   is the product.

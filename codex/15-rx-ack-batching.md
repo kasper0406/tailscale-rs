@@ -1,7 +1,7 @@
 # Brief 15: upload path batching (your C1/C2 from codex-12), opt-in
 
-Worktree `/Volumes/git/ts-exit/scratch/wt-codex-scans`, branch `ts-exit/netstack-scans` (HEAD 64bfe42,
-now pushed; includes Claude's listener-orphan fix 64bfe42). Continue there in new commits, same trailers,
+Worktree `/Volumes/git/ts-exit/scratch/wt-codex-scans`, branch `ts-exit/netstack-scans` (HEAD 12f705c,
+now pushed; includes Claude's listener-orphan fix 12f705c). Continue there in new commits, same trailers,
 `cargo +1.95.0`, format only touched files, no push.
 
 ## Evidence (Claude, harness §4, see docs/DECISIONS.md F20–F22)

@@ -1,6 +1,6 @@
 # Brief 19: find and fix the cross-thread overhead that makes sharded upload expensive
 
-Worktree `scratch/wt-codex-shard`, branch `ts-exit/shard-stage1` (HEAD 179e151, pushed). Same rules.
+Worktree `scratch/wt-codex-shard`, branch `ts-exit/shard-stage1` (HEAD 6ea505a, pushed). Same rules.
 Claude is separately consolidating the N=1 wins on another branch; do not change flag defaults here.
 
 ## Evidence (Claude, harness §4, all with targeted replay + RX + ACK batching on)

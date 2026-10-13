@@ -1,6 +1,6 @@
 New bug found live, reproduced in-process. Please root-cause and fix.
 
-Live: rust-exit (release, ts-exit/runner a91ea74, --tcp-buffer-size 2097152) forwarding a 50 MB HTTPS download to a
+Live: rust-exit (release, ts-exit/runner 5d6b650, --tcp-buffer-size 2097152) forwarding a 50 MB HTTPS download to a
 Go Tailscale 1.88 client over a direct path (~23 ms RTT, phone hotspot). Host socket to Cloudflare had received 45.6 MB
 and then 1.35 MB sat unread in its Recv-Q forever: the overlay TCP leg (smoltcp forwarder socket -> client) stalled.
 With the default 256 KiB buffers the same test ran at ~75 Mbit/s.

@@ -3,7 +3,7 @@
 Design: your `docs/codex-10-sharding-design.md` (conditions 1–7, stage 1 row) and re-rank
 `docs/codex-12-stage0-replan.md`. Measurements so far: `BENCHMARKS.md` §4–§5, `docs/DECISIONS.md` F16–F24.
 
-Worktree/branch: create a new branch `ts-exit/shard-stage1` from `ts-exit/netstack-scans` (HEAD 480a8c7) in a new
+Worktree/branch: create a new branch `ts-exit/shard-stage1` from `ts-exit/netstack-scans` (HEAD 85dd5f5) in a new
 worktree `/Volumes/git/ts-exit/scratch/wt-codex-shard` (`git -C /Volumes/git/ts-exit/repos/geiserx-tailscale-rs
 worktree add -b ts-exit/shard-stage1 ../../scratch/wt-codex-shard ts-exit/netstack-scans`). Same rules as before
 (trailers, `cargo +1.95.0`, touched-file fmt, small reviewable commits, no push).
