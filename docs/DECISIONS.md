@@ -224,3 +224,13 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   upload, but 2 × 8 download is still −6% (disjoint). Coalescing: 1-flow download −4.5% (was −14%) at −9% CPU/GB,
   2 × 8 download +3% with −6% CPU/GB, uploads worse but noisy. **D28**: keep both default-off on Linux (no pure
   win yet); keep the fixed Linux code paths (only active with the flags). Defaults on macOS unchanged.
+- **D29 Branch reorganisation (codex-21, docs/REORG-21.md).** 97 commits → 36 signed-off commits, layered on
+  the real GeiserX `main` (which also undoes the scrub's duplicated, unsigned GeiserX history): `fixes` (13) →
+  `exit-node` (5) → `perf` (12) = `main` → `bench` (4) → `experiments` (2). Every layer builds, passes clippy/fmt
+  and the full suite. `main` is equivalent to the old consolidated + Linux fixes minus experiments: on the Mac
+  harness the old and new node binaries give identical results with the same generator (1-flow 2.87 vs 2.85
+  Gbit/s down, 3.13 vs 3.14 up, same CPU/GB). The live node runs `main` (e909d0b), smoke 6/6, 520–540 Mbit/s
+  through the node vs ~578 direct. Old branches are deleted after `archive/ts-exit/*` tags. Harness note: the node
+  only probes a peer endpoint when it appears or changes in the netmap, and control remembers endpoints across
+  sessions, so `stage0-matrix.sh` now picks fresh peer ports per matrix. Generator builds changed today, so only
+  compare runs made with the same generator binary.

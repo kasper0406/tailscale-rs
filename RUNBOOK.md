@@ -62,16 +62,23 @@ Settings (`runner/env.sh`, overridable via environment): hostname `rust-exit`, t
 WireGuard UDP port 41642 (not the official client's 41641), state `state/rust-exit`.
 Extra runner flags pass through `start.sh`, e.g. `--tcp-buffer-size 2097152` (see BENCHMARKS.md).
 
-Branches: `ts-exit/runner` is the functional exit node. `ts-exit/perf-connected` adds the opt-in macOS
-underlay optimization, and its default behavior is identical. Build whichever is checked out in
-`repos/geiserx-tailscale-rs`. A/B the optimization on the perf build with:
+Branches (github.com/kasper0406/tailscale-rs, layered on GeiserX `main`):
 
-```sh
-TS_DEBUG_MAGICSOCK_CONNECTED_SOCKETS=1 TS_DEBUG_DONT_FRAGMENT=1 runner/start.sh
-```
+| Branch | Contents |
+|---|---|
+| `ts-exit/fixes` | bug/security fixes, upstreamable to GeiserX on their own |
+| `ts-exit/exit-node` | exit-node runner and features (port gate, IPv6 rejection, exit DNS) |
+| `ts-exit/perf` = **`ts-exit/main`** | proven performance work; **this is what runs on the Mac** |
+| `ts-exit/bench` | load generator (`examples/synthetic_peer`), `TS_BENCH_EXIT_REDIRECT`, benchmarks |
+| `ts-exit/experiments` | sharding, pipeline thread, ACK batching, work-budget control, internal reports |
 
-The log then shows `magicsock: connected sockets / DF enabled` at start, and
-`connected socket opened` (debug level) once a peer has carried 1 MiB.
+Old branches are kept as `archive/ts-exit/<name>` tags. Build `ts-exit/main` in `repos/geiserx-tailscale-rs`.
+Benchmark with a `ts-exit/bench` build (the redirect isn't in `main`).
+
+Performance defaults on `main`: targeted waiter replay on everywhere. RX batching and splice coalescing are on
+for Apple only (`TS_EXPERIMENT_RX_BATCH` / `TS_EXPERIMENT_SPLICE_COALESCE`: `=1` forces on, `=0` off). The live
+node also sets `TS_DEBUG_MAGICSOCK_CONNECTED_SOCKETS=1 TS_DEBUG_DONT_FRAGMENT=1 TS_DEBUG_MAGICSOCK_BATCHED_IO=1`
+(Apple underlay optimizations, opt-in).
 
 ## 3. Verify it joined
 

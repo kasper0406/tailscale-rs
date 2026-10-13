@@ -9,11 +9,17 @@ configs=("$@"); (( $#configs )) || configs=(p1f1 p2f1 p2f8 p2f8rtt p2f64)
 pid=$(cat state/rust-exit/exit_node.pid)
 node_bin=$(ps -o command= -p $pid | awk '{print $1}')
 P1=bench/results/stage0/peers1.json; P2=bench/results/stage0/peers.json
+# Fresh endpoint ports per matrix: the node only probes a peer endpoint when it appears/changes in the netmap,
+# and control remembers a peer's last endpoint across sessions, so reusing a port leaves the node on DERP.
+base=$(( 41710 + (RANDOM % 140) * 2 ))
+for f in $P1 $P2; do
+  python3 -c 'import json,sys; b=int(sys.argv[2]); p=json.load(open(sys.argv[1])); [e.update(bind=f"0.0.0.0:{b+i}", advertise=f"192.168.50.76:{b+i}") for i,e in enumerate(p)]; json.dump(p,open(sys.argv[1],"w"),indent=1)' $f $base
+done
 # One control session per peer for the whole matrix, settled before any run (see synthetic_peer hold).
 holders=()
 for i in 1 2; do
   bin/synthetic_peer hold --key-file state/bench-peers/$i/node.key --disco-key-file state/bench-peers/$i/disco.key \
-    --identity-file state/bench-peers/$i/identity.json --advertise 192.168.50.76:4170$i --hostname synthetic-load-$i \
+    --identity-file state/bench-peers/$i/identity.json --advertise 192.168.50.76:$((base+i-1)) --hostname synthetic-load-$i \
     > /dev/null 2>> $out/errors.log &
   holders+=($!)
 done
