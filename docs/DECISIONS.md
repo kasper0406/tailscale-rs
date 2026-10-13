@@ -196,3 +196,18 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   **D26**: sharding is not evaluable further on this single Mac. Next evidence needs a remote generator
   and/or a many-core Linux host. Until then sharding stays opt-in and off, and the consolidated N=1 build
   is the product.
+- **F28 Linux results (kworkstation, Ryzen 9 9950X3D, node pinned to 4 or 8 physical cores of one CCD, generator
+  and sink on the other).** Sharding hurts many-flow upload on Linux too (2 × 64 upload, 8 cores:
+  N=1 3.39 Gbit/s → N=8 1.44), so it isn't just Mac contention. Per-feature attribution (W=8, N=1, two passes):
+  splice coalescing caps a single download flow at ~4.1 Gbit/s (−14% vs off, while saving 18% CPU/GB). RX
+  batching costs 18–27% on many-flow uploads (and 8–10% on downloads when alone). Targeted replay is neutral to
+  positive (+17% on 2 × 64 download). With everything on, the node used ~2 cores vs ~3 with everything off: more
+  efficient but more serialized. **D27**: `ts-exit/consolidated` 3e9ee27 makes RX batching and coalescing
+  default-on only on Apple; targeted replay stays on everywhere; `=1`/`=0` force either way. The Mac is
+  unchanged (primary objective). Root-cause fixes so both become wins on Linux too (parallel decrypt after
+  batched receive; bounded coalescing hold) are queued for codex.
+- **Privacy scrub (2026-10-13).** A home public IP was published in a benchmark CSV (workspace) and as unit-test
+  sample data (a9b583f, `ts_magicsock/src/path.rs`). All 9 `ts-exit/*` branches were rewritten with
+  git-filter-repo (IP → 203.0.113.34) and force-pushed with Kasper's approval; doc hash references were remapped.
+  LAN/tailnet addresses were judged fine (Kasper). GitHub may keep the old commits reachable by SHA until GC.
+  Rule from now on: never commit public IPs; use documentation ranges in tests.
