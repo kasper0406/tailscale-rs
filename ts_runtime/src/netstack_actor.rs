@@ -85,7 +85,11 @@ pub(crate) fn piped_ingress_bounded(
     if budget_experiment() {
         stack.set_work_budget(Some(128));
     }
-    if std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() != Ok("0") {
+    if match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => cfg!(target_vendor = "apple"),
+    } {
         // A continuously refilled pipe must not monopolise the driver. Egress is deliberately
         // unbounded here: a single TCP socket emits only one segment per smoltcp egress pass.
         stack.set_ingress_budget(Some(128));
@@ -292,7 +296,11 @@ impl kameo::Actor for NetstackActor {
         });
 
         env.spawn_packet(&mut joinset, async move {
-            let batching = std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() != Ok("0");
+            let batching = match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
+                Ok("1") => true,
+                Ok("0") => false,
+                _ => cfg!(target_vendor = "apple"),
+            };
             pump_ingress_with_batch_wake(
                 netstack_down,
                 |b| {

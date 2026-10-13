@@ -12,7 +12,13 @@ const COALESCE_BYTES: usize = 128 * 1024;
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("TS_EXPERIMENT_SPLICE_COALESCE").as_deref() != Ok("0"))
+    *ENABLED.get_or_init(
+        || match std::env::var("TS_EXPERIMENT_SPLICE_COALESCE").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => cfg!(target_vendor = "apple"),
+        },
+    )
 }
 
 /// No extra storage: reads fill Tokio's bounded copy buffer. A pending overlay command stays

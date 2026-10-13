@@ -1167,7 +1167,11 @@ impl kameo::Actor for DirectManager {
             .on_packet_runtime(|| {
                 DirectTransport::new(sock.clone()).with_receive_batching(
                     env.packet_runtime.is_some()
-                        || std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() != Ok("0"),
+                        || match std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() {
+                            Ok("1") => true,
+                            Ok("0") => false,
+                            _ => cfg!(target_vendor = "apple"),
+                        },
                 )
             })
             .with_key_lookup(DiscoPeerLookup(peer_db.clone()));
