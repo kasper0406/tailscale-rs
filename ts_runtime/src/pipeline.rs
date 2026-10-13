@@ -12,7 +12,7 @@ pub(crate) const THREAD_NAME: &str = "ts-packet-pipeline";
 pub(crate) struct PipelineThread {
     handle: Handle,
     caller: Handle,
-    stop: Option<oneshot::Sender<()>>,
+    stop: PipelineStop,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -62,9 +62,13 @@ impl PipelineThread {
         Ok(Self {
             handle,
             caller,
-            stop: Some(stop),
+            stop: PipelineStop(std::sync::Arc::new(std::sync::Mutex::new(Some(stop)))),
             thread: Some(thread),
         })
+    }
+
+    pub(crate) fn stop_handle(&self) -> PipelineStop {
+        self.stop.clone()
     }
 
     pub(crate) fn handle(&self) -> Handle {
@@ -72,11 +76,20 @@ impl PipelineThread {
     }
 }
 
-impl Drop for PipelineThread {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
+/// Nonblocking cancellation capability; only the PipelineThread owner joins the OS thread.
+#[derive(Clone)]
+pub(crate) struct PipelineStop(std::sync::Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>);
+impl PipelineStop {
+    pub(crate) fn stop(&self) {
+        if let Some(stop) = self.0.lock().unwrap().take() {
             let _ = stop.send(());
         }
+    }
+}
+
+impl Drop for PipelineThread {
+    fn drop(&mut self) {
+        self.stop.stop();
         if let Some(thread) = self.thread.take() {
             if thread.thread().id() == thread::current().id() {
                 // An inline user capture hook may drop the last Runtime Arc here. We cannot

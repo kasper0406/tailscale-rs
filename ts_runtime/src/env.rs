@@ -229,6 +229,9 @@ pub struct RuntimePrefCells {
 #[derive(Clone)]
 pub struct Env {
     /// Placement handles only: Runtime owns and joins the dedicated thread.
+    pub(crate) forwarder_shards: usize,
+    pub(crate) forwarder_stops: Arc<Vec<crate::pipeline::PipelineStop>>,
+    pub(crate) forwarder_handles: Arc<Vec<tokio::runtime::Handle>>,
     pub(crate) packet_runtime: Option<tokio::runtime::Handle>,
     pub(crate) supervisor_runtime: Option<tokio::runtime::Handle>,
     pub(crate) caller_runtime: Option<tokio::runtime::Handle>,
@@ -485,6 +488,9 @@ impl Env {
         });
 
         let env = Self {
+            forwarder_shards: 1,
+            forwarder_handles: Arc::new(Vec::new()),
+            forwarder_stops: Arc::new(Vec::new()),
             packet_runtime: None,
             supervisor_runtime: None,
             caller_runtime: None,

@@ -113,6 +113,7 @@ impl Default for DatapathActivity {
 #[derive(Clone)]
 pub struct OverlayToDataplane {
     tx: mpsc::UnboundedSender<Vec<PacketMut>>,
+    bounded: Option<mpsc::Sender<Vec<PacketMut>>>,
     activity: DatapathActivity,
 }
 
@@ -126,11 +127,31 @@ impl OverlayToDataplane {
         &self,
         packets: Vec<PacketMut>,
     ) -> Result<(), mpsc::error::SendError<Vec<PacketMut>>> {
-        let sent = self.tx.send(packets);
+        let sent = if let Some(tx) = &self.bounded {
+            tx.try_send(packets)
+                .map_err(|e| mpsc::error::SendError(e.into_inner()))
+        } else {
+            self.tx.send(packets)
+        };
         if sent.is_ok() {
             self.activity.note_send();
         }
         sent
+    }
+
+    pub(crate) async fn send_wait(
+        &self,
+        packets: Vec<PacketMut>,
+    ) -> Result<(), mpsc::error::SendError<Vec<PacketMut>>> {
+        if let Some(tx) = &self.bounded {
+            let sent = tx.send(packets).await;
+            if sent.is_ok() {
+                self.activity.note_send();
+            }
+            sent
+        } else {
+            self.send(packets)
+        }
     }
 
     /// A send half feeding `activity`, paired with its receiver, so a test can drive the real
@@ -139,7 +160,14 @@ impl OverlayToDataplane {
     #[cfg(test)]
     pub(crate) fn for_test(activity: DatapathActivity) -> (Self, OverlayFromDataplane) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Self { tx, activity }, rx)
+        (
+            Self {
+                tx,
+                bounded: None,
+                activity,
+            },
+            rx,
+        )
     }
 }
 
@@ -173,6 +201,7 @@ pub struct PeerDiscoKeyAdvertisement {
 }
 
 pub struct DataplaneActor {
+    forwarder_security: Option<ActorRef<crate::forwarder_actor::ForwarderActor>>,
     dataplane: Arc<ts_dataplane::async_tokio::DataPlane>,
     task: tokio::task::JoinHandle<()>,
     /// Forwards TSMP-learned peer disco keys from the dataplane onto the bus.
@@ -215,10 +244,35 @@ impl DataplaneActor {
             id,
             OverlayToDataplane {
                 tx,
+                bounded: None,
                 activity: self.datapath_activity.clone(),
             },
             rx,
         )
+    }
+
+    #[message]
+    pub async fn bound_forwarder_egress(
+        &self,
+        mut up: OverlayToDataplane,
+    ) -> (OverlayToDataplane,) {
+        up.bounded = Some(self.dataplane.bounded_forwarder_egress(64).await);
+        (up,)
+    }
+
+    /// Install the opt-in authenticated forwarder delivery without changing app transports.
+    #[message]
+    pub async fn authenticated_forwarder(
+        &mut self,
+        id: OverlayTransportId,
+        sink: ts_dataplane::AuthenticatedOverlaySink,
+        forwarder: ActorRef<crate::forwarder_actor::ForwarderActor>,
+        owners: ts_dataplane::ForwarderSourceOwners,
+    ) {
+        self.forwarder_security = Some(forwarder);
+        let dp = &mut *self.dataplane.inner().await;
+        dp.authenticated_overlay = Some((id, sink));
+        dp.forwarder_source_owners = Some(owners);
     }
 
     #[message]
@@ -309,6 +363,7 @@ impl kameo::Actor for DataplaneActor {
         tracing::trace!("dataplane running");
 
         Ok(Self {
+            forwarder_security: None,
             dataplane,
             task,
             disco_key_task,
@@ -354,7 +409,13 @@ impl Message<SelfRouteUpdate> for DataplaneActor {
 impl Message<PacketFilterState> for DataplaneActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: PacketFilterState, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, msg: PacketFilterState, ctx: &mut Context<Self, Self::Reply>) {
+        if let Some(forwarder) = &self.forwarder_security
+            && forwarder.ask(msg.clone()).await.is_err()
+        {
+            ctx.actor_ref().kill();
+            return;
+        }
         {
             let dp = &mut *self.dataplane.inner().await;
             dp.packet_filter = msg.0;
@@ -367,7 +428,13 @@ impl Message<PacketFilterState> for DataplaneActor {
 impl Message<SourceFilterState> for DataplaneActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: SourceFilterState, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, msg: SourceFilterState, ctx: &mut Context<Self, Self::Reply>) {
+        if let Some(forwarder) = &self.forwarder_security
+            && forwarder.ask(msg.clone()).await.is_err()
+        {
+            ctx.actor_ref().kill();
+            return;
+        }
         {
             let dp = &mut *self.dataplane.inner().await;
             dp.src_filter_in = msg.0;

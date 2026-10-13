@@ -28,6 +28,8 @@ pub(crate) fn egress(index: usize, n: usize) {
 /// Cheap cumulative snapshot; array order: app/forwarder and pipeline/security.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
+    /// Per-shard forwarding and bounded-memory counters; empty when sharding/metrics are off.
+    pub forwarder_shards: Vec<crate::forwarder_shards::ShardSnapshot>,
     /// Opt-in kernel receive batch distribution, fallback and truncation counts.
     pub receive: ts_magicsock::ReceiveBatchSnapshot,
     /// Cumulative work across application and forwarder netstacks.
@@ -46,6 +48,7 @@ pub struct Snapshot {
 /// Read counters without actor messaging or hot-path tracing.
 pub fn snapshot() -> Snapshot {
     Snapshot {
+        forwarder_shards: crate::forwarder_shards::snapshots(),
         receive: ts_magicsock::receive_batch_snapshot(),
         netstack: ts_netstack_smoltcp::netcore::pipeline_metrics::snapshot(),
         ingress_drops: core::array::from_fn(|i| DROPS[i].load(Ordering::Relaxed)),

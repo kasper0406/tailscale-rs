@@ -27,11 +27,14 @@ use crate::{
 };
 
 pub struct ForwarderActor {
-    _joinset: JoinSet<()>,
-    channel: Channel,
+    pub(crate) _joinset: JoinSet<()>,
+    pub(crate) ingress_discard: Option<netstack::IngressDiscard>,
+    pub(crate) gate: Option<PortGate>,
+    pub(crate) shards: Option<crate::forwarder_shards::Group>,
+    pub(crate) channel: Channel,
     /// Live handle to swap the forwarder's accept/dial route table at runtime (a
     /// `set_advertise_routes`). New flows see the new set; in-flight flows keep their classification.
-    route_updater: RouteUpdater,
+    pub(crate) route_updater: RouteUpdater,
 }
 
 /// Build a [`Forwarder`] with the given dialer and spawn its run loop onto `joinset`.
@@ -67,17 +70,20 @@ fn spawn_forwarder<D: RealDialer>(
     // push a new `RouteTable` (a runtime `set_advertise_routes`) onto the running forwarder. New
     // flows pick up the change; in-flight flows keep their classification.
     let route_updater = forwarder.route_updater();
-    joinset.spawn(async move {
-        if let Err(e) = forwarder.run().await {
-            tracing::error!(error = %e, "forwarder run loop exited");
-        }
-    });
+    joinset.spawn(ts_forwarder::shard_task(
+        async move {
+            if let Err(e) = forwarder.run().await {
+                tracing::error!(error = %e, "forwarder run loop exited");
+            }
+        },
+        false,
+    ));
     (route_updater, gate)
 }
 
 /// Token bucket for IPv6 rejections (TCP RST / ICMPv6) the forwarder sends back to peers:
 /// [`RejectBudget::PER_SEC`] per second, bursting to the same.
-struct RejectBudget {
+pub(crate) struct RejectBudget {
     tokens: f64,
     last: std::time::Instant,
 }
@@ -85,14 +91,14 @@ struct RejectBudget {
 impl RejectBudget {
     const PER_SEC: f64 = 1000.0;
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tokens: Self::PER_SEC,
             last: std::time::Instant::now(),
         }
     }
 
-    fn take(&mut self) -> bool {
+    pub(crate) fn take(&mut self) -> bool {
         let now = std::time::Instant::now();
         let refill = now.duration_since(self.last).as_secs_f64() * Self::PER_SEC;
         self.tokens = (self.tokens + refill).min(Self::PER_SEC);
@@ -179,16 +185,57 @@ impl kameo::Actor for ForwarderActor {
         (env, config, netstack_up, netstack_down): Self::Args,
         _slf: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
-        let (
-            mut netstack,
-            netstack::WakingPipe {
-                rx: mut netstack_down_rx,
-                tx: netstack_down_tx,
-            },
-        ) = crate::netstack_actor::piped_ingress_bounded(config);
+        if env.forwarder_shards > 1 {
+            return crate::forwarder_shards::Group::start(env, config, netstack_up, _slf).await;
+        }
+        Self::single(
+            env,
+            config,
+            netstack_up,
+            crate::forwarder_shards::Input::Legacy(netstack_down),
+        )
+        .await
+    }
+}
+
+impl ForwarderActor {
+    pub(crate) async fn single(
+        env: Env,
+        config: netstack::netcore::Config,
+        netstack_up: OverlayToDataplane,
+        netstack_down: crate::forwarder_shards::Input,
+    ) -> Result<Self, Error> {
+        let shard_metrics = netstack_down.metrics();
+        if let Some(metrics) = &shard_metrics {
+            metrics.configure(&config);
+        }
+        let sharded = matches!(&netstack_down, crate::forwarder_shards::Input::Shard { .. });
+        let (mut netstack, mut pipe) = crate::netstack_actor::piped_ingress_bounded(config);
+        let egress_queue = if sharded {
+            Some(netstack.bound_egress(&mut pipe, 4096))
+        } else {
+            None
+        };
+        if let Some(metrics) = &shard_metrics {
+            metrics.set_egress_queue(egress_queue);
+        }
+        let netstack::WakingPipe {
+            rx: mut netstack_down_rx,
+            tx: netstack_down_tx,
+        } = pipe;
+        if let Some(metrics) = &shard_metrics {
+            metrics.set_socket_counter(netstack.tcp_socket_counter());
+        }
         if env.packet_runtime.is_some() {
             netstack.set_work_budget(Some(128));
         }
+        let ingress_discard =
+            if matches!(&netstack_down, crate::forwarder_shards::Input::Shard { .. }) {
+                netstack.set_accept_half_closed(true);
+                Some(netstack.ingress_discard_handle())
+            } else {
+                None
+            };
         let channel = netstack.command_channel();
 
         let mut joinset = JoinSet::new();
@@ -199,6 +246,7 @@ impl kameo::Actor for ForwarderActor {
 
         // Pump packets emitted by the forwarder netstack down into the dataplane (out the overlay).
         let reject_up = netstack_up.clone();
+        let output_metrics = shard_metrics.clone();
         let counters = crate::pipeline_metrics::enabled();
         let cooperative =
             env.packet_runtime.is_some() || crate::netstack_actor::budget_experiment();
@@ -217,7 +265,15 @@ impl kameo::Actor for ForwarderActor {
                 if counters {
                     crate::pipeline_metrics::egress(1, batch.len());
                 }
-                if netstack_up.send(batch).is_err() {
+                if let Some(metrics) = &output_metrics {
+                    metrics.out_packets(batch.len());
+                }
+                let sent = if sharded {
+                    netstack_up.send_wait(batch).await
+                } else {
+                    netstack_up.send(batch)
+                };
+                if sent.is_err() {
                     break;
                 }
                 turns += 1;
@@ -340,6 +396,11 @@ impl kameo::Actor for ForwarderActor {
             ),
         };
 
+        if let Some(metrics) = &shard_metrics {
+            metrics.set_gate(gate.clone());
+        }
+        let actor_gate = gate.clone();
+
         // Pump packets the dataplane routed to this transport up into the forwarder netstack,
         // dropping what its bounded ingress queue has no room for. This forwarder dials IPv4 only,
         // so every IPv6 packet is answered here with a TCP RST / ICMPv6 prohibited (or dropped if
@@ -378,18 +439,42 @@ impl kameo::Actor for ForwarderActor {
                     None => pass(b),
                 }
             };
-            crate::netstack_actor::pump_ingress_with_batch_wake(
-                netstack_down,
-                admit,
-                || {
-                    if batching {
-                        netstack_down_tx.notify_receive();
-                    }
-                },
-                "forwarder",
-                cooperative || batching,
-            )
-            .await;
+            match netstack_down {
+                crate::forwarder_shards::Input::Legacy(netstack_down) => {
+                    crate::netstack_actor::pump_ingress_with_batch_wake(
+                        netstack_down,
+                        admit,
+                        || {
+                            if batching {
+                                netstack_down_tx.notify_receive();
+                            }
+                        },
+                        "forwarder",
+                        cooperative || batching,
+                    )
+                    .await;
+                }
+                crate::forwarder_shards::Input::Shard {
+                    packets,
+                    security,
+                    metrics,
+                    owners,
+                } => {
+                    crate::forwarder_shards::pump(
+                        packets,
+                        security,
+                        metrics,
+                        owners,
+                        admit,
+                        || {
+                            if batching {
+                                netstack_down_tx.notify_receive();
+                            }
+                        },
+                    )
+                    .await;
+                }
+            }
 
             tracing::warn!("forwarder netstack uplink shut down!");
         });
@@ -410,6 +495,9 @@ impl kameo::Actor for ForwarderActor {
             _joinset: joinset,
             channel,
             route_updater,
+            shards: None,
+            ingress_discard,
+            gate: actor_gate,
         })
     }
 }
@@ -421,6 +509,16 @@ impl ForwarderActor {
         (self.channel.clone(),)
     }
 
+    #[message]
+    pub fn shard_dispatch(&self) -> Option<ts_dataplane::AuthenticatedOverlaySink> {
+        self.shards.as_ref().map(|group| group.sink.clone())
+    }
+
+    #[message]
+    pub fn shard_ownership(&self) -> Option<ts_dataplane::ForwarderSourceOwners> {
+        self.shards.as_ref().map(|group| group.owners.clone())
+    }
+
     /// Replace the forwarder's accept/dial route table with `routes` (a runtime
     /// `set_advertise_routes`). New flows are classified against the new set; in-flight flows keep
     /// their existing classification. The local half of advertising routes — paired with the wire
@@ -428,7 +526,12 @@ impl ForwarderActor {
     /// granted exactly the prefixes it advertises.
     #[message]
     pub fn update_routes(&self, routes: Vec<ipnet::IpNet>) {
-        self.route_updater.update(RouteTable::new(routes));
+        let routes = RouteTable::new(routes);
+        if let Some(group) = &self.shards {
+            group.update_routes(routes);
+        } else {
+            self.route_updater.update(routes);
+        }
     }
 }
 
