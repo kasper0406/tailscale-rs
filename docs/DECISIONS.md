@@ -175,3 +175,11 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   `scratch/prof/co4-up-metrics.txt`. **D24**: coalescing joins the candidate defaults (with targeted
   replay and RX batching, pending a live soak). Sharding stays off. Its upload overhead must be profiled
   and fixed before stage 2/3 work.
+- **D25 Consolidate + soak, and keep sharding going (user, 2026-10-13).** `ts-exit/consolidated` (6f93d9f) makes
+  targeted replay, RX batching and splice coalescing default-on (opt out with `=0`). 1,109 tests pass both
+  ways, and harness one-flow results match the coalesce run exactly. **It runs as the live node**
+  (`bin/exit_node-consolidated`, smoke 6/6) with `runner/soak.sh` logging egress/HTTPS/RSS/CPU every
+  30 min to `state/soak.log`. Codex brief 19 is attributing sharded upload overhead in parallel. Upstream
+  survey in `docs/UPSTREAM.md`: nobody has done exit-node scaling. The official repo already fixed the
+  listener orphan but still has the FIN-drop, abandoned-receive and global-replay issues. The Go
+  counterpart of our macOS batching is tailscale/tailscale#21487 (open).
