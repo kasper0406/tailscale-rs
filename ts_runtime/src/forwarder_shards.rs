@@ -37,10 +37,17 @@ const QUEUE_PACKETS: usize = 4096;
 const QUEUE_BYTES: usize = 4096 * 1280;
 
 pub(crate) fn count_from_env() -> std::io::Result<usize> {
+    let value = std::env::var_os("TS_EXPERIMENT_FORWARDER_SHARDS")
+        .map(|value| {
+            value.into_string().map_err(|_| {
+                std::io::Error::other(
+                    "TS_EXPERIMENT_FORWARDER_SHARDS must be a UTF-8 integer in 1..=64",
+                )
+            })
+        })
+        .transpose()?;
     count(
-        std::env::var("TS_EXPERIMENT_FORWARDER_SHARDS")
-            .ok()
-            .as_deref(),
+        value.as_deref(),
         std::env::var("TS_EXPERIMENT_PIPELINE_THREAD").as_deref() == Ok("1"),
     )
 }
@@ -370,6 +377,8 @@ pub(crate) async fn pump(
 }
 
 struct Dispatcher {
+    admission: Mutex<()>,
+    failed: tokio::sync::watch::Receiver<bool>,
     selector: Selector,
     exit_dns: bool,
     queues: Vec<Queue>,
@@ -382,7 +391,11 @@ struct Dispatcher {
 }
 impl Dispatcher {
     fn send(&self, peer: PeerId, packets: Vec<PacketMut>) {
-        if self.paused.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
+        let _admission = self.admission.lock().unwrap();
+        if *self.failed.borrow()
+            || self.paused.load(Ordering::Acquire)
+            || self.stopped.load(Ordering::Acquire)
+        {
             return;
         }
         for packet in packets {
@@ -646,6 +659,8 @@ impl Group {
             monitor_actor.kill();
         });
         let dispatcher = Arc::new(Dispatcher {
+            admission: Mutex::new(()),
+            failed: failed.subscribe(),
             selector: Selector::new(n),
             exit_dns: env.forward_exit_egress
                 && env.exit_proxy.is_none()
@@ -696,8 +711,14 @@ impl Group {
         sources: Option<SourceFilterState>,
         filter: Option<PacketFilterState>,
     ) -> Result<(), Error> {
-        self.dispatcher.paused.store(true, Ordering::Release);
-        self.dispatcher.fragments.lock().unwrap().clear();
+        {
+            // Wait for an already-entered authenticated batch before clearing fragment state.
+            // Holding this guard across the pause closes the check-then-admit race; release it
+            // before awaiting any shard so the WG owner never waits on a shard acknowledgement.
+            let _admission = self.dispatcher.admission.lock().unwrap();
+            self.dispatcher.paused.store(true, Ordering::Release);
+            self.dispatcher.fragments.lock().unwrap().clear();
+        }
         // Await every runtime's acknowledgement. A full control queue cannot lose revocations.
         for tx in &self.controls {
             let (ack, rx) = oneshot::channel();
