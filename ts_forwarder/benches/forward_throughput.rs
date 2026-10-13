@@ -23,7 +23,10 @@
 
 use core::net::{Ipv4Addr, SocketAddr};
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -42,6 +45,47 @@ const CHUNK: usize = 64 * 1024;
 
 /// Bytes the loopback server actually received (`up`), to cross-check the sender-side count.
 static SERVER_RX: AtomicU64 = AtomicU64::new(0);
+static QUEUE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Opt-in wire trace: ports and TCP sequence space only, never addresses or payloads.
+fn trace_packet(pkt: &[u8], seed: u64, dropped: bool) {
+    static TRACE: OnceLock<Option<Mutex<(std::fs::File, Instant)>>> = OnceLock::new();
+    let trace = TRACE.get_or_init(|| {
+        std::env::var("TRACE_TCP")
+            .ok()
+            .map(|path| Mutex::new((std::fs::File::create(path).unwrap(), Instant::now())))
+    });
+    let Some(trace) = trace else { return };
+    use smoltcp::wire::{Ipv4Packet, TcpPacket, TcpRepr};
+    let Ok(ip) = Ipv4Packet::new_checked(pkt) else {
+        return;
+    };
+    let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else {
+        return;
+    };
+    let Ok(repr) = TcpRepr::parse(
+        &tcp,
+        &ip.src_addr().into(),
+        &ip.dst_addr().into(),
+        &smoltcp::phy::ChecksumCapabilities::ignored(),
+    ) else {
+        return;
+    };
+    use std::io::Write;
+    let mut guard = trace.lock().unwrap();
+    let ms = guard.1.elapsed().as_secs_f64() * 1000.0;
+    writeln!(
+        guard.0,
+        "{ms:.3} {seed:x} drop={dropped} port={} seq={} ack={:?} len={} win={} sack={:?}",
+        repr.src_port,
+        repr.seq_number,
+        repr.ack_number,
+        repr.payload.len(),
+        repr.window_len,
+        repr.sack_ranges
+    )
+    .unwrap();
+}
 
 /// Relay packets from `rx` to `deliver`, each delivered `delay` after it was received.
 fn spawn_relay(
@@ -74,6 +118,7 @@ fn spawn_relay(
         let mut link_free = tokio::time::Instant::now();
         while let Some(pkt) = rx.recv_async().await {
             if loss > 0.0 && lose() {
+                trace_packet(&pkt, seed, true);
                 continue;
             }
             let now = tokio::time::Instant::now();
@@ -81,12 +126,15 @@ fn spawn_relay(
             if bw_bps > 0.0 {
                 let backlog = link_free.saturating_duration_since(now).as_secs_f64() * bw_bps / 8.0;
                 if backlog + pkt.len() as f64 > queue_bytes {
+                    QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+                    trace_packet(&pkt, seed, true);
                     continue;
                 }
-                link_free = link_free.max(now)
-                    + Duration::from_secs_f64(pkt.len() as f64 * 8.0 / bw_bps);
+                link_free =
+                    link_free.max(now) + Duration::from_secs_f64(pkt.len() as f64 * 8.0 / bw_bps);
                 due = link_free + delay;
             }
+            trace_packet(&pkt, seed, false);
             if q_tx.send((due, pkt)).is_err() {
                 return;
             }
@@ -94,7 +142,7 @@ fn spawn_relay(
     });
     tokio::spawn(async move {
         while let Some((due, pkt)) = q_rx.recv().await {
-            if !delay.is_zero() {
+            if !delay.is_zero() || bw_bps > 0.0 {
                 tokio::time::sleep_until(due).await;
             }
             deliver(&pkt);
@@ -138,7 +186,7 @@ async fn spawn_forwarder(
     loss: f64,
     tcp_buf: Option<usize>,
     mode: Mode,
-    port: u16,
+    ports: Vec<u16>,
 ) -> Channel {
     let mut config = netcore::Config {
         mtu: OVERLAY_MTU,
@@ -167,7 +215,7 @@ async fn spawn_forwarder(
     let into_fwd = b.tx.clone();
     let (forwarder, gate) = match mode {
         Mode::Ports => (
-            Forwarder::new(fwd_ch, routes, LoopbackInternetDialer, vec![port], vec![]),
+            Forwarder::new(fwd_ch, routes, LoopbackInternetDialer, ports, vec![]),
             None,
         ),
         Mode::Raw => (
@@ -252,7 +300,7 @@ async fn spawn_server(down: bool) -> SocketAddr {
     addr
 }
 
-#[tokio::main(flavor = "multi_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let args: Vec<String> = std::env::args()
         .skip(1)
@@ -283,12 +331,26 @@ async fn main() {
         .unwrap_or(0.0);
 
     let server = spawn_server(down).await;
+    let probe_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let probe_addr = probe_server.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = probe_server.accept().await {
+            tokio::spawn(async move {
+                let mut byte = [0];
+                while s.read_exact(&mut byte).await.is_ok() {
+                    if s.write_all(&byte).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
     let peer_ch = spawn_forwarder(
         Duration::from_millis(rtt_ms),
         loss_pct / 100.0,
         tcp_buf_kb.map(|k| k * 1024),
         mode,
-        server.port(),
+        vec![server.port(), probe_addr.port()],
     )
     .await;
 
@@ -316,6 +378,42 @@ async fn main() {
         .map(|v| v.parse::<u64>().expect("VERIFY_MB must be an integer") * 1024 * 1024);
     let start = Instant::now();
     let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(secs);
+    let probe = if std::env::var_os("LATENCY").is_some() {
+        let ch = peer_ch.clone();
+        Some(tokio::spawn(async move {
+            let mut samples = Vec::new();
+            let mut failures = 0;
+            while tokio::time::Instant::now() < deadline {
+                let t = Instant::now();
+                let result = tokio::time::timeout_at(
+                    deadline.min(tokio::time::Instant::now() + Duration::from_secs(3)),
+                    async {
+                        let mut s = ch
+                            .tcp_connect(SocketAddr::new(PEER_IP.into(), 20_000), probe_addr)
+                            .await?;
+                        s.write_all(&[1]).await?;
+                        s.read_exact(&mut [0]).await?;
+                        Ok::<_, std::io::Error>(())
+                    },
+                )
+                .await;
+                if matches!(result, Ok(Ok(()))) {
+                    samples.push(t.elapsed().as_secs_f64() * 1e3);
+                } else {
+                    failures += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            samples.sort_by(f64::total_cmp);
+            let p95 = samples
+                .get(samples.len().saturating_sub(1) * 95 / 100)
+                .copied()
+                .unwrap_or(0.0);
+            (p95, failures)
+        }))
+    } else {
+        None
+    };
     let mut tasks = Vec::new();
     for i in 0..flows {
         let peer_ch = peer_ch.clone();
@@ -334,6 +432,7 @@ async fn main() {
             let mut buf = vec![0u8; CHUNK];
             let mut bytes = 0u64;
             let mut last_progress = Instant::now();
+            let mut max_idle = 0.0_f64;
             while verify_bytes.is_none_or(|target| bytes < target) {
                 let transfer = async {
                     if down {
@@ -346,6 +445,7 @@ async fn main() {
                 match tokio::time::timeout_at(deadline, transfer).await {
                     Ok(Ok(n)) if n > 0 => {
                         bytes += n as u64;
+                        max_idle = max_idle.max(last_progress.elapsed().as_secs_f64());
                         last_progress = Instant::now();
                     }
                     Ok(Ok(_)) | Err(_) => break,
@@ -359,7 +459,7 @@ async fn main() {
                     last_progress.elapsed()
                 );
             }
-            (bytes, last_progress.elapsed().as_secs_f64())
+            (bytes, max_idle.max(last_progress.elapsed().as_secs_f64()))
         }));
     }
     let mut total = 0u64;
@@ -370,9 +470,14 @@ async fn main() {
         stalled_secs = stalled_secs.max(idle);
     }
     let elapsed = start.elapsed().as_secs_f64();
+    let (latency_p95_ms, probe_failures) = match probe {
+        Some(p) => p.await.unwrap(),
+        None => (0.0, 0),
+    };
+    let queue_drops = QUEUE_DROPS.load(Ordering::Relaxed);
     let mbps = |b: u64| b as f64 * 8.0 / elapsed / 1e6;
     println!(
-        "dir={} mode={mode:?} rtt_ms={rtt_ms} loss_pct={loss_pct} tcp_buf_kb={} flows={flows} secs={elapsed:.2} mbps={:.1} server_rx_mbps={:.1} cold_connect_ms={cold_connect_ms:.0} stalled_secs={stalled_secs:.2}",
+        "dir={} mode={mode:?} rtt_ms={rtt_ms} loss_pct={loss_pct} tcp_buf_kb={} flows={flows} secs={elapsed:.2} mbps={:.1} server_rx_mbps={:.1} cold_connect_ms={cold_connect_ms:.0} stalled_secs={stalled_secs:.2} queue_drops={queue_drops} latency_p95_ms={latency_p95_ms:.1} probe_failures={probe_failures}",
         if down { "down" } else { "up" },
         tcp_buf_kb.map_or("default".to_owned(), |k| k.to_string()),
         mbps(total),

@@ -26,6 +26,8 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 
 [dev-dependencies]
+# Cargo unifies this for both bench stacks; avoid the four-hole receiver limit.
+smoltcp = { workspace = true, features = ["assembler-max-segment-count-32"] }
 tokio = { workspace = true, features = ["full"] }
 
 [[bench]]

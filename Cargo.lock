@@ -2093,6 +2093,7 @@ dependencies = [
  "etherparse",
  "geiserx_ts_netstack_smoltcp",
  "ipnet",
+ "smoltcp",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
