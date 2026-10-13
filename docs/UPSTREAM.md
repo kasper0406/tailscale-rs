@@ -62,7 +62,9 @@ the patch, and the patch passes `ts_netstack_smoltcp` + `ts_runtime` + `tailscal
 - tailscale/tailscale-rs#446: socket `Close` on drop is silently lost when the command channel is full
   (default bound 32; no reaper upstream, so it's a permanent leak and no FIN).
 - tailscale/tailscale-rs#447: a cancelled `recv` leaves a blocked command that consumes the next datagram.
-- Comment on #439: `ts_derp/src/dial.rs:172` unwraps `JoinError::Cancelled` during runtime shutdown.
+- (Withdrawn) a comment on #439 about `ts_derp/src/dial.rs` unwrapping `JoinError::Cancelled`: its evidence
+  came from a GeiserX build that included our experimental DERP-dial change, and on official `main` a runtime
+  shutdown drops the waiting parent rather than polling it, so it wasn't a valid report there. Deleted.
 Not filed: global replay cost (a performance improvement, not a bug; better as part of a later write-up);
 listener orphan (already fixed upstream).
 
@@ -75,3 +77,9 @@ second fork, `kasper0406/geiserx-tailscale-rs`.
   Benchmarks: #597 release build vs this PR's production setup on the Mac harness (BENCHMARKS, `pr-*` results):
   1-flow down 0.74 → 3.06 Gbit/s at 24.2 → 1.87 CPU-s/GB; 2 × 8 down 0.65 → 7.51; the base stalled one 2 × 64
   upload flow.
+- Bug-fix PRs to GeiserX (each cut from GeiserX `main`, built and tested alone; also contained in #597):
+  #599 netstack (lost FIN/Close, abandoned receive, reset listener orphan, blocking try_recv), #600 smoltcp RTO
+  backport, #601 peer lifecycle and ordered security updates, #602 netmap state (self-only, Hostinfo, DNS view),
+  #603 exit destination guard, #604 betterAddr.
+- Commit messages on all `ts-exit/*` layers were rewritten (codex-22, trees verified identical) after the reorg
+  had left placeholder bodies. #597/#598 were updated with the same trees.
