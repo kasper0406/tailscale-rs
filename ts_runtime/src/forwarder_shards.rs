@@ -320,8 +320,12 @@ pub(crate) async fn pump(
 ) {
     let mut admission = ts_dataplane::InboundAdmission::default();
     let mut turns = 0;
+    // Revalidation needs a Vec, but each turn pops/discards its sole packet. Keep the
+    // one-packet allocation on this pump rather than allocating and freeing it per packet.
+    let mut batch = Vec::with_capacity(1);
     while let Some(mut queued) = packets.recv().await {
-        let mut batch = vec![queued.packet.take().unwrap()];
+        batch.clear();
+        batch.push(queued.packet.take().unwrap());
         {
             let security_guard = security.lock().unwrap();
             {
