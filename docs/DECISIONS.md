@@ -211,3 +211,8 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   git-filter-repo (IP → 203.0.113.34) and force-pushed with Kasper's approval; doc hash references were remapped.
   LAN/tailnet addresses were judged fine (Kasper). GitHub may keep the old commits reachable by SHA until GC.
   Rule from now on: never commit public IPs; use documentation ranges in tests.
+- **F29 Linux defaults verified (kworkstation, consolidated 3e9ee27, W=8, N=1, 2 passes).** Defaults (replay
+  only) vs all-off: no regression on any load (all within ±1%); 2 × 8 download +4% and 2 × 64 download +21%
+  (disjoint), 2 × 64 upload +18% (overlapping); RX batching confirmed inactive (`kernel_batches` all zero). The
+  single-flow download cap is gone (4.69 vs 4.68 Gbit/s). Upstream issues filed: tailscale-rs#446, #447,
+  plus a comment on #439 (docs/UPSTREAM.md).

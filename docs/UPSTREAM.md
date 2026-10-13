@@ -53,3 +53,15 @@ subnet router, scalability, listener/RST/half-open/FIN.
    and the design (codex-10/12), citing the Go PRs above. Wait until sharding or stage 2 shows a real
    multi-core gain and we have a remote-generator measurement.
 3. Posting is outward-facing: drafts go to the user for approval first.
+
+## Filed (2026-10-13)
+
+CONTRIBUTING says the maintainers aren't taking external PRs without contact first, so we filed issues with
+deterministic repros and verified patches. Each was checked against `main` b44db0d: the repro fails before
+the patch, and the patch passes `ts_netstack_smoltcp` + `ts_runtime` + `tailscale` tests.
+- tailscale/tailscale-rs#446: socket `Close` on drop is silently lost when the command channel is full
+  (default bound 32; no reaper upstream, so it's a permanent leak and no FIN).
+- tailscale/tailscale-rs#447: a cancelled `recv` leaves a blocked command that consumes the next datagram.
+- Comment on #439: `ts_derp/src/dial.rs:172` unwraps `JoinError::Cancelled` during runtime shutdown.
+Not filed: global replay cost (a performance improvement, not a bug; better as part of a later write-up);
+listener orphan (already fixed upstream).
