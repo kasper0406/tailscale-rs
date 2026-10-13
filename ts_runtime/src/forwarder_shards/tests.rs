@@ -5,6 +5,7 @@ use netstack::{CreateSocket, HasChannel, netcore::NetstackControl};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
+mod splice_probe;
 pub(super) fn packet(protocol: u8, src_port: u16, dst_port: u16) -> Vec<u8> {
     let mut b = vec![0; 40];
     b[0] = 0x45;
