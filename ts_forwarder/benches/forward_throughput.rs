@@ -7,7 +7,8 @@
 //! `RTT_MS` inserts a symmetric one-way delay of `RTT_MS / 2` on the overlay pipe, standing in for
 //! the peer's path latency (the forwarder's own egress leg stays on loopback).
 //!
-//! `LOSS_PCT` drops that percentage of overlay packets in each direction.
+//! `LOSS_PCT` drops that percentage of overlay packets in each direction. `BW_MBPS` adds a bottleneck
+//! link of that rate in each direction, fed by a `QUEUE_KB` tail-drop queue (default 128 KiB).
 //!
 //! `FWD_MODE` picks how the forwarder takes ports: `ports` (default; an explicit listener on the
 //! server's port), `raw` (all-port, raw-socket observer) or `gated` (all-port behind the ingress
@@ -58,16 +59,35 @@ fn spawn_relay(
         state ^= state << 17;
         (state >> 11) as f64 / (1u64 << 53) as f64 <= loss
     };
+    // Optional bottleneck: a `BW_MBPS` link fed by a `QUEUE_KB` tail-drop queue (default 128 KiB).
+    let bw_bps: f64 = std::env::var("BW_MBPS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map_or(0.0, |m| m * 1e6);
+    let queue_bytes: f64 = std::env::var("QUEUE_KB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(128.0)
+        * 1024.0;
     let (q_tx, mut q_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
+        let mut link_free = tokio::time::Instant::now();
         while let Some(pkt) = rx.recv_async().await {
             if loss > 0.0 && lose() {
                 continue;
             }
-            if q_tx
-                .send((tokio::time::Instant::now() + delay, pkt))
-                .is_err()
-            {
+            let now = tokio::time::Instant::now();
+            let mut due = now + delay;
+            if bw_bps > 0.0 {
+                let backlog = link_free.saturating_duration_since(now).as_secs_f64() * bw_bps / 8.0;
+                if backlog + pkt.len() as f64 > queue_bytes {
+                    continue;
+                }
+                link_free = link_free.max(now)
+                    + Duration::from_secs_f64(pkt.len() as f64 * 8.0 / bw_bps);
+                due = link_free + delay;
+            }
+            if q_tx.send((due, pkt)).is_err() {
                 return;
             }
         }
