@@ -160,3 +160,10 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   budget control reproduces the regression. Cumulative vs stage 0 in BENCHMARKS §5. **D22**: targeted replay
   and RX batching are the candidate defaults, pending a live laptop/iPad soak. Next build is sharding
   stage 1 on top of `ts-exit/netstack-scans`.
+- **F25 Sharding stage 1 (codex, `ts-exit/shard-stage1`) A/B.** N=1 ≈ previous build (default path intact),
+  no stalls. Only 2 × 64 download improves (N=4: 4.54 → 3.11 CPU-s/GB, 5.06 → 5.68 Gbit/s). Upload CPU/GB
+  roughly doubles by N=8 (2 × 64: 7.88 → 15.36, 3.02 → 2.03 Gbit/s), and single-flow download drops
+  4.30 → 3.3 Gbit/s at N≥2. Profile (N=4 upload): host TCP write syscalls up ~60% at lower throughput,
+  i.e. smaller writes, since each shard writes each segment as it arrives. Single-flow loss is likely the extra
+  hop's latency on a window-limited flow. **D23**: sharding stays opt-in and off. Next is coalesced splice
+  writes (a general win, also at N=1) and a check on the hop latency (codex brief 18) before stage 2/3.
