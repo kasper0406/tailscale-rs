@@ -81,6 +81,11 @@ second fork, `kasper0406/geiserx-tailscale-rs`.
   #599 netstack (lost FIN/Close, abandoned receive, reset listener orphan, blocking try_recv), #600 smoltcp RTO
   backport, #601 peer lifecycle and ordered security updates, #602 netmap state (self-only, Hostinfo, DNS view),
   #603 exit destination guard, #604 betterAddr.
+- GeiserX/tailscale-rs#605 (2026-10-13): key file written owner-only (0600), and an existing key file is
+  tightened on load. From security review 23a/23b; the same weakness exists in official `src/config.rs`
+  (`try_write` uses `tokio::fs::write`). Official reports security issues privately to security@tailscale.com;
+  user judged it hardening: filed publicly as tailscale/tailscale-rs#449 (reproduced on official main b44db0d). The fix is commit `1fe63d2` at the top of `ts-exit/fixes`. It is not
+  in #597/#598, whose branches were not force-pushed.
 - Commit messages on all `ts-exit/*` layers were rewritten (codex-22, trees verified identical) after the reorg
   had left placeholder bodies. #597/#598 were updated with the same trees.
 

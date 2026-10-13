@@ -42,8 +42,10 @@ keeps all state in `/Volumes/git/ts-exit/state/`. Stopping the process is the fu
 /Volumes/git/ts-exit/runner/build.sh
 ```
 
-That runs `cargo build --release --locked --example exit_node` in the fork checkout (branch `ts-exit/main`),
-for `aarch64-apple-darwin`.
+That runs `cargo +1.95.0 build --profile exitnode --locked --features ring-aead --example exit_node` in the fork
+checkout (branch `ts-exit/main`), for `aarch64-apple-darwin`; the binary lands in `target/exitnode/examples/`.
+The live node runs a copy, `bin/exit_node-keyperm` (built 2026-10-13 from `ts-exit/main` 51ee63d); after a manual
+restart, write the new PID to `state/rust-exit/exit_node.pid`, because `runner/soak.sh` reads it.
 
 ## 2. Start / status / stop
 

@@ -3,26 +3,26 @@
   "key_file": "state/bench-peers/1/node.key",
   "disco_key_file": "state/bench-peers/1/disco.key",
   "node_key": "23f7e5019ea1f115651f6314e489f14999550f3f94de96a1e5ef897024b07f19",
-  "node_disco_key": "92aa650242b7cae361da2805d5d6675b0139283b6389772123c26da3ec49ee76",
+  "node_disco_key": "e908e22f57523f84758a9b3f69377e334ab283a301dcafcc4d5c341be6a5b26f",
   "endpoint": "192.168.50.76:41642",
   "source": "100.127.38.40",
   "destination": "198.18.0.1:9000",
   "identity_file": "state/bench-peers/1/identity.json",
-  "bind": "0.0.0.0:41890",
-  "advertise": "192.168.50.76:41890",
+  "bind": "0.0.0.0:41730",
+  "advertise": "192.168.50.76:41730",
   "hostname": "synthetic-load-1"
  },
  {
   "key_file": "state/bench-peers/2/node.key",
   "disco_key_file": "state/bench-peers/2/disco.key",
   "node_key": "23f7e5019ea1f115651f6314e489f14999550f3f94de96a1e5ef897024b07f19",
-  "node_disco_key": "92aa650242b7cae361da2805d5d6675b0139283b6389772123c26da3ec49ee76",
+  "node_disco_key": "e908e22f57523f84758a9b3f69377e334ab283a301dcafcc4d5c341be6a5b26f",
   "endpoint": "192.168.50.76:41642",
   "source": "100.108.232.5",
   "destination": "198.18.0.1:9000",
   "identity_file": "state/bench-peers/2/identity.json",
-  "bind": "0.0.0.0:41891",
-  "advertise": "192.168.50.76:41891",
+  "bind": "0.0.0.0:41731",
+  "advertise": "192.168.50.76:41731",
   "hostname": "synthetic-load-2"
  }
 ]

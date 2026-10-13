@@ -1,7 +1,7 @@
 # Shared settings for the ts-exit runner scripts. Sourced, not executed.
 TS_EXIT_ROOT=/Volumes/git/ts-exit
 TS_EXIT_FORK=$TS_EXIT_ROOT/repos/geiserx-tailscale-rs
-TS_EXIT_BIN=$TS_EXIT_FORK/target/release/examples/exit_node
+TS_EXIT_BIN=$TS_EXIT_FORK/target/exitnode/examples/exit_node
 TS_EXIT_STATE=${TS_EXIT_STATE:-$TS_EXIT_ROOT/state/rust-exit}
 TS_EXIT_KEYFILE=${TS_EXIT_KEYFILE:-$HOME/.config/ts-exit/authkey}
 TS_EXIT_HOSTNAME=${TS_EXIT_HOSTNAME:-rust-exit}
