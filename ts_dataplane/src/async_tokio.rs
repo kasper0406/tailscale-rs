@@ -69,6 +69,7 @@ struct CoreState {
 struct PollState {
     /// Queue for packets entering the data plane ("coming down") from overlay transports.
     from_overlay: DataplaneFromOverlay,
+    from_forwarder: Option<mpsc::Receiver<Vec<PacketMut>>>,
     /// Queue for packets entering the data plane ("coming up") from underlay transports.
     from_underlay: DataplaneFromUnderlay,
 }
@@ -102,9 +103,21 @@ impl DataPlane {
 
             poll_state: Mutex::new(PollState {
                 from_overlay: overlay_down,
+                from_forwarder: None,
                 from_underlay: underlay_up,
             }),
         }
+    }
+
+    /// Install stage-1 bounded shard egress to the same WG/dataplane owner.
+    /// At most `batches` batches are queued; producers must bound batch size too.
+    pub async fn bounded_forwarder_egress(&self, batches: usize) -> mpsc::Sender<Vec<PacketMut>> {
+        let (tx, rx) = mpsc::channel(batches);
+        // Wake step before waiting on its poll lock, which it holds across select.
+        self.transports_changed.notify_one();
+        self.poll_state.lock().await.from_forwarder = Some(rx);
+        self.transports_changed.notify_one();
+        tx
     }
 
     /// Allocate a new underlay transport.
@@ -211,10 +224,14 @@ impl DataPlane {
             let PollState {
                 from_overlay: overlay_down,
                 from_underlay: underlay_up,
+                from_forwarder,
                 ..
             } = &mut *poll_state;
 
             tokio::select! {
+                forwarder = async { from_forwarder.as_mut().unwrap().recv().await }, if from_forwarder.is_some() => {
+                    match forwarder { Some(packets) => SelectResult::OverlayDown(packets), None => { *from_forwarder = None; SelectResult::TransportsChanged } }
+                }
                 overlay_pkts = overlay_down.recv() => {
                     let overlay_pkts = overlay_pkts.unwrap();
                     tracing::trace!(n_overlay_pkts = overlay_pkts.len());
@@ -388,6 +405,34 @@ fn next_wakeup<I: core::ops::Add<core::time::Duration, Output = I> + Copy>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn bounded_forwarder_egress_wakes_poll_owner_and_limits_pending_batches() {
+        let dp = std::sync::Arc::new(super::DataPlane::new(ts_tunnel::NodeKeyPair::new()));
+        let owner = dp.clone();
+        let poll = tokio::spawn(async move {
+            owner.step().await;
+        });
+        tokio::task::yield_now().await;
+        let tx = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dp.bounded_forwarder_egress(2),
+        )
+        .await
+        .unwrap();
+        poll.await.unwrap();
+        tx.try_send(vec![]).unwrap();
+        tx.try_send(vec![]).unwrap();
+        assert!(tx.try_send(vec![]).is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while tx.capacity() == 0 {
+                dp.step().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(tx.try_send(vec![]).is_ok());
+    }
+
     use super::*;
 
     /// The wedge fix, distilled: with no event scheduled, the dataplane must still wake within the
