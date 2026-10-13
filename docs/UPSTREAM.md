@@ -65,3 +65,13 @@ the patch, and the patch passes `ts_netstack_smoltcp` + `ts_runtime` + `tailscal
 - Comment on #439: `ts_derp/src/dial.rs:172` unwraps `JoinError::Cancelled` during runtime shutdown.
 Not filed: global replay cost (a performance improvement, not a bug; better as part of a later write-up);
 listener orphan (already fixed upstream).
+
+## PRs to GeiserX (2026-10-13)
+
+`kasper0406/tailscale-rs` is a fork of the official repo, so PRs to GeiserX (a standalone repo) come from a
+second fork, `kasper0406/geiserx-tailscale-rs`.
+- GeiserX/tailscale-rs#597: exit-node support + fixes (`ts-exit/exit-node` as branch `exit-node`).
+- GeiserX/tailscale-rs#598: data-path performance (`ts-exit/perf` as `exit-node-perf`), stacked on #597.
+  Benchmarks: #597 release build vs this PR's production setup on the Mac harness (BENCHMARKS, `pr-*` results):
+  1-flow down 0.74 → 3.06 Gbit/s at 24.2 → 1.87 CPU-s/GB; 2 × 8 down 0.65 → 7.51; the base stalled one 2 × 64
+  upload flow.
