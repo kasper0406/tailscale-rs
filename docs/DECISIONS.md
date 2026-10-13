@@ -167,3 +167,11 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   i.e. smaller writes, since each shard writes each segment as it arrives. Single-flow loss is likely the extra
   hop's latency on a window-limited flow. **D23**: sharding stays opt-in and off. Next is coalesced splice
   writes (a general win, also at N=1) and a check on the hop latency (codex brief 18) before stage 2/3.
+- **F26 Splice coalescing (codex-18, `TS_EXPERIMENT_SPLICE_COALESCE=1`) at N=1 is a clear download win:**
+  1-flow download 2.79 → 1.92 CPU-s/GB (−31%), 2 × 8 −25%, 2 × 64 −12% with +15% throughput. Upload is neutral.
+  At N=4 it doesn't fix sharded upload (2 × 64 up 13.7 CPU-s/GB vs 7.7 at N=1). An attribution run shows
+  essentially no drops (1 drop in 4.2 M shard packets), so the N>1 upload cost is cross-thread overhead
+  (wakes, the shared WG handoff, small per-shard batches), not loss or write size. Profile:
+  `scratch/prof/co4-up-metrics.txt`. **D24**: coalescing joins the candidate defaults (with targeted
+  replay and RX batching, pending a live soak). Sharding stays off. Its upload overhead must be profiled
+  and fixed before stage 2/3 work.
