@@ -383,13 +383,14 @@ async fn main() {
         Some(tokio::spawn(async move {
             let mut samples = Vec::new();
             let mut failures = 0;
+            let mut probe_port = 20_000;
             while tokio::time::Instant::now() < deadline {
                 let t = Instant::now();
                 let result = tokio::time::timeout_at(
                     deadline.min(tokio::time::Instant::now() + Duration::from_secs(3)),
                     async {
                         let mut s = ch
-                            .tcp_connect(SocketAddr::new(PEER_IP.into(), 20_000), probe_addr)
+                            .tcp_connect(SocketAddr::new(PEER_IP.into(), probe_port), probe_addr)
                             .await?;
                         s.write_all(&[1]).await?;
                         s.read_exact(&mut [0]).await?;
@@ -399,17 +400,23 @@ async fn main() {
                 .await;
                 if matches!(result, Ok(Ok(()))) {
                     samples.push(t.elapsed().as_secs_f64() * 1e3);
-                } else {
+                } else if tokio::time::Instant::now() < deadline {
                     failures += 1;
                 }
+                probe_port += 1;
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             samples.sort_by(f64::total_cmp);
             let p95 = samples
-                .get(samples.len().saturating_sub(1) * 95 / 100)
+                .get((samples.len() * 95).div_ceil(100).saturating_sub(1))
                 .copied()
                 .unwrap_or(0.0);
-            (p95, failures)
+            (
+                p95,
+                samples.last().copied().unwrap_or(0.0),
+                samples.len(),
+                failures,
+            )
         }))
     } else {
         None
@@ -470,14 +477,14 @@ async fn main() {
         stalled_secs = stalled_secs.max(idle);
     }
     let elapsed = start.elapsed().as_secs_f64();
-    let (latency_p95_ms, probe_failures) = match probe {
+    let (latency_p95_ms, latency_max_ms, probe_samples, probe_failures) = match probe {
         Some(p) => p.await.unwrap(),
-        None => (0.0, 0),
+        None => (0.0, 0.0, 0, 0),
     };
     let queue_drops = QUEUE_DROPS.load(Ordering::Relaxed);
     let mbps = |b: u64| b as f64 * 8.0 / elapsed / 1e6;
     println!(
-        "dir={} mode={mode:?} rtt_ms={rtt_ms} loss_pct={loss_pct} tcp_buf_kb={} flows={flows} secs={elapsed:.2} mbps={:.1} server_rx_mbps={:.1} cold_connect_ms={cold_connect_ms:.0} stalled_secs={stalled_secs:.2} queue_drops={queue_drops} latency_p95_ms={latency_p95_ms:.1} probe_failures={probe_failures}",
+        "dir={} mode={mode:?} rtt_ms={rtt_ms} loss_pct={loss_pct} tcp_buf_kb={} flows={flows} secs={elapsed:.2} mbps={:.1} server_rx_mbps={:.1} cold_connect_ms={cold_connect_ms:.0} stalled_secs={stalled_secs:.2} queue_drops={queue_drops} latency_p95_ms={latency_p95_ms:.1} latency_max_ms={latency_max_ms:.1} probe_samples={probe_samples} probe_failures={probe_failures}",
         if down { "down" } else { "up" },
         tcp_buf_kb.map_or("default".to_owned(), |k| k.to_string()),
         mbps(total),
