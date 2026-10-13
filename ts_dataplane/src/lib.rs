@@ -1543,7 +1543,47 @@ impl CapturePath {
 /// it.
 pub type CaptureHook = std::sync::Arc<dyn Fn(CapturePath, &[u8]) + Send + Sync>;
 
-/// Transforms packets to make tailscale happen.
+/// Admission state for rechecking an authenticated packet after a bounded queue handoff.
+/// Uses the same source and ACL rules as initial dataplane admission, including fragment rules.
+#[derive(Default)]
+pub struct InboundAdmission {
+    flows: flowtrack::FlowCache,
+}
+impl InboundAdmission {
+    /// Apply current source ownership and the normal inbound ACL rules.
+    pub fn retain(
+        &mut self,
+        peer: PeerId,
+        packets: &mut Vec<PacketMut>,
+        sources: &ts_bart::Table<PeerId>,
+        filter: &(dyn ts_packetfilter::Filter + Send + Sync),
+    ) {
+        packets.retain(|packet| {
+            packet
+                .get_src_addr()
+                .is_some_and(|ip| sources.lookup(ip) == Some(&peer))
+        });
+        filter_inbound_from_peer(
+            filter,
+            &mut self.flows,
+            peer,
+            packets,
+            RejectConfig {
+                disabled: true,
+                peerapi_port: None,
+            },
+            &mut InboundHarvest::default(),
+        );
+    }
+}
+
+/// Bounded ledger binding reply destination addresses to authenticated forwarder clients.
+pub type ForwarderSourceOwners = Arc<std::sync::Mutex<HashMap<std::net::IpAddr, PeerId>>>;
+
+/// Nonblocking authenticated transport sink.
+pub type AuthenticatedOverlaySink = Arc<dyn Fn(PeerId, Vec<PacketMut>) + Send + Sync>;
+
+/// Transforms packets to make Tailscale happen.
 pub struct DataPlane {
     /// Wireguard encryption/decryption.
     pub wireguard: Endpoint,
@@ -1557,6 +1597,13 @@ pub struct DataPlane {
     pub src_filter_in: Arc<ts_bart::Table<PeerId>>,
     /// Inbound overlay router.
     pub or_in: or::inbound::Router,
+
+    /// Optional authenticated delivery for an opt-in forwarder transport. Runs inline,
+    /// after WG authentication, source validation and ACLs; it must never block.
+    pub authenticated_overlay: Option<(OverlayTransportId, AuthenticatedOverlaySink)>,
+    /// Opt-in forwarding replies remain bound to their authenticated source owner, even
+    /// while the existing source and outbound route consumers apply separate updates.
+    pub forwarder_source_owners: Option<ForwarderSourceOwners>,
 
     /// The packet filter.
     pub packet_filter: Arc<dyn ts_packetfilter::Filter + Send + Sync>,
@@ -1611,6 +1658,8 @@ impl DataPlane {
             ur_out: Default::default(),
             src_filter_in: Default::default(),
             or_in: Default::default(),
+            authenticated_overlay: None,
+            forwarder_source_owners: None,
             events: Default::default(),
             packet_filter: Arc::new(ts_packetfilter::DropAllFilter),
             wg_next: None,
@@ -1662,9 +1711,26 @@ impl DataPlane {
         }
 
         let or::outbound::Result {
-            to_wireguard,
-            loopback,
+            mut to_wireguard,
+            mut loopback,
         } = self.or_out.route(packets);
+
+        if let Some(owners) = &self.forwarder_source_owners {
+            let owners = owners.lock().unwrap();
+            for (peer, packets) in &mut to_wireguard {
+                packets.retain(|p| {
+                    p.get_dst_addr()
+                        .is_some_and(|dst| owners.get(&dst).is_none_or(|owner| owner == peer))
+                });
+            }
+            to_wireguard.retain(|_, packets| !packets.is_empty());
+            for packets in loopback.values_mut() {
+                packets.retain(|p| {
+                    p.get_dst_addr()
+                        .is_some_and(|dst| !owners.contains_key(&dst))
+                });
+            }
+        }
 
         let to_wireguard = to_wireguard
             .into_iter()
@@ -1785,7 +1851,19 @@ impl DataPlane {
                     &mut harvest,
                 );
 
-                v
+                if let Some((target, sink)) = &self.authenticated_overlay {
+                    let mut local = Vec::new();
+                    for (id, packets) in self.or_in.route(v) {
+                        if id == *target {
+                            sink(peer_id, packets);
+                        } else {
+                            local.extend(packets);
+                        }
+                    }
+                    local
+                } else {
+                    v
+                }
             })
             // Forced here rather than left lazy: the TSMP rejected-connection replies the filter
             // stage synthesizes have to be encrypted and merged into `to_peers` below, and that
@@ -5572,6 +5650,122 @@ mod tests {
         assert!(
             take(at_a.to_peers).is_empty(),
             "consuming a reject must put nothing back on the wire"
+        );
+    }
+    #[test]
+    fn authenticated_forwarder_sink_uses_wg_identity_after_acl_and_source_validation() {
+        let (a_key, b_key) = (NodeKeyPair::new(), NodeKeyPair::new());
+        let (mut a, mut b) = (DataPlane::new(a_key.clone()), DataPlane::new(b_key.clone()));
+        let wg_peer = ts_tunnel::PeerId(7);
+        let peer = PeerId(7);
+        for (dp, key) in [(&mut a, b_key.public), (&mut b, a_key.public)] {
+            dp.wireguard.upsert_peer(
+                wg_peer,
+                ts_tunnel::PeerConfig {
+                    key,
+                    psk: [0; 32].into(),
+                    persistent_keepalive_interval: None,
+                },
+            );
+            dp.ur_out.table.insert(peer, UnderlayTransportId(0));
+        }
+        let mut sources = ts_bart::Table::default();
+        sources.insert(
+            ipnet::IpNet::from(std::net::IpAddr::from(IPV4_FIXTURE_SRC)),
+            peer,
+        );
+        b.src_filter_in = Arc::new(sources);
+        b.packet_filter = Arc::new(AllowAll);
+        let mut routes = ts_bart::Table::default();
+        routes.insert(
+            "0.0.0.0/0".parse().unwrap(),
+            or::inbound::RouteAction::ToOverlay(OverlayTransportId(1)),
+        );
+        b.or_in.swap(routes);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        b.authenticated_overlay = Some((
+            OverlayTransportId(1),
+            Arc::new(move |peer, packets| captured.lock().unwrap().push((peer, packets))),
+        ));
+        let syn = v4_packet(6, 0, false, &tcp_header(12345, 443, TCP_SYN));
+        let initial = a
+            .wireguard
+            .send([(wg_peer, vec![syn.clone().into()])])
+            .to_peers
+            .remove(&wg_peer)
+            .unwrap();
+        let take = |p: HashMap<(UnderlayTransportId, PeerId), Vec<PacketMut>>| {
+            p.into_values().flatten().collect::<Vec<_>>()
+        };
+        let response = take(b.process_inbound(initial).to_peers);
+        let data = take(a.process_inbound(response).to_peers);
+        let received = b.process_inbound_from(Some(PeerId(999)), data);
+        assert!(received.to_local.is_empty());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(seen.lock().unwrap()[0].0, peer);
+        assert_eq!(&seen.lock().unwrap()[0].1[0].as_ref()[..syn.len()], &syn);
+        b.packet_filter = Arc::new(DenyAll);
+        let data = a
+            .wireguard
+            .send([(wg_peer, vec![syn.clone().into()])])
+            .to_peers
+            .remove(&wg_peer)
+            .unwrap();
+        b.process_inbound(data);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "ACL rejection precedes dispatch"
+        );
+        b.packet_filter = Arc::new(AllowAll);
+        b.src_filter_in = Arc::new(Default::default());
+        let data = a
+            .wireguard
+            .send([(wg_peer, vec![syn.into()])])
+            .to_peers
+            .remove(&wg_peer)
+            .unwrap();
+        b.process_inbound(data);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "unauthorized source never reaches dispatch"
+        );
+    }
+    #[test]
+    fn forwarded_reply_cannot_follow_an_address_reassignment_to_another_wg_peer() {
+        let mut dp = DataPlane::new(NodeKeyPair::new());
+        let dst = std::net::IpAddr::from(IPV4_FIXTURE_DST);
+        let owners = Arc::new(Mutex::new(HashMap::from([(dst, PeerId(1))])));
+        dp.forwarder_source_owners = Some(owners);
+        let mut routes = ts_bart::Table::default();
+        routes.insert(
+            ipnet::IpNet::from(dst),
+            or::outbound::RouteAction::Wireguard(PeerId(2)),
+        );
+        dp.or_out.swap(routes);
+        let packet = v4_packet(6, 0, false, &tcp_header(443, 12345, TCP_ACK));
+        assert!(
+            dp.process_outbound(vec![packet.clone().into()])
+                .to_peers
+                .is_empty()
+        );
+        assert!(
+            dp.wireguard.next_event().is_none(),
+            "no handshake/staging toward a new owner"
+        );
+        let mut routes = ts_bart::Table::default();
+        routes.insert(
+            ipnet::IpNet::from(dst),
+            or::outbound::RouteAction::Loopback(OverlayTransportId(0)),
+        );
+        dp.or_out.swap(routes);
+        assert!(
+            dp.process_outbound(vec![packet.into()])
+                .loopback
+                .values()
+                .all(Vec::is_empty)
         );
     }
 }
