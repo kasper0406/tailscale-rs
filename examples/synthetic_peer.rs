@@ -842,22 +842,41 @@ async fn peer(
             return Err("expected STOP on stdin".into());
         }
     }
+    // Teardown is best-effort: the transfer was already measured and reported. A connection that
+    // finished long before STOP (peers can complete far apart) may already be fully closed, and
+    // reading it then reports an invalid socket state rather than EOF. Report such problems on
+    // stderr without failing the run.
     if !legacy_stream {
         for mut stream in streams {
             jobs.spawn(async move {
-                stream.shutdown().await?;
+                if let Err(e) = stream.shutdown().await {
+                    eprintln!("teardown: shutdown: {e}");
+                }
                 let mut buf = [0u8; 1024];
-                while stream.read(&mut buf).await? != 0 {}
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("teardown: read after shutdown: {e}");
+                            break;
+                        }
+                    }
+                }
                 Ok::<_, Box<dyn Error + Send + Sync>>((serde_json::Value::Null, stream))
             });
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(closed) = jobs.join_next().await {
-                drop(closed??);
+                if let Err(e) = closed {
+                    eprintln!("teardown: close task failed: {e}");
+                }
             }
-            Ok::<_, Box<dyn Error + Send + Sync>>(())
         })
-        .await??;
+        .await;
+        if drained.is_err() {
+            eprintln!("teardown: connections did not close within 5 s");
+        }
     }
     // Flush the last FIN/ACK after the measured window; never strand remote sockets by immediately
     // dropping the crypto/UDP driver after a fire-and-forget netstack close.
