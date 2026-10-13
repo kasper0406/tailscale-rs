@@ -2,7 +2,7 @@
 //! Environment is read once with `std`; builds without `std` leave counters disabled.
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-static COUNTERS: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+static COUNTERS: [AtomicUsize; 17] = [const { AtomicUsize::new(0) }; 17];
 
 #[derive(Clone, Copy)]
 pub(crate) enum Metric {
@@ -22,6 +22,7 @@ pub(crate) enum Metric {
     IngressBudgetHits,
     EgressPasses,
     EgressBudgetHits,
+    PollDelayScans,
 }
 
 /// All netstacks in the process, cumulative since startup. Read deltas over matched windows.
@@ -59,9 +60,11 @@ pub struct Snapshot {
     pub egress_passes: u64,
     /// Egress passes using all full-budget transmit tokens.
     pub egress_budget_hits: u64,
+    /// Calls to poll_delay, each scanning the socket set.
+    pub poll_delay_scans: u64,
 }
 
-fn from_counts(c: [u64; 16]) -> Snapshot {
+fn from_counts(c: [u64; 17]) -> Snapshot {
     Snapshot {
         replay_attempts: c[0],
         replay_completions: c[1],
@@ -79,6 +82,7 @@ fn from_counts(c: [u64; 16]) -> Snapshot {
         ingress_budget_hits: c[13],
         egress_passes: c[14],
         egress_budget_hits: c[15],
+        poll_delay_scans: c[16],
     }
 }
 
@@ -100,24 +104,48 @@ fn enabled() -> bool {
     false
 }
 
+/// Local netstack counters; useful for attributing work to individual shards.
+#[derive(Clone)]
+pub struct Handle(alloc::sync::Arc<[AtomicUsize; 17]>);
+impl Handle {
+    /// Read cumulative work on one stack.
+    pub fn snapshot(&self) -> Snapshot {
+        from_counts(core::array::from_fn(|i| {
+            self.0[i].load(Ordering::Relaxed) as u64
+        }))
+    }
+}
+
 pub(crate) struct Metrics {
+    local: Option<Handle>,
     enabled: bool,
     #[cfg(test)]
-    counts: [core::cell::Cell<u64>; 16],
+    counts: [core::cell::Cell<u64>; 17],
 }
 impl Metrics {
     pub fn new() -> Self {
         Self {
             enabled: enabled(),
+            local: enabled().then(|| {
+                Handle(alloc::sync::Arc::new(core::array::from_fn(|_| {
+                    AtomicUsize::new(0)
+                })))
+            }),
             #[cfg(test)]
             counts: core::array::from_fn(|_| core::cell::Cell::new(0)),
         }
+    }
+    pub fn handle(&self) -> Option<Handle> {
+        self.local.clone()
     }
     #[inline]
     pub fn record(&self, metric: Metric, n: usize) {
         let i = metric as usize;
         if self.enabled {
             COUNTERS[i].fetch_add(n, Ordering::Relaxed);
+            if let Some(local) = &self.local {
+                local.0[i].fetch_add(n, Ordering::Relaxed);
+            }
         }
         #[cfg(test)]
         self.counts[i].set(self.counts[i].get() + n as u64);

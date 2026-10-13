@@ -119,6 +119,20 @@ impl Netstack<WakingPipeDev> {
             .bound_output(consumer, max_packets, self.dev.mtu)
     }
 
+    /// Try publishing emitted batches synchronously before using the bounded output pipe.
+    /// A failed publication must return the original batch for the ordinary FIFO consumer.
+    /// The caller must preserve FIFO order with that consumer. One device producer only;
+    /// cloned senders keep the ordinary pipe path. Batches contain at most 64 packets.
+    pub fn set_egress_sink(
+        &mut self,
+        sink: impl FnMut(alloc::vec::Vec<bytes::Bytes>) -> Result<(), alloc::vec::Vec<bytes::Bytes>>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        self.dev.pipe.tx.egress_sink = Some(alloc::boxed::Box::new(sink));
+    }
+
     /// Build a handle to discard pending ingress at a security barrier on this runtime.
     /// Feed ingress with individual packets only; see [`IngressDiscard`].
     pub fn ingress_discard_handle(&self) -> IngressDiscard {
@@ -134,6 +148,11 @@ impl Netstack<WakingPipeDev> {
 }
 
 impl<D> Netstack<D> {
+    /// Per-stack counters, available only with pipeline metrics enabled.
+    pub fn metrics_handle(&self) -> Option<netcore::pipeline_metrics::Handle> {
+        self.core.metrics_handle()
+    }
+
     /// Enable this stack's actual TCP socket count for opt-in memory accounting.
     pub fn tcp_socket_counter(&mut self) -> alloc::sync::Arc<core::sync::atomic::AtomicUsize> {
         self.core.tcp_socket_counter()

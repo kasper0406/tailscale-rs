@@ -52,12 +52,15 @@ pub struct WakingPipeReceiver {
     budget: Option<Arc<ByteBudget>>,
 }
 
+type EgressSink = alloc::boxed::Box<dyn FnMut(Vec<Bytes>) -> Result<(), Vec<Bytes>> + Send + Sync>;
+
 /// A [`flume::Sender`] that wakes a remote [`WakingPipeReceiver`] when a message is sent.
 pub struct WakingPipeSender {
     tx: flume::Sender<PipeMessage>,
     // Channel capacity is immutable; avoid flume's capacity mutex on unbounded transmit polls.
     bounded: bool,
     pub(crate) pending_egress: Option<Vec<Bytes>>,
+    pub(crate) egress_sink: Option<EgressSink>,
 
     /// The waker this end of the pipe polls on in `poll_tx`.
     ///
@@ -136,6 +139,7 @@ impl Clone for WakingPipeSender {
             tx: self.tx.clone(),
             bounded: self.bounded,
             pending_egress: None,
+            egress_sink: None,
             self_waker: self.self_waker.clone(),
             remote_waker: self.remote_waker.clone(),
             budget: self.budget.clone(),
@@ -286,6 +290,7 @@ impl WakingPipe {
                     tx: tx1,
                     bounded: egress.is_some(),
                     pending_egress: None,
+                    egress_sink: None,
                     remote_waker: pipe2_rx_waker.clone(),
                     self_waker: pipe1_tx_waker.clone(),
                     budget: None,
@@ -303,6 +308,7 @@ impl WakingPipe {
                     tx: tx2,
                     bounded: ingress.is_some(),
                     pending_egress: None,
+                    egress_sink: None,
                     remote_waker: pipe1_rx_waker,
                     self_waker: pipe2_tx_waker,
                     budget: None,
@@ -469,11 +475,36 @@ impl WakingPipeSender {
                 return;
             }
             let bufs = core::mem::take(pending);
-            if self.tx.send(PipeMessage::Batch(bufs)).is_err() {
-                tracing::warn!("remote end of pipe dropped on batch send");
-            }
-            self.remote_waker.wake();
+            self.publish_egress(bufs);
         }
+    }
+
+    fn publish_egress(&mut self, bufs: Vec<Bytes>) {
+        let bufs = if let Some(sink) = &mut self.egress_sink {
+            let packets = bufs.len();
+            let bytes: usize = bufs.iter().map(Bytes::len).sum();
+            match sink(bufs) {
+                Ok(()) => {
+                    if let Some(budget) = &self.budget {
+                        budget.packets.fetch_sub(packets, Ordering::AcqRel);
+                        budget.queued.fetch_sub(bytes, Ordering::AcqRel);
+                    }
+                    return;
+                }
+                Err(bufs) => bufs,
+            }
+        } else {
+            bufs
+        };
+        if let Err(error) = self.tx.send(PipeMessage::Batch(bufs)) {
+            if let PipeMessage::Batch(bufs) = error.0 {
+                for buf in bufs {
+                    release(&self.budget, buf.len());
+                }
+            }
+            tracing::warn!("remote end of pipe dropped on batch send");
+        }
+        self.remote_waker.wake();
     }
 
     /// Report whether we can currently transmit.
@@ -546,6 +577,10 @@ impl smoltcp::phy::TxToken for &mut WakingPipeSender {
             if pending.len() == 64 {
                 self.flush_egress();
             }
+            return ret;
+        }
+        if self.egress_sink.is_some() {
+            self.publish_egress(alloc::vec![b.freeze()]);
             return ret;
         }
         if self.tx.send(PipeMessage::One(b.freeze())).is_err() {
@@ -715,6 +750,59 @@ mod tests {
             }
             assert!(dev.transmit(Instant::ZERO).is_some());
             while caller.rx.try_recv().is_some() {}
+            assert_eq!(queue.occupancy(), (0, 0));
+        }
+    }
+
+    #[test]
+    fn inline_publication_releases_budget_and_full_sink_uses_bounded_pipe() {
+        use smoltcp::phy::{Device, TxToken};
+        for batching in [false, true] {
+            let (pipe, mut caller) = WakingPipe::unbounded();
+            let mut dev = device(pipe);
+            dev.mtu = 100;
+            let queue = dev.pipe.bound_output(&mut caller, 2, 100);
+            if batching {
+                dev.pipe.tx.pending_egress = Some(Vec::new());
+            }
+            let refuse = Arc::new(core::sync::atomic::AtomicBool::new(false));
+            let count = Arc::new(AtomicUsize::new(0));
+            let closed = refuse.clone();
+            let accepted = count.clone();
+            dev.pipe.tx.egress_sink = Some(alloc::boxed::Box::new(move |bufs| {
+                if closed.load(Ordering::Relaxed) {
+                    Err(bufs)
+                } else {
+                    accepted.fetch_add(bufs.len(), Ordering::Relaxed);
+                    Ok(())
+                }
+            }));
+            for _ in 0..3 {
+                dev.transmit(Instant::ZERO)
+                    .unwrap()
+                    .consume(80, |b| b.fill(1));
+                dev.pipe.tx.flush_egress();
+                assert_eq!(queue.occupancy(), (0, 0));
+                assert!(caller.rx.try_recv().is_none());
+            }
+            assert_eq!(count.load(Ordering::Relaxed), 3);
+            refuse.store(true, Ordering::Relaxed);
+            for n in [2, 3] {
+                dev.transmit(Instant::ZERO)
+                    .unwrap()
+                    .consume(80, |b| b.fill(n));
+            }
+            dev.pipe.tx.flush_egress();
+            assert_eq!(queue.occupancy(), (2, 160));
+            assert!(dev.transmit(Instant::ZERO).is_none());
+            assert_eq!(caller.rx.try_recv().unwrap()[0], 2);
+            assert_eq!(caller.rx.try_recv().unwrap()[0], 3);
+            assert_eq!(queue.occupancy(), (0, 0));
+            // A closed consumer must release even an unsuccessfully published batch's budget.
+            let token = dev.transmit(Instant::ZERO).unwrap();
+            drop(caller);
+            token.consume(80, |b| b.fill(4));
+            dev.pipe.tx.flush_egress();
             assert_eq!(queue.occupancy(), (0, 0));
         }
     }

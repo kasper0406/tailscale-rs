@@ -268,8 +268,14 @@ impl Netstack {
         deadline
     }
 
+    /// Obtain per-stack metrics when TS_DEBUG_PIPELINE_METRICS=1.
+    pub fn metrics_handle(&self) -> Option<pipeline_metrics::Handle> {
+        self.metrics.handle()
+    }
+
     /// Report the amount of time until the netstack should next be polled.
     pub fn poll_delay(&mut self, now: smoltcp::time::Instant) -> Option<core::time::Duration> {
+        self.metrics.record(Metric::PollDelayScans, 1);
         self.poll_at(now).map(|deadline| {
             if deadline > now {
                 (deadline - now).into()

@@ -12,6 +12,9 @@ use ts_tunnel::{Endpoint, NodeKeyPair};
 use ts_underlay_router as ur;
 
 pub mod async_tokio;
+/// Opt-in counters at the bounded shard-to-WG receive seam.
+#[cfg(feature = "async_tokio")]
+pub mod handoff_metrics;
 
 mod flowtrack;
 
