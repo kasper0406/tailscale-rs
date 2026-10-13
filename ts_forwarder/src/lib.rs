@@ -58,6 +58,8 @@ mod forwarder;
 mod ipv6_reject;
 mod port_gate;
 mod shard_resources;
+mod splice;
+pub mod splice_metrics;
 mod tcp;
 mod udp;
 
