@@ -827,8 +827,10 @@ async fn peer(
         "bytes":bytes*flows as u64,"seconds_including_setup":wall,"transfer_seconds":transfer_seconds,"mbit_s":bytes as f64*flows as f64*8.0/transfer_seconds/1e6,"mbit_s_including_setup":bytes as f64*flows as f64*8.0/wall/1e6})
     );
     if wait_for_start {
+        // The orchestrator sends STOP only after every peer has reported, and peers can finish far
+        // apart (uneven upload completion), so wait as long as the transfer itself may take.
         let input = tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(timeout),
             tokio::task::spawn_blocking(|| {
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
