@@ -25,7 +25,7 @@ mod std_clock;
 #[cfg(feature = "tun")]
 mod tun_rs_device;
 
-pub use pipe::{WakingPipe, WakingPipeDev, WakingPipeReceiver, WakingPipeSender};
+pub use pipe::{IngressDiscard, WakingPipe, WakingPipeDev, WakingPipeReceiver, WakingPipeSender};
 pub use run::{run, run_blocking};
 #[cfg(feature = "tun")]
 pub use tun_rs_device::{TunRsDevice, TunRsDeviceAsync};
@@ -109,6 +109,12 @@ pub fn piped_pair(config: netcore::Config) -> (Netstack<WakingPipeDev>, Netstack
 }
 
 impl Netstack<WakingPipeDev> {
+    /// Build a handle to discard pending ingress at a security barrier on this runtime.
+    /// Feed ingress with individual packets only; see [`IngressDiscard`].
+    pub fn ingress_discard_handle(&self) -> IngressDiscard {
+        self.dev.pipe.rx.discard_handle()
+    }
+
     /// Coalesce async poll output in groups of at most 64, flushing before the poll returns.
     /// Use only with the async driver; synchronous device polls do not flush partial batches.
     pub fn set_egress_batching(&mut self, enabled: bool) {
@@ -118,6 +124,11 @@ impl Netstack<WakingPipeDev> {
 }
 
 impl<D> Netstack<D> {
+    /// Accept peer-half-closed sockets after a completed handshake (opt-in).
+    pub fn set_accept_half_closed(&mut self, enabled: bool) {
+        self.core.set_accept_half_closed(enabled);
+    }
+
     /// Limit async work per turn; the async runner cooperatively yields between bounded turns.
     pub fn set_work_budget(&mut self, budget: Option<usize>) {
         self.core.set_work_budget(budget);

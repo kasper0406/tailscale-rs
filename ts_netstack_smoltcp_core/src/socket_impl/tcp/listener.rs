@@ -144,6 +144,10 @@ impl Netstack {
                             tracing::trace!("half-open socket unchanged, re-queueing");
                             true
                         }
+                        tcp::State::CloseWait if self.accept_half_closed => {
+                            listener.accept_queue.push_back(*half_open);
+                            false
+                        }
                         tcp::State::Established => {
                             tracing::trace!("half-open socket ready, moving to accept queue");
                             listener.accept_queue.push_back(*half_open);
@@ -185,6 +189,7 @@ impl Netstack {
                     .entered();
 
                     match state {
+                        tcp::State::CloseWait if self.accept_half_closed => {}
                         tcp::State::Established => {
                             tracing::trace!("accept socket accepted, returning")
                         }
@@ -316,7 +321,10 @@ impl Netstack {
                 listener.half_open_queue.push_back(current);
             }
 
-            tcp::State::Established => {
+            state
+                if state == tcp::State::Established
+                    || (self.accept_half_closed && state == tcp::State::CloseWait) =>
+            {
                 tracing::trace!("connection established");
                 self.enforce_listen_backlog(handle);
                 let listener = self

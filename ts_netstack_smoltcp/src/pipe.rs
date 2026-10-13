@@ -78,6 +78,40 @@ pub struct WakingPipeSender {
     budget: Option<Arc<ByteBudget>>,
 }
 
+/// A security-barrier handle that discards packets still queued for a device.
+/// Use only on the device's runtime, with admission paused. The ingress sender must use
+/// individual packets (including deferred wakes), so no batch is buffered in the receiver.
+#[derive(Clone)]
+pub struct IngressDiscard {
+    rx: flume::Receiver<PipeMessage>,
+    budget: Option<Arc<ByteBudget>>,
+    waker: Arc<AtomicWaker>,
+}
+impl IngressDiscard {
+    /// Drop all pending ingress and release its byte budget; returns packet count.
+    pub fn discard(&self) -> usize {
+        let mut count = 0;
+        while let Ok(message) = self.rx.try_recv() {
+            match message {
+                PipeMessage::One(b) => {
+                    release(&self.budget, b.len());
+                    count += 1;
+                }
+                PipeMessage::Batch(batch) => {
+                    for b in batch {
+                        release(&self.budget, b.len());
+                        count += 1;
+                    }
+                }
+            }
+        }
+        if count > 0 {
+            self.waker.wake();
+        }
+        count
+    }
+}
+
 enum PipeMessage {
     One(Bytes),
     Batch(Vec<Bytes>),
@@ -236,6 +270,14 @@ impl WakingPipe {
 }
 
 impl WakingPipeReceiver {
+    pub(crate) fn discard_handle(&self) -> IngressDiscard {
+        IngressDiscard {
+            rx: self.rx.clone(),
+            budget: self.budget.clone(),
+            waker: self.remote_waker.clone(),
+        }
+    }
+
     /// Receive a packet.
     pub fn recv(&mut self) -> Option<Bytes> {
         if let Some(buf) = self.buffered_rx.next() {
@@ -581,6 +623,19 @@ mod tests {
     }
 
     /// The ingress direction refuses past its packet count, and taking a packet makes room again.
+    #[test]
+    fn security_discard_releases_count_and_byte_limits() {
+        let (device, caller) = WakingPipe::ingress_bounded(2, 80);
+        let discard = device.rx.discard_handle();
+        assert!(caller.tx.try_send_deferred(&[0; 40]));
+        assert!(caller.tx.try_send_deferred(&[0; 40]));
+        assert!(!caller.tx.try_send(&[0]));
+        assert_eq!(discard.discard(), 2);
+        assert_eq!(discard.discard(), 0);
+        assert!(caller.tx.try_send(&[0; 80]));
+        assert_eq!(discard.discard(), 1);
+    }
+
     #[test]
     fn ingress_refuses_past_packet_count() {
         let (dev, caller) = WakingPipe::ingress_bounded(2, usize::MAX);

@@ -60,6 +60,7 @@ const ORPHAN_SWEEP_INTERVAL: smoltcp::time::Duration = smoltcp::time::Duration::
 pub struct Netstack {
     work_budget: Option<usize>,
     ingress_budget: Option<usize>,
+    accept_half_closed: bool,
     ingress_budget_exhausted: bool,
     metrics: Metrics,
     targeted_replay: Option<targeted_replay::TargetedReplay>,
@@ -148,6 +149,7 @@ impl Netstack {
         Netstack {
             work_budget: None,
             ingress_budget: None,
+            accept_half_closed: false,
             ingress_budget_exhausted: false,
             metrics: Metrics::new(),
             targeted_replay: targeted_replay::TargetedReplay::from_env(now),
@@ -272,6 +274,13 @@ impl Netstack {
     pub fn set_ingress_budget(&mut self, budget: Option<usize>) {
         self.ingress_budget = budget.map(|n| n.max(1));
     }
+
+    /// Opt in to accepting a completed handshake even if the peer has already sent FIN.
+    /// Stage-1 shards can consume handshake, request and FIN in one receive turn.
+    pub fn set_accept_half_closed(&mut self, enabled: bool) {
+        self.accept_half_closed = enabled;
+    }
+
     /// Configured receive-only bound.
     pub fn ingress_budget(&self) -> Option<usize> {
         self.ingress_budget
