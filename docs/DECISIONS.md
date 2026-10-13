@@ -234,3 +234,54 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   only probes a peer endpoint when it appears or changes in the netmap, and control remembers endpoints across
   sessions, so `stage0-matrix.sh` now picks fresh peer ports per matrix. Generator builds changed today, so only
   compare runs made with the same generator binary.
+- **F31 Real-world laptop test (2026-10-13, laptop away from home, Wi-Fi, ~23 ms to the node, path verified
+  direct on the node for every valid run).** Results in `bench/results/laptop/` (CPU logs) and below.
+  | run | build | down / up Mbit/s | single flow | idle latency (TCP / TLS / HTTP ms) |
+  |---|---|---|---|---|
+  | A | `ts-exit/main` 51ee63d, 256 KiB | 91 / 105 | 9.0 MB/s | 61 (22 / 106 / 57) |
+  | B | A + no Nagle (smoltcp + host `TCP_NODELAY`) | 97 / 66 | 8.7 MB/s | 46 (22 / 80 / 37) |
+  | C | B + 2 MiB window | 58 / 193 | hung | 62; loaded HTTP 15 s |
+  | D | C + smoltcp Cubic | 48 / 196 | 0.32 MB/s (stalled, node ~0% CPU) | 44; loaded HTTP 22 s |
+  | direct (same session as D) | | 184 / 182 | 20.1 MB/s | 12 (6 / 27 / 4) |
+  Findings: (1) **single flow is window-capped**: 256 KiB / ~29 ms ≈ 9 MB/s, exactly as measured. (2) **Larger
+  windows break the node→client direction on a lossy path**: the smoltcp sender stalls (no SACK; the forwarder's
+  smoltcp is built without any congestion controller, `NoControl`), and Cubic does not fix it, so the stall is in
+  loss recovery, not cwnd. The client→node direction (macOS TCP sender) benefits from the bigger window. (3) **No
+  Nagle** cut TLS by ~25 ms and HTTP by ~20 ms in one run each on a noisy link: plausible, not yet proven. (4)
+  **Restart bug**: after a node restart an already-connected client stays on DERP from the node's side (the
+  client's own `tailscale status` says direct, because its pings reach the node); quitting/reopening the client
+  app (new netmap entry) makes it go direct. Reproduced with the committed build, so it is not caused by B–D.
+  (5) Node CPU at real-world rates is ~20–30 CPU-s/GB (vs 1.9 at multi-Gbit in the harness): batching does not
+  amortise at ~100 Mbit/s. Not a bottleneck (≤ 0.8 core), but worth a profile. The live node is back on A.
+  (6) **Dropped half-open connections:** in run A2 (script run by the laptop session, 19:57 UTC), networkQuality's
+  upload through the node failed with `errSSLClosedNoNotify`; at that moment the node logged `half-open socket in
+  unexpected state, dropping` ×12 (`ts_netstack_smoltcp_core/src/socket_impl/tcp/listener.rs`, the Accept
+  path's `_` arm, which doesn't log the state). Unexplained so far; needs the state logged.
+  Run A2 numbers (laptop now ~230 Mbit/s): single flow 9.3 MB/s exit vs 30 MB/s direct; TLS 82 ms after connect
+  via exit vs 21 ms direct; TTFB 175 vs 73 ms; networkQuality down 82 vs 230 Mbit/s.
+- **D30 Follow-ups from F31 (2026-10-13).** codex-24 (`codex/24-tcp-recovery.md`): smoltcp sender loss recovery,
+  reproduced offline with the new `BW_MBPS`/`QUEUE_KB` bottleneck in forward_throughput (branch
+  `ts-exit/tcp-recovery` ac68a55; 150 Mbit/s, 25 ms: 256 KiB window + 64 KiB queue → 0.9 Mbit/s; 2 MiB + 256 KiB
+  → 0.8 Mbit/s; Cubic the same; random loss ≤ 2% doesn't stall). Source shows a 1 s min RTO doubling to 60 s, no
+  sender use of SACK, go-back-N after fast retransmit. codex-25 (`codex/25-restart-direct.md`): the restart bug.
+  Nagle A/B continues on the laptop via its Remote Control session (Kasper approved the tests there).
+- **F32 Nagle A/B on the laptop (2026-10-13, 4 runs by the laptop's Remote Control session, `run.sh`: 3 single
+  100 MB flows, 5 HTTPS fetches of www.apple.com, networkQuality -s; exit then direct; runs A2 = `A-256k`, B =
+  `B-nonagle`, B2, A3).** TLS time after connect through the node (mean of the 4 warm fetches): Nagle on (A2, A3)
+  82 / 78 ms; Nagle off (B, B2) 60 / 59 ms, and 62 ms in Kasper's manual no-Nagle run earlier; direct 21–23 ms. TTFB
+  improves ~15 ms. Single flow unchanged (window-capped, 8.8–9.8 MB/s vs 22–33 MB/s direct). B's erratic single
+  flows (2.9–9.7 MB/s) coincided with three brief direct→DERP flaps of the node's path; B2 (one brief flap) was
+  steady. The networkQuality upload through the node failed with `errSSLClosedNoNotify` on mensura `/gm/large` in
+  A2 and B2 (both builds) and succeeded in A3 (244 Mbit/s, same as direct): intermittent, cause unknown; A3 ran
+  with forwarder debug + listener trace logging and saw nothing. Verdict: adopt no-Nagle (smoltcp
+  `set_nagle_enabled(false)` + host `TCP_NODELAY`, as Go does) after a LAN throughput/CPU check.
+- **F33 Restart bug fixed (codex-25, 2026-10-13).** Root cause: `MagicSock::emit_disco_pings` returned on the
+  first UDP send error after `send_pings` had stamped every candidate, so one unsendable candidate (likely the
+  laptop's IPv6 endpoint on the IPv4-only socket) starved the rest on every sweep in a stable per-process order.
+  Fix: send each candidate independently, as Go does. Live A/B with `runner/restart-direct-check.sh` (restart the
+  node, time until the node's own status says `path=direct` for the idle laptop), alternating builds: old build
+  TIMEOUT (> 120 s, still DERP) 2/2; fixed build direct in 4.1 / 3.0 / 3.1 s. Release builds compile out debug
+  logs, so the failing candidate itself wasn't observed. Pre-fix, 7 of 7 restarts tonight left the laptop on
+  DERP until its app restarted. Now the top commit of `ts-exit/fixes` (307bf6b; layers restacked: main b78d017);
+  GeiserX PR #606. The live node runs it (`bin/exit_node-restartfix`). Note: `runner/env.sh` defaults
+  `TS_EXIT_TAG=tag:rust-exit`, but the live node is untagged, so run the check with `TS_EXIT_TAG=`.

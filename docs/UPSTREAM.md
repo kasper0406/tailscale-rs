@@ -86,6 +86,10 @@ second fork, `kasper0406/geiserx-tailscale-rs`.
   (`try_write` uses `tokio::fs::write`). Official reports security issues privately to security@tailscale.com;
   user judged it hardening: filed publicly as tailscale/tailscale-rs#449 (reproduced on official main b44db0d). The fix is commit `1fe63d2` at the top of `ts-exit/fixes`. It is not
   in #597/#598, whose branches were not force-pushed.
+- GeiserX/tailscale-rs#606 (2026-10-13): magicsock keeps probing after a candidate send fails (codex-25,
+  `docs/RESTART-DIRECT-25.md`). Root cause of "after a node restart, connected clients stay on DERP". Official
+  tailscale-rs doesn't have this code (different discovery actor), so nothing to report there. On our layers it
+  is the top commit of `ts-exit/fixes` (307bf6b).
 - Commit messages on all `ts-exit/*` layers were rewritten (codex-22, trees verified identical) after the reorg
   had left placeholder bodies. #597/#598 were updated with the same trees.
 
