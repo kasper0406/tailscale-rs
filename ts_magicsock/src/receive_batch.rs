@@ -73,7 +73,7 @@ pub fn snapshot() -> Snapshot {
 }
 
 pub(crate) fn enabled() -> bool {
-    std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1")
+    std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() != Ok("0")
 }
 
 pub(crate) struct Receiver {

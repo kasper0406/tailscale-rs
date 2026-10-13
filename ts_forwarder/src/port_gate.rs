@@ -152,7 +152,7 @@ impl PortGate {
         };
         let inner = Inner {
             ingress,
-            batch_ingress: std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() == Ok("1"),
+            batch_ingress: std::env::var("TS_EXPERIMENT_RX_BATCH").as_deref() != Ok("0"),
             epoch: Instant::now(),
             tcp: vec![closed; 1 << 16],
             udp: vec![closed; 1 << 16],
