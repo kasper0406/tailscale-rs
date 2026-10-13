@@ -111,7 +111,36 @@ pub struct PortGate {
 /// The manager side of a [`PortGate`]: open requests to serve.
 pub(crate) struct OpenRequests(pub(crate) tokio::sync::mpsc::UnboundedReceiver<PortRef>);
 
+/// Memory currently held by one gate, excluding the netstack's socket buffers.
+#[derive(Debug, Clone, Default)]
+pub struct GateSnapshot {
+    /// Listener generations opening, open or closing.
+    pub active_ports: usize,
+    /// Bytes in held packets awaiting listener registration.
+    pub held_bytes: usize,
+    /// Bytes in the two fixed port-state arrays.
+    pub slot_bytes: usize,
+}
 impl PortGate {
+    /// Drop cold-port packets at a security barrier, preserving listener generations.
+    pub fn discard_held(&self) -> usize {
+        let mut inner = self.lock();
+        let count = inner.held.values().map(Vec::len).sum();
+        inner.held.clear();
+        inner.held_bytes = 0;
+        count
+    }
+
+    /// Read this stack's gate occupancy for opt-in diagnostics.
+    pub fn snapshot(&self) -> GateSnapshot {
+        let inner = self.inner.lock().unwrap();
+        GateSnapshot {
+            active_ports: inner.active,
+            held_bytes: inner.held_bytes,
+            slot_bytes: (inner.tcp.len() + inner.udp.len()) * std::mem::size_of::<Slot>(),
+        }
+    }
+
     /// A gate feeding `ingress` (the forwarder netstack's ingress queue), allowing at most
     /// `max_active` ports (TCP and UDP together) to be opening, open or closing at once.
     pub(crate) fn new(ingress: WakingPipeSender, max_active: usize) -> (Self, OpenRequests) {
@@ -421,6 +450,19 @@ mod tests {
 
     fn never_busy(_: Proto, _: u16) -> bool {
         false
+    }
+
+    #[test]
+    fn security_barrier_discards_held_packets_without_reusing_generation() {
+        let (gate, mut requests, mut device) = gate(16);
+        assert_eq!(gate.ingress(&tcp(443, true, false)), Admit::Held);
+        let generation = requests.0.try_recv().unwrap();
+        assert_eq!(gate.discard_held(), 1);
+        assert_eq!(gate.snapshot().held_bytes, 0);
+        assert_eq!(gate.mark_open(generation), 0);
+        assert!(drain(&mut device).is_empty());
+        assert_eq!(gate.ingress(&tcp(443, true, false)), Admit::Passed);
+        assert_eq!(drain(&mut device).len(), 1);
     }
 
     #[test]

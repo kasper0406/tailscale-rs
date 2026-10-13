@@ -80,7 +80,7 @@ const PORT_REAP_INTERVAL: Duration = Duration::from_secs(60);
 /// the per-port cap, so a single port still cannot exceed its own 512 even when the global budget
 /// is free. Sized to the AGENTS.md envelope — ~1000 concurrent TCP flows ≈ ~512 MB — rounded up to
 /// 2048 (a ≈1 GiB ceiling: generous but bounded, and 256× below the old ≈524K/≈256 GiB ceiling).
-const MAX_GLOBAL_TCP_SPLICES: usize = 2048;
+pub(crate) const MAX_GLOBAL_TCP_SPLICES: usize = 2048;
 
 /// Process-wide cap on concurrent UDP flows summed across *all* on-demand ports.
 ///
@@ -89,7 +89,7 @@ const MAX_GLOBAL_TCP_SPLICES: usize = 2048;
 /// port-sweep could materialize ≈524,288 real OS sockets (process-wide fd exhaustion). Set to 2048
 /// to match the TCP ceiling; the per-port 512 still applies underneath so a single port cannot hog
 /// the whole global budget.
-const MAX_GLOBAL_UDP_FLOWS: usize = 2048;
+pub(crate) const MAX_GLOBAL_UDP_FLOWS: usize = 2048;
 
 /// Bookkeeping for one on-demand per-port listener owned by an all-port manager.
 struct PortEntry {
@@ -276,8 +276,14 @@ pub(crate) async fn run_gated_all_ports<D: RealDialer>(
 ) -> Result<(), ts_netstack_smoltcp::netcore::Error> {
     use ts_netstack_smoltcp::netcore::{Error, InternalErrorKind};
 
-    let global_tcp = Arc::new(Semaphore::new(MAX_GLOBAL_TCP_SPLICES));
-    let global_udp = Arc::new(Semaphore::new(MAX_GLOBAL_UDP_FLOWS));
+    let global_tcp = crate::shard_resources::current().map_or_else(
+        || Arc::new(Semaphore::new(MAX_GLOBAL_TCP_SPLICES)),
+        |r| r.admission.tcp,
+    );
+    let global_udp = crate::shard_resources::current().map_or_else(
+        || Arc::new(Semaphore::new(MAX_GLOBAL_UDP_FLOWS)),
+        |r| r.admission.udp,
+    );
     let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<PortRef>();
 
     // The current listener per port: its generation, abort handle and (UDP) live-flow count. A UDP
@@ -302,47 +308,50 @@ pub(crate) async fn run_gated_all_ports<D: RealDialer>(
         let (channel, routes, dialer) = (channel.clone(), routes.clone(), dialer.clone());
         let (global_tcp, global_udp) = (global_tcp.clone(), global_udp.clone());
         let (port_live, ready_tx) = (live_flows.clone(), ready_tx.clone());
-        let abort = tasks.spawn(async move {
-            let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
-            let listener = async move {
-                match proto {
-                    Proto::Tcp => {
-                        run_tcp_port(
-                            channel,
-                            port,
-                            routes,
-                            dialer,
-                            Some(global_tcp),
-                            Some(registered_tx),
-                        )
-                        .await
+        let abort = tasks.spawn(crate::shard_resources::task(
+            async move {
+                let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+                let listener = async move {
+                    match proto {
+                        Proto::Tcp => {
+                            run_tcp_port(
+                                channel,
+                                port,
+                                routes,
+                                dialer,
+                                Some(global_tcp),
+                                Some(registered_tx),
+                            )
+                            .await
+                        }
+                        Proto::Udp => {
+                            run_udp_port(
+                                channel,
+                                port,
+                                routes,
+                                dialer,
+                                Some(global_udp),
+                                Some(registered_tx),
+                                port_live,
+                            )
+                            .await
+                        }
                     }
-                    Proto::Udp => {
-                        run_udp_port(
-                            channel,
-                            port,
-                            routes,
-                            dialer,
-                            Some(global_udp),
-                            Some(registered_tx),
-                            port_live,
-                        )
-                        .await
+                };
+                tokio::pin!(listener);
+                tokio::select! {
+                    biased;
+                    res = &mut listener => return res,
+                    registered = registered_rx => {
+                        if registered.is_ok() {
+                            let _ = ready_tx.send(port_ref);
+                        }
                     }
                 }
-            };
-            tokio::pin!(listener);
-            tokio::select! {
-                biased;
-                res = &mut listener => return res,
-                registered = registered_rx => {
-                    if registered.is_ok() {
-                        let _ = ready_tx.send(port_ref);
-                    }
-                }
-            }
-            listener.await
-        });
+                listener.await
+            },
+            false,
+        ));
         task_ports.insert(abort.id(), port_ref);
         let old = listeners.insert(
             (proto, port),
@@ -388,7 +397,10 @@ pub(crate) async fn run_gated_all_ports<D: RealDialer>(
                     Ok(Err(e)) => tracing::warn!(?proto, %port, error = %e, "all-port listener exited"),
                     Ok(Ok(())) => {}
                     Err(e) if e.is_cancelled() => {}
-                    Err(e) => tracing::error!(?proto, %port, error = %e, "all-port listener panicked"),
+                    Err(e) => {
+                        if let Some(r) = crate::shard_resources::current() { r.failed.send_replace(true); return Ok(()); }
+                        tracing::error!(?proto, %port, error = %e, "all-port listener panicked");
+                    },
                 }
                 if let Some(reopen) = gate.listener_ended(port_ref) {
                     start(reopen, &mut tasks, &mut task_ports, &mut listeners);

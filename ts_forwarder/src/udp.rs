@@ -129,7 +129,7 @@ pub(crate) async fn run_udp_port<D: RealDialer>(
                         // open a NEW flow (fail-closed — no dial, no socket/task) rather than let a
                         // dst-sweep exhaust fds. Existing flows are unaffected; the reaper frees
                         // slots as flows idle out.
-                        if flows.len() >= MAX_UDP_FLOWS {
+                        if flows.len() >= crate::shard_resources::current().map_or(MAX_UDP_FLOWS, |r| r.admission.udp_per_port) {
                             tracing::warn!(
                                 %dst, %peer, max = MAX_UDP_FLOWS,
                                 "drop: at max concurrent udp flows"
@@ -236,7 +236,7 @@ fn spawn_reply_pump(
     last: Arc<AtomicU64>,
     now_ms: impl Fn() -> u64 + Send + 'static,
 ) -> tokio::task::AbortHandle {
-    tokio::spawn(async move {
+    tokio::spawn(crate::shard_resources::task(async move {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
             match real.recv(&mut buf).await {
@@ -252,7 +252,7 @@ fn spawn_reply_pump(
                 }
             }
         }
-    })
+    }, true))
     .abort_handle()
 }
 

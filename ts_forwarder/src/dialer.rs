@@ -411,7 +411,7 @@ impl ProxyExitDialer {
 /// - **Broadcast `255.255.255.255`** — never a legitimate egress target.
 /// - **"This network" `0.0.0.0/8` (RFC 791)** — covers `0.0.0.0/8`, of which `0.0.0.0` (the
 ///   unspecified address) is one; the explicit `is_unspecified` check above is kept for clarity.
-fn exit_dst_is_forbidden(dst: SocketAddr) -> bool {
+pub fn exit_dst_is_forbidden(dst: SocketAddr) -> bool {
     match dst.ip() {
         IpAddr::V4(v4) => {
             let o = v4.octets();
