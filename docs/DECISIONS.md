@@ -216,3 +216,11 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   (disjoint), 2 × 64 upload +18% (overlapping); RX batching confirmed inactive (`kernel_batches` all zero). The
   single-flow download cap is gone (4.69 vs 4.68 Gbit/s). Upstream issues filed: tailscale-rs#446, #447,
   plus a comment on #439 (docs/UPSTREAM.md).
+- **F30 Linux fixes A/B (codex-20, `ts-exit/linux-fixes` 0a70e1b, kworkstation, replay on everywhere, 2 passes).**
+  Codex showed WG decrypt was already serial with RX batching off. The Linux regressions came from bursts:
+  large RX handoffs delay ACK admission, and 128 KiB coalesced download bursts. Fixes (Linux, flag-on only):
+  ≤4-packet RX handoffs with yields; host→overlay reads passed on immediately in ≤16 KiB pieces. Vs the shipping
+  Linux default (replay only): RX now +5.5% and −11% CPU/GB on 2 × 8 upload (was −18%) and −13% CPU/GB on 1-flow
+  upload, but 2 × 8 download is still −6% (disjoint). Coalescing: 1-flow download −4.5% (was −14%) at −9% CPU/GB,
+  2 × 8 download +3% with −6% CPU/GB, uploads worse but noisy. **D28**: keep both default-off on Linux (no pure
+  win yet); keep the fixed Linux code paths (only active with the flags). Defaults on macOS unchanged.
