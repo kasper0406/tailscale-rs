@@ -139,18 +139,67 @@ impl OverlayToDataplane {
         sent
     }
 
-    pub(crate) async fn send_wait(
+    /// Reserve bounded capacity before converting buffers, so failure keeps the original batch.
+    pub(crate) fn try_send_bytes(
+        &self,
+        buffers: Vec<bytes::Bytes>,
+    ) -> Result<(), Vec<bytes::Bytes>> {
+        let Some(tx) = &self.bounded else {
+            return Err(buffers);
+        };
+        let Ok(permit) = tx.try_reserve() else {
+            return Err(buffers);
+        };
+        permit.send(
+            buffers
+                .into_iter()
+                .map(crate::netstack_actor::into_packet)
+                .collect(),
+        );
+        self.activity.note_send();
+        Ok(())
+    }
+
+    pub(crate) async fn send_wait_counted(
         &self,
         packets: Vec<PacketMut>,
+        metrics: Option<&crate::forwarder_shards::Metrics>,
     ) -> Result<(), mpsc::error::SendError<Vec<PacketMut>>> {
         if let Some(tx) = &self.bounded {
-            let sent = tx.send(packets).await;
+            let sent = if let Some(metrics) = metrics {
+                use std::future::Future;
+                let mut send = std::pin::pin!(tx.send(packets));
+                let mut counted = false;
+                std::future::poll_fn(|cx| {
+                    let result = send.as_mut().poll(cx);
+                    if result.is_pending() && tx.capacity() == 0 && !counted {
+                        metrics.wg_wait();
+                        counted = true;
+                    }
+                    result
+                })
+                .await
+            } else {
+                tx.send(packets).await
+            };
             if sent.is_ok() {
                 self.activity.note_send();
             }
             sent
         } else {
             self.send(packets)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_probe(
+        tx: mpsc::UnboundedSender<Vec<PacketMut>>,
+        bounded: Option<mpsc::Sender<Vec<PacketMut>>>,
+    ) -> Self {
+        Self {
+            tx,
+            bounded,
+            activity: DatapathActivity::default(),
         }
     }
 

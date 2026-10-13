@@ -34,6 +34,23 @@ use crate::{
 mod fragments;
 
 const QUEUE_PACKETS: usize = 4096;
+fn treatment() -> [bool; 3] {
+    static ENABLED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("TS_EXPERIMENT_SHARD_BATCH");
+        [
+            matches!(value.as_deref(), Ok("1" | "dispatch")),
+            matches!(value.as_deref(), Ok("1" | "owners")),
+            matches!(value.as_deref(), Ok("1" | "egress")),
+        ]
+    })
+}
+pub(crate) fn batching() -> bool {
+    treatment()[0]
+}
+pub(crate) fn inline_egress() -> bool {
+    treatment()[2]
+}
 const QUEUE_BYTES: usize = 4096 * 1280;
 
 pub(crate) fn count_from_env() -> std::io::Result<usize> {
@@ -129,12 +146,20 @@ fn ipv4(b: &[u8]) -> Option<(IpAddr, IpAddr)> {
     ))
 }
 
-#[derive(Default)]
 pub(crate) struct Metrics {
     index: AtomicUsize,
     packets_in: AtomicU64,
     packets_out: AtomicU64,
     drops: AtomicU64,
+    dispatch_batches: [AtomicU64; 65],
+    ingress_flushes: AtomicU64,
+    dispatcher_receiver: Arc<ts_dataplane::handoff_metrics::ReceiverCounts>,
+    owner_locks: AtomicU64,
+    egress_batches: [AtomicU64; 65],
+    wg_waits: AtomicU64,
+    inline_batches: AtomicU64,
+    pub(crate) host_writes: Arc<ts_forwarder::splice_metrics::Counters>,
+    netstack: Mutex<Option<netstack::netcore::pipeline_metrics::Handle>>,
     queued: AtomicUsize,
     queued_bytes: AtomicUsize,
     peak: AtomicUsize,
@@ -145,9 +170,50 @@ pub(crate) struct Metrics {
     egress_queue: Mutex<Option<netstack::EgressQueue>>,
     ingress_ring_bytes: AtomicUsize,
 }
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            index: AtomicUsize::new(0),
+            packets_in: AtomicU64::new(0),
+            packets_out: AtomicU64::new(0),
+            drops: AtomicU64::new(0),
+            queued: AtomicUsize::new(0),
+            queued_bytes: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            flows: Arc::new(AtomicUsize::new(0)),
+            gate: Mutex::new(None),
+            socket_buffer_bytes: AtomicUsize::new(0),
+            tcp_sockets: Mutex::new(None),
+            egress_queue: Mutex::new(None),
+            ingress_ring_bytes: AtomicUsize::new(0),
+            dispatch_batches: core::array::from_fn(|_| AtomicU64::new(0)),
+            dispatcher_receiver: Arc::new(Default::default()),
+            ingress_flushes: AtomicU64::new(0),
+            owner_locks: AtomicU64::new(0),
+            egress_batches: core::array::from_fn(|_| AtomicU64::new(0)),
+            wg_waits: AtomicU64::new(0),
+            inline_batches: AtomicU64::new(0),
+            host_writes: Arc::new(Default::default()),
+            netstack: Mutex::new(None),
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub struct ShardSnapshot {
     pub index: usize,
+    /// Channel publications by exact packet count; one receiver notification attempt per publication.
+    pub dispatch_batches: [u64; 65],
+    pub dispatcher_receiver: ts_dataplane::handoff_metrics::ReceiverSnapshot,
+    pub ingress_flushes: u64,
+    /// Global ownership ledger locks by the shard pump (WG owner is separate).
+    pub owner_locks: u64,
+    pub egress_batches: [u64; 65],
+    /// Sends returning Pending while the bounded WG mailbox had zero available slots.
+    pub wg_waits: u64,
+    /// Batches published by the stack directly to the bounded WG mailbox.
+    pub inline_batches: u64,
+    pub host_writes: ts_forwarder::splice_metrics::Snapshot,
+    pub netstack: netstack::netcore::pipeline_metrics::Snapshot,
     pub gate: ts_forwarder::GateSnapshot,
     pub tcp_bytes_per_socket: usize,
     pub tcp_sockets: usize,
@@ -184,6 +250,24 @@ pub(crate) fn snapshots() -> Vec<ShardSnapshot> {
                 .as_ref()
                 .map_or((0, 0), netstack::EgressQueue::occupancy);
             ShardSnapshot {
+                dispatcher_receiver: m.dispatcher_receiver.snapshot(),
+                dispatch_batches: core::array::from_fn(|i| {
+                    m.dispatch_batches[i].load(Ordering::Relaxed)
+                }),
+                ingress_flushes: m.ingress_flushes.load(Ordering::Relaxed),
+                owner_locks: m.owner_locks.load(Ordering::Relaxed),
+                egress_batches: core::array::from_fn(|i| {
+                    m.egress_batches[i].load(Ordering::Relaxed)
+                }),
+                wg_waits: m.wg_waits.load(Ordering::Relaxed),
+                inline_batches: m.inline_batches.load(Ordering::Relaxed),
+                host_writes: m.host_writes.snapshot(),
+                netstack: m
+                    .netstack
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map_or_else(Default::default, |h| h.snapshot()),
                 egress_queued,
                 egress_queued_bytes,
                 tcp_sockets,
@@ -210,6 +294,16 @@ pub(crate) fn snapshots() -> Vec<ShardSnapshot> {
         .collect()
 }
 impl Metrics {
+    pub(crate) fn set_netstack(&self, handle: netstack::netcore::pipeline_metrics::Handle) {
+        *self.netstack.lock().unwrap() = Some(handle);
+    }
+    pub(crate) fn inline_batch(&self) {
+        self.inline_batches.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn wg_wait(&self) {
+        self.wg_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn set_egress_queue(&self, queue: Option<netstack::EgressQueue>) {
         *self.egress_queue.lock().unwrap() = queue;
     }
@@ -230,6 +324,7 @@ impl Metrics {
 
     pub(crate) fn out_packets(&self, n: usize) {
         self.packets_out.fetch_add(n as u64, Ordering::Relaxed);
+        self.egress_batches[n.min(64)].fetch_add(1, Ordering::Relaxed);
     }
     fn drop_packet(&self) {
         self.drops.fetch_add(1, Ordering::Relaxed);
@@ -240,6 +335,7 @@ pub(crate) struct Queued {
     packet: Option<PacketMut>,
     length: usize,
     _bytes: OwnedSemaphorePermit,
+    _packet: Option<PacketPermit>,
     metrics: Option<Arc<Metrics>>,
 }
 impl Drop for Queued {
@@ -250,14 +346,95 @@ impl Drop for Queued {
         }
     }
 }
+/// A numeric cap avoids adding another semaphore lock to every batched packet release.
+struct PacketBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+impl PacketBudget {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            used: AtomicUsize::new(0),
+            limit,
+        })
+    }
+    fn acquire(self: &Arc<Self>) -> Option<PacketPermit> {
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                (used < self.limit).then_some(used + 1)
+            })
+            .ok()?;
+        Some(PacketPermit(self.clone()))
+    }
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.limit - self.used.load(Ordering::Relaxed)
+    }
+}
+struct PacketPermit(Arc<PacketBudget>);
+impl Drop for PacketPermit {
+    fn drop(&mut self) {
+        self.0.used.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+pub(crate) enum QueuedBatch {
+    One(Queued),
+    Many(Vec<Queued>),
+}
+impl IntoIterator for QueuedBatch {
+    type Item = Queued;
+    type IntoIter = std::iter::Chain<std::option::IntoIter<Queued>, std::vec::IntoIter<Queued>>;
+    fn into_iter(self) -> Self::IntoIter {
+        let (one, many) = match self {
+            Self::One(p) => (Some(p), Vec::new()),
+            Self::Many(p) => (None, p),
+        };
+        one.into_iter().chain(many)
+    }
+}
 #[derive(Clone)]
 struct Queue {
-    tx: mpsc::Sender<Queued>,
+    tx: mpsc::Sender<QueuedBatch>,
+    packets: Arc<PacketBudget>,
     bytes: Arc<Semaphore>,
     metrics: Option<Arc<Metrics>>,
 }
 impl Queue {
     fn send(&self, peer: PeerId, packet: PacketMut) {
+        let Ok(slot) = self.tx.try_reserve() else {
+            if let Some(m) = &self.metrics {
+                m.drop_packet();
+            }
+            return;
+        };
+        if let Some(queued) = self.prepare(peer, packet, false) {
+            if let Some(m) = &self.metrics {
+                m.dispatch_batches[1].fetch_add(1, Ordering::Relaxed);
+            }
+            slot.send(QueuedBatch::One(queued));
+        }
+    }
+    fn send_batch(&self, peer: PeerId, packets: Vec<PacketMut>) {
+        let Ok(slot) = self.tx.try_reserve() else {
+            if let Some(m) = &self.metrics {
+                m.drops.fetch_add(packets.len() as u64, Ordering::Relaxed);
+            }
+            return;
+        };
+        let mut batch = Vec::with_capacity(packets.len());
+        for packet in packets {
+            if let Some(queued) = self.prepare(peer, packet, true) {
+                batch.push(queued);
+            }
+        }
+        if !batch.is_empty() {
+            if let Some(m) = &self.metrics {
+                m.dispatch_batches[batch.len().min(64)].fetch_add(1, Ordering::Relaxed);
+            }
+            slot.send(QueuedBatch::Many(batch));
+        }
+    }
+    fn prepare(&self, peer: PeerId, packet: PacketMut, bound_packets: bool) -> Option<Queued> {
         let n = packet.as_ref().len();
         let bytes = u32::try_from(n)
             .ok()
@@ -266,33 +443,39 @@ impl Queue {
             if let Some(m) = &self.metrics {
                 m.drop_packet();
             }
-            return;
+            return None;
         };
-        let Ok(slot) = self.tx.try_reserve() else {
-            if let Some(m) = &self.metrics {
-                m.drop_packet();
-            }
-            return;
+        let packet_slot = if bound_packets {
+            let Some(slot) = self.packets.acquire() else {
+                if let Some(m) = &self.metrics {
+                    m.drop_packet();
+                }
+                return None;
+            };
+            Some(slot)
+        } else {
+            None
         };
         if let Some(m) = &self.metrics {
             let queued = m.queued.fetch_add(1, Ordering::Relaxed) + 1;
             m.queued_bytes.fetch_add(n, Ordering::Relaxed);
             m.peak.fetch_max(queued, Ordering::Relaxed);
         }
-        slot.send(Queued {
+        Some(Queued {
             peer,
             packet: Some(packet),
             length: n,
             _bytes: bytes,
+            _packet: packet_slot,
             metrics: self.metrics.clone(),
-        });
+        })
     }
 }
 
 pub(crate) enum Input {
     Legacy(OverlayFromDataplane),
     Shard {
-        packets: mpsc::Receiver<Queued>,
+        packets: mpsc::Receiver<QueuedBatch>,
         security: Arc<Mutex<Security>>,
         metrics: Option<Arc<Metrics>>,
         owners: Arc<Mutex<HashMap<IpAddr, PeerId>>>,
@@ -311,7 +494,7 @@ pub(crate) struct Security {
     filter: PacketFilterState,
 }
 pub(crate) async fn pump(
-    mut packets: mpsc::Receiver<Queued>,
+    mut packets: mpsc::Receiver<QueuedBatch>,
     security: Arc<Mutex<Security>>,
     metrics: Option<Arc<Metrics>>,
     owners: Arc<Mutex<HashMap<IpAddr, PeerId>>>,
@@ -323,58 +506,90 @@ pub(crate) async fn pump(
     // Revalidation needs a Vec, but each turn pops/discards its sole packet. Keep the
     // one-packet allocation on this pump rather than allocating and freeing it per packet.
     let mut batch = Vec::with_capacity(1);
-    while let Some(mut queued) = packets.recv().await {
-        batch.clear();
-        batch.push(queued.packet.take().unwrap());
-        {
-            let security_guard = security.lock().unwrap();
+    let mut known_owners = HashMap::new();
+    let cache_owners = treatment()[1];
+    let mut probe = metrics
+        .as_ref()
+        .map(|m| ts_dataplane::handoff_metrics::ReceiverProbe::new(m.dispatcher_receiver.clone()));
+    while let Some(queued_batch) = std::future::poll_fn(|cx| match &mut probe {
+        Some(probe) => probe.poll_recv(&mut packets, cx),
+        None => packets.poll_recv(cx),
+    })
+    .await
+    {
+        for mut queued in queued_batch {
+            batch.clear();
+            batch.push(queued.packet.take().unwrap());
             {
-                let security = &*security_guard;
-                admission.retain(
-                    queued.peer,
-                    &mut batch,
-                    &security.sources.0,
-                    security.filter.0.as_ref(),
-                );
-            }
-            if let Some(packet) = batch.pop() {
-                if let Some(src) = packet.get_src_addr() {
-                    // Bounded ownership ledger; a security barrier checks it before acknowledging.
-                    let mut owners = owners.lock().unwrap();
-                    if owners.len() >= 8192 && !owners.contains_key(&src) {
-                        if let Some(m) = &metrics {
-                            m.drop_packet();
-                        }
-                        continue;
-                    }
-                    if owners.get(&src).is_some_and(|peer| *peer != queued.peer) {
-                        if let Some(m) = &metrics {
-                            m.drop_packet();
-                        }
-                        continue;
-                    }
-                    owners.insert(src, queued.peer);
-                }
-                if let Some(m) = &metrics {
-                    m.packets_in.fetch_add(1, Ordering::Relaxed);
-                }
-                if !admit(packet.as_ref())
-                    && let Some(m) = &metrics
+                let security_guard = security.lock().unwrap();
                 {
+                    let security = &*security_guard;
+                    admission.retain(
+                        queued.peer,
+                        &mut batch,
+                        &security.sources.0,
+                        security.filter.0.as_ref(),
+                    );
+                }
+                if let Some(packet) = batch.pop() {
+                    if let Some(src) = packet.get_src_addr() {
+                        // Bounded ownership ledger; a security barrier checks it before acknowledging.
+                        if !cache_owners || known_owners.get(&src) != Some(&queued.peer) {
+                            if let Some(m) = &metrics {
+                                m.owner_locks.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let mut owners = owners.lock().unwrap();
+                            if owners.len() >= 8192 && !owners.contains_key(&src) {
+                                if let Some(m) = &metrics {
+                                    m.drop_packet();
+                                }
+                                continue;
+                            }
+                            if owners.get(&src).is_some_and(|peer| *peer != queued.peer) {
+                                if let Some(m) = &metrics {
+                                    m.drop_packet();
+                                }
+                                continue;
+                            }
+                            owners.insert(src, queued.peer);
+                            // This ledger only grows. Source removal/reassignment stops the
+                            // whole group before acknowledgement; ACL/source checks above still
+                            // run for every packet, including cache hits after a barrier.
+                            if cache_owners {
+                                known_owners.insert(src, queued.peer);
+                            }
+                        }
+                    }
+                    if let Some(m) = &metrics {
+                        m.packets_in.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if !admit(packet.as_ref())
+                        && let Some(m) = &metrics
+                    {
+                        m.drop_packet();
+                    }
+                } else if let Some(m) = &metrics {
                     m.drop_packet();
                 }
-            } else if let Some(m) = &metrics {
-                m.drop_packet();
+            }
+            drop(queued);
+            turns += 1;
+            if turns == 128 {
+                if let Some(m) = &metrics {
+                    m.ingress_flushes.fetch_add(1, Ordering::Relaxed);
+                }
+                flush();
+            }
+            if turns == 128 {
+                turns = 0;
+                tokio::task::yield_now().await;
             }
         }
-        drop(queued);
-        turns += 1;
-        if turns == 128 || packets.is_empty() {
+        if packets.is_empty() {
+            if let Some(m) = &metrics {
+                m.ingress_flushes.fetch_add(1, Ordering::Relaxed);
+            }
             flush();
-        }
-        if turns == 128 {
-            turns = 0;
-            tokio::task::yield_now().await;
         }
     }
     flush();
@@ -402,6 +617,12 @@ impl Dispatcher {
         {
             return;
         }
+        let batched = batching();
+        let mut batches: Vec<Vec<PacketMut>> = if batched {
+            (0..self.queues.len()).map(|_| Vec::new()).collect()
+        } else {
+            Vec::new()
+        };
         for packet in packets {
             let bytes = packet.as_ref();
             if bytes.first().is_some_and(|v| v >> 4 == 6) {
@@ -431,7 +652,19 @@ impl Dispatcher {
                 continue;
             }
             if let Some(owner) = self.selector.owner(peer, packet.as_ref()) {
-                self.queues[owner].send(peer, packet);
+                if batched {
+                    batches[owner].push(packet);
+                    if batches[owner].len() == 64 {
+                        self.queues[owner].send_batch(peer, std::mem::take(&mut batches[owner]));
+                    }
+                } else {
+                    self.queues[owner].send(peer, packet);
+                }
+            }
+        }
+        for (queue, batch) in self.queues.iter().zip(batches) {
+            if !batch.is_empty() {
+                queue.send_batch(peer, batch);
             }
         }
     }
@@ -548,6 +781,7 @@ impl Group {
             let (tx, packets) = mpsc::channel(QUEUE_PACKETS);
             queues.push(Queue {
                 tx,
+                packets: PacketBudget::new(QUEUE_PACKETS),
                 bytes: Arc::new(Semaphore::new(QUEUE_BYTES)),
                 metrics: metrics.clone(),
             });
@@ -570,6 +804,7 @@ impl Group {
             let resources = ShardResources {
                 admission: limits.clone(),
                 failed: failed.clone(),
+                host_writes: metrics.as_ref().map(|m| m.host_writes.clone()),
                 flows: metrics.map(|m| m.flows.clone()),
             };
             let config = config.clone();

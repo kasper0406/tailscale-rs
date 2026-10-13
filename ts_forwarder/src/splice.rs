@@ -22,6 +22,7 @@ struct Io<T> {
     drain: bool,
     eof: bool,
     host_metrics: bool,
+    shard_metrics: Option<std::sync::Arc<crate::splice_metrics::Counters>>,
 }
 impl<T> Io<T> {
     fn new(inner: T, drain: bool, host_metrics: bool) -> Self {
@@ -30,6 +31,11 @@ impl<T> Io<T> {
             drain,
             eof: false,
             host_metrics,
+            shard_metrics: if host_metrics {
+                crate::shard_resources::current().and_then(|r| r.host_writes)
+            } else {
+                None
+            },
         }
     }
 }
@@ -77,6 +83,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Io<T> {
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
         if self.host_metrics {
             crate::splice_metrics::record(&result, buf.len());
+            if let Some(m) = &self.shard_metrics {
+                m.record(&result, buf.len());
+            }
         }
         result
     }

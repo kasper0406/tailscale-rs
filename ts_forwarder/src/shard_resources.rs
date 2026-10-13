@@ -45,6 +45,8 @@ pub struct ShardResources {
     pub failed: watch::Sender<bool>,
     /// Optional count of active TCP splices and UDP reply pumps.
     pub flows: Option<Arc<AtomicUsize>>,
+    /// Optional host-write attribution scoped to this shard.
+    pub host_writes: Option<Arc<crate::splice_metrics::Counters>>,
 }
 tokio::task_local! { static RESOURCES: ShardResources; }
 impl ShardResources {
@@ -106,6 +108,7 @@ mod tests {
                     admission: admission.clone(),
                     failed: failed.clone(),
                     flows: None,
+                    host_writes: None,
                 };
                 held.push(
                     r.scope(async {
@@ -134,6 +137,7 @@ mod tests {
             admission: ShardAdmission::new(4),
             failed,
             flows: Some(flows.clone()),
+            host_writes: None,
         };
         let task = resources
             .scope(async {

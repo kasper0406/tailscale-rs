@@ -31,6 +31,41 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("TS_DEBUG_PIPELINE_METRICS").as_deref() == Ok("1"))
 }
 
+/// Per-shard counters, allocated only when pipeline metrics are enabled.
+#[derive(Default)]
+pub struct Counters {
+    bytes: AtomicU64,
+    writes: [AtomicU64; 9],
+    pending: AtomicU64,
+    partial: AtomicU64,
+}
+impl Counters {
+    /// Read cumulative counters on this shard.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            host_write_bytes: self.bytes.load(Ordering::Relaxed),
+            host_write_sizes: core::array::from_fn(|i| self.writes[i].load(Ordering::Relaxed)),
+            host_write_pending: self.pending.load(Ordering::Relaxed),
+            host_write_partial: self.partial.load(Ordering::Relaxed),
+        }
+    }
+    pub(crate) fn record(&self, result: &Poll<io::Result<usize>>, offered: usize) {
+        match result {
+            Poll::Ready(Ok(n)) if *n > 0 => {
+                self.bytes.fetch_add(*n as u64, Ordering::Relaxed);
+                self.writes[bucket(*n)].fetch_add(1, Ordering::Relaxed);
+                if *n < offered {
+                    self.partial.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Poll::Pending => {
+                self.pending.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Counts successful nonzero AsyncWrite completions, not offered bytes or Pending retries.
 /// For the production host Tokio TcpStream each such completion is a successful socket write.
 #[derive(Clone, Debug, Default)]

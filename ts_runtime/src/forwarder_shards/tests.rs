@@ -87,6 +87,7 @@ async fn queue_has_both_packet_and_byte_bounds_and_releases_on_drop() {
     let metrics = Arc::new(Metrics::default());
     let queue = Queue {
         tx,
+        packets: PacketBudget::new(4096),
         bytes: Arc::new(Semaphore::new(80)),
         metrics: Some(metrics.clone()),
     };
@@ -106,6 +107,7 @@ async fn queue_has_both_packet_and_byte_bounds_and_releases_on_drop() {
     let (tx, _rx) = mpsc::channel(1);
     let q = Queue {
         tx,
+        packets: PacketBudget::new(4096),
         bytes: Arc::new(Semaphore::new(200)),
         metrics: Some(metrics.clone()),
     };
@@ -157,7 +159,21 @@ async fn setup() -> (
     env.forwarder_shards = 4;
     env.forward_all_ports = true;
     env.forward_routes = Arc::new(vec!["127.0.0.0/8".parse().unwrap()]);
-    let (up, down) = OverlayToDataplane::for_test(Default::default());
+    let (up, down) = if inline_egress() {
+        let (tx, down) = mpsc::unbounded_channel();
+        let (bounded, mut rx) = mpsc::channel(64);
+        let fallback = tx.clone();
+        tokio::spawn(async move {
+            while let Some(batch) = rx.recv().await {
+                if fallback.send(batch).is_err() {
+                    break;
+                }
+            }
+        });
+        (OverlayToDataplane::for_probe(tx, Some(bounded)), down)
+    } else {
+        OverlayToDataplane::for_test(Default::default())
+    };
     let (_input, input) = mpsc::unbounded_channel();
     let fwd = ForwarderActor::spawn((env.clone(), Default::default(), up, input));
     fwd.wait_for_startup_with_result(|r| r.is_ok()).await;
@@ -534,6 +550,7 @@ async fn queued_packets_revalidate_before_the_gate() {
     let metrics = Arc::new(Metrics::default());
     let queue = Queue {
         tx,
+        packets: PacketBudget::new(4096),
         bytes: Arc::new(Semaphore::new(1000)),
         metrics: Some(metrics.clone()),
     };
@@ -591,4 +608,149 @@ fn destination_guard_and_operator_dns_exception_precede_all_shards() {
     assert!(destination_allowed(exit, private, &dns, true));
     assert!(destination_allowed(subnet, private, &tcp, false));
     assert!(destination_allowed(exit, public, &tcp, false));
+}
+
+#[tokio::test]
+async fn batched_queue_keeps_packet_byte_caps_order_and_drop_accounting() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let metrics = Arc::new(Metrics::default());
+    let queue = Queue {
+        tx,
+        packets: PacketBudget::new(3),
+        bytes: Arc::new(Semaphore::new(120)),
+        metrics: Some(metrics.clone()),
+    };
+    queue.send_batch(
+        PeerId(7),
+        (1..=4).map(|port| packet(6, port, 443).into()).collect(),
+    );
+    assert_eq!(metrics.queued.load(Ordering::Relaxed), 3);
+    assert_eq!(metrics.queued_bytes.load(Ordering::Relaxed), 120);
+    assert_eq!(metrics.drops.load(Ordering::Relaxed), 1);
+    let batch = rx.recv().await.unwrap();
+    let mut ports = Vec::new();
+    for queued in batch {
+        assert_eq!(queued.peer, PeerId(7));
+        ports.push(u16::from_be_bytes(
+            queued.packet.as_ref().unwrap().as_ref()[20..22]
+                .try_into()
+                .unwrap(),
+        ));
+    }
+    assert_eq!(ports, [1, 2, 3]);
+    assert_eq!(queue.packets.available_permits(), 3);
+    assert_eq!(queue.bytes.available_permits(), 120);
+    // Independently exercise the packet cap with byte space remaining.
+    queue.send_batch(PeerId(7), (0..4).map(|_| vec![0; 1].into()).collect());
+    assert_eq!(metrics.queued.load(Ordering::Relaxed), 3);
+    assert_eq!(metrics.drops.load(Ordering::Relaxed), 2);
+    drop(rx);
+    assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
+    assert_eq!(queue.packets.available_permits(), 3);
+    assert_eq!(queue.bytes.available_permits(), 120);
+}
+
+#[tokio::test]
+async fn batched_ingress_revalidates_after_revocation_at_turn_boundary() {
+    let mut sources = ts_bart::Table::default();
+    sources.insert("100.64.0.1/32".parse().unwrap(), PeerId(1));
+    let security = Arc::new(Mutex::new(Security {
+        sources: SourceFilterState(Arc::new(sources)),
+        filter: PacketFilterState(Arc::new(Allow)),
+    }));
+    let (tx, rx) = mpsc::channel(8);
+    let metrics = Arc::new(Metrics::default());
+    let queue = Queue {
+        tx,
+        packets: PacketBudget::new(192),
+        bytes: Arc::new(Semaphore::new(192 * 40)),
+        metrics: Some(metrics.clone()),
+    };
+    for _ in 0..3 {
+        queue.send_batch(
+            PeerId(1),
+            (0..64).map(|_| packet(6, 1, 443).into()).collect(),
+        );
+    }
+    drop(queue);
+    let (ready, notified) = oneshot::channel();
+    let revoke_security = security.clone();
+    let revoke = tokio::spawn(async move {
+        notified.await.unwrap();
+        revoke_security.lock().unwrap().sources = SourceFilterState(Arc::new(Default::default()));
+    });
+    let mut admitted = 0;
+    let mut ready = Some(ready);
+    pump(
+        rx,
+        security,
+        Some(metrics.clone()),
+        Arc::new(Mutex::new(HashMap::new())),
+        |_| {
+            admitted += 1;
+            if admitted == 128 {
+                ready.take().unwrap().send(()).unwrap();
+            }
+            true
+        },
+        || {},
+    )
+    .await;
+    revoke.await.unwrap();
+    assert_eq!(admitted, 128);
+    assert_eq!(metrics.drops.load(Ordering::Relaxed), 64);
+    assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn inline_egress_full_mailbox_keeps_fifo_then_resumes_and_closed_fails() {
+    let (tx, _unused) = mpsc::unbounded_channel();
+    let (bounded, mut receiver) = mpsc::channel(1);
+    let up = OverlayToDataplane::for_probe(tx, Some(bounded));
+    let lagging = Arc::new(AtomicBool::new(false));
+    let mut sink = crate::forwarder_actor::inline_sink(up.clone(), lagging.clone(), None, false);
+    let bytes = |n| vec![bytes::Bytes::from(vec![n])];
+    sink(bytes(0)).unwrap();
+    let first = sink(bytes(1)).unwrap_err();
+    assert!(lagging.load(Ordering::Relaxed));
+    assert_eq!(receiver.recv().await.unwrap()[0].as_ref(), &[0]);
+    // Capacity is free, but an older failed publication still belongs to the fallback pump.
+    let second = sink(bytes(2)).unwrap_err();
+    up.send_wait_counted(
+        first
+            .into_iter()
+            .map(crate::netstack_actor::into_packet)
+            .collect(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(receiver.recv().await.unwrap()[0].as_ref(), &[1]);
+    up.send_wait_counted(
+        second
+            .into_iter()
+            .map(crate::netstack_actor::into_packet)
+            .collect(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(receiver.recv().await.unwrap()[0].as_ref(), &[2]);
+    // The colocated pump clears this only after its current send and all queued tails finish.
+    lagging.store(false, Ordering::Relaxed);
+    sink(bytes(3)).unwrap();
+    assert_eq!(receiver.recv().await.unwrap()[0].as_ref(), &[3]);
+    drop(receiver);
+    let closed = sink(bytes(4)).unwrap_err();
+    assert!(
+        up.send_wait_counted(
+            closed
+                .into_iter()
+                .map(crate::netstack_actor::into_packet)
+                .collect(),
+            None
+        )
+        .await
+        .is_err()
+    );
 }

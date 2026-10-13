@@ -198,6 +198,39 @@ impl kameo::Actor for ForwarderActor {
     }
 }
 
+pub(crate) fn inline_sink(
+    up: OverlayToDataplane,
+    lagging: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    metrics: Option<std::sync::Arc<crate::forwarder_shards::Metrics>>,
+    counters: bool,
+) -> impl FnMut(Vec<bytes::Bytes>) -> Result<(), Vec<bytes::Bytes>> + Send + Sync {
+    move |buffers: Vec<bytes::Bytes>| {
+        use std::sync::atomic::Ordering;
+        if lagging.load(Ordering::Relaxed) {
+            return Err(buffers);
+        }
+        let n = buffers.len();
+        match up.try_send_bytes(buffers) {
+            Ok(()) => {
+                if counters {
+                    crate::pipeline_metrics::egress(1, n);
+                }
+                if let Some(m) = &metrics {
+                    m.out_packets(n);
+                    m.inline_batch();
+                }
+                Ok(())
+            }
+            Err(buffers) => {
+                // All later publications queue until the colocated pump has sent every
+                // older packet. A transient full WG mailbox cannot reorder a flow.
+                lagging.store(true, Ordering::Relaxed);
+                Err(buffers)
+            }
+        }
+    }
+}
+
 impl ForwarderActor {
     pub(crate) async fn single(
         env: Env,
@@ -218,6 +251,18 @@ impl ForwarderActor {
         };
         if let Some(metrics) = &shard_metrics {
             metrics.set_egress_queue(egress_queue);
+            if let Some(handle) = netstack.metrics_handle() {
+                metrics.set_netstack(handle);
+            }
+        }
+        let inline = sharded && crate::forwarder_shards::inline_egress();
+        let lagging = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if inline {
+            let up = netstack_up.clone();
+            let lagging = lagging.clone();
+            let metrics = shard_metrics.clone();
+            let counters = crate::pipeline_metrics::enabled();
+            netstack.set_egress_sink(inline_sink(up, lagging, metrics, counters));
         }
         let netstack::WakingPipe {
             rx: mut netstack_down_rx,
@@ -269,12 +314,20 @@ impl ForwarderActor {
                     metrics.out_packets(batch.len());
                 }
                 let sent = if sharded {
-                    netstack_up.send_wait(batch).await
+                    netstack_up
+                        .send_wait_counted(batch, output_metrics.as_deref())
+                        .await
                 } else {
                     netstack_up.send(batch)
                 };
                 if sent.is_err() {
                     break;
+                }
+                // Producer and pump run on this same current-thread shard runtime. There is
+                // no yield between checking the receiver (including its buffered batch tail)
+                // and clearing lagging. No unsent pump batch can be bypassed.
+                if inline && !netstack_down_rx.rx_ready() {
+                    lagging.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
                 turns += 1;
                 if cooperative && turns == 4 {

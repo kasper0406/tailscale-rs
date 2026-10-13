@@ -28,6 +28,8 @@ pub(crate) fn egress(index: usize, n: usize) {
 /// Cheap cumulative snapshot; array order: app/forwarder and pipeline/security.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
+    /// Combined shard-to-WG receive turns, before outbound routing/encryption.
+    pub wg_handoff: ts_dataplane::handoff_metrics::Snapshot,
     /// Actual host TCP write bytes and sizes across all forwarder stacks, including N=1.
     pub splice: ts_forwarder::splice_metrics::Snapshot,
     /// Per-shard forwarding and bounded-memory counters; empty when sharding/metrics are off.
@@ -50,6 +52,7 @@ pub struct Snapshot {
 /// Read counters without actor messaging or hot-path tracing.
 pub fn snapshot() -> Snapshot {
     Snapshot {
+        wg_handoff: ts_dataplane::handoff_metrics::snapshot(),
         splice: ts_forwarder::splice_metrics::snapshot(),
         forwarder_shards: crate::forwarder_shards::snapshots(),
         receive: ts_magicsock::receive_batch_snapshot(),
