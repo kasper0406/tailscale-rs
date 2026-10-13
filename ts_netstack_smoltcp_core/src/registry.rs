@@ -43,16 +43,19 @@ mod tests {
     #[test]
     fn wrappers_keep_kinds_and_generations_in_sync_on_slot_reuse() {
         let mut stack = Netstack::new(Config::default(), Instant::ZERO);
+        let counter = stack.tcp_socket_counter();
         let tcp = tcp::Socket::new(
             tcp::SocketBuffer::new(alloc::vec![0; 64]),
             tcp::SocketBuffer::new(alloc::vec![0; 64]),
         );
         let handle = stack.add_socket(tcp);
+        assert_eq!(counter.load(core::sync::atomic::Ordering::Relaxed), 1);
         let generation = stack.handle_gen(handle).unwrap();
         assert!(stack.socket_matches::<tcp::Socket>(handle));
         assert!(!stack.socket_matches::<udp::Socket>(handle));
         stack.pending_tcp_closes.insert(handle);
         stack.remove_socket(handle);
+        assert_eq!(counter.load(core::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(stack.handle_gen(handle), None);
         assert!(!stack.socket_matches::<tcp::Socket>(handle));
         assert!(stack.pending_tcp_closes.is_empty());
@@ -68,6 +71,7 @@ mod tests {
             ),
         );
         let recycled = stack.add_socket(udp);
+        assert_eq!(counter.load(core::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(recycled, handle);
         assert_ne!(stack.handle_gen(recycled), Some(generation));
         assert!(stack.socket_matches::<udp::Socket>(recycled));

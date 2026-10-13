@@ -25,7 +25,9 @@ mod std_clock;
 #[cfg(feature = "tun")]
 mod tun_rs_device;
 
-pub use pipe::{IngressDiscard, WakingPipe, WakingPipeDev, WakingPipeReceiver, WakingPipeSender};
+pub use pipe::{
+    EgressQueue, IngressDiscard, WakingPipe, WakingPipeDev, WakingPipeReceiver, WakingPipeSender,
+};
 pub use run::{run, run_blocking};
 #[cfg(feature = "tun")]
 pub use tun_rs_device::{TunRsDevice, TunRsDeviceAsync};
@@ -109,6 +111,14 @@ pub fn piped_pair(config: netcore::Config) -> (Netstack<WakingPipeDev>, Netstack
 }
 
 impl Netstack<WakingPipeDev> {
+    /// Bound output from this single device producer, backpressuring TxToken creation rather
+    /// than blocking consume. Call before driving the stack; output packets must be <= its MTU.
+    pub fn bound_egress(&mut self, consumer: &mut WakingPipe, max_packets: usize) -> EgressQueue {
+        self.dev
+            .pipe
+            .bound_output(consumer, max_packets, self.dev.mtu)
+    }
+
     /// Build a handle to discard pending ingress at a security barrier on this runtime.
     /// Feed ingress with individual packets only; see [`IngressDiscard`].
     pub fn ingress_discard_handle(&self) -> IngressDiscard {
@@ -124,6 +134,11 @@ impl Netstack<WakingPipeDev> {
 }
 
 impl<D> Netstack<D> {
+    /// Enable this stack's actual TCP socket count for opt-in memory accounting.
+    pub fn tcp_socket_counter(&mut self) -> alloc::sync::Arc<core::sync::atomic::AtomicUsize> {
+        self.core.tcp_socket_counter()
+    }
+
     /// Accept peer-half-closed sockets after a completed handshake (opt-in).
     pub fn set_accept_half_closed(&mut self, enabled: bool) {
         self.core.set_accept_half_closed(enabled);

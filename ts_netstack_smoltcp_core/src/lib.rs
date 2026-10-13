@@ -97,6 +97,7 @@ pub struct Netstack {
 
     /// Count maintained by the socket wrappers; avoids a scan to arm maintenance.
     tcp_socket_count: usize,
+    tcp_socket_counter: Option<alloc::sync::Arc<core::sync::atomic::AtomicUsize>>,
     next_orphan_sweep: smoltcp::time::Instant,
 
     /// Set of TCP socket handles that are expected to close in the future, held onto for
@@ -162,6 +163,7 @@ impl Netstack {
             socket_registry: BTreeMap::new(),
             next_gen: 0,
             tcp_socket_count: 0,
+            tcp_socket_counter: None,
             next_orphan_sweep: now + ORPHAN_SWEEP_INTERVAL,
             pending_tcp_closes: Default::default(),
             connecting_tcp_sockets: Default::default(),
@@ -194,6 +196,7 @@ impl Netstack {
         );
         if T::KIND == SocketKind::Tcp {
             self.tcp_socket_count += 1;
+            self.publish_tcp_count();
         }
         h
     }
@@ -211,10 +214,26 @@ impl Netstack {
             .is_some_and(|entry| entry.kind == SocketKind::Tcp)
         {
             self.tcp_socket_count -= 1;
+            self.publish_tcp_count();
         }
         self.pending_tcp_closes.remove(&handle);
         self.connecting_tcp_sockets.remove(&handle);
         self.socket_set.remove(handle);
+    }
+
+    /// Enable a live TCP socket gauge for one stack. Includes idle listeners, SYN backlog,
+    /// established connections and sockets closing or in TIME_WAIT, not just host splices.
+    pub fn tcp_socket_counter(&mut self) -> alloc::sync::Arc<core::sync::atomic::AtomicUsize> {
+        self.tcp_socket_counter
+            .get_or_insert_with(|| {
+                alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(self.tcp_socket_count))
+            })
+            .clone()
+    }
+    fn publish_tcp_count(&self) {
+        if let Some(counter) = &self.tcp_socket_counter {
+            counter.store(self.tcp_socket_count, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Current generation of `handle`, or `None` if no live socket occupies that slot.
@@ -898,6 +917,14 @@ where
             Poll::Ready(())
         } else {
             Poll::Pending
+        }
+    }
+}
+
+impl Drop for Netstack {
+    fn drop(&mut self) {
+        if let Some(counter) = &self.tcp_socket_counter {
+            counter.store(0, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }

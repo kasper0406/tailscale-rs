@@ -112,6 +112,19 @@ impl IngressDiscard {
     }
 }
 
+/// Live bounded device-output occupancy, including packets buffered before publication.
+#[derive(Clone)]
+pub struct EgressQueue(Arc<ByteBudget>);
+impl EgressQueue {
+    /// Current packets and bytes; sampled gauges are not an atomic pair.
+    pub fn occupancy(&self) -> (usize, usize) {
+        (
+            self.0.packets.load(Ordering::Relaxed),
+            self.0.queued.load(Ordering::Relaxed),
+        )
+    }
+}
+
 enum PipeMessage {
     One(Bytes),
     Batch(Vec<Bytes>),
@@ -139,6 +152,9 @@ impl Clone for WakingPipeSender {
 struct ByteBudget {
     queued: AtomicUsize,
     max: usize,
+    packets: AtomicUsize,
+    max_packets: usize,
+    max_packet_bytes: usize,
 }
 
 impl ByteBudget {
@@ -155,11 +171,17 @@ impl ByteBudget {
     /// already bounded by the channel's packet count.
     fn charge(&self, len: usize) {
         self.queued.fetch_add(len, Ordering::AcqRel);
+        if self.max_packet_bytes > 0 {
+            self.packets.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// Give back `len` bytes previously charged.
     fn release(&self, len: usize) {
         self.queued.fetch_sub(len, Ordering::AcqRel);
+        if self.max_packet_bytes > 0 {
+            self.packets.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -176,6 +198,24 @@ fn release(budget: &Option<Arc<ByteBudget>>, len: usize) {
 }
 
 impl WakingPipe {
+    pub(crate) fn bound_output(
+        &mut self,
+        consumer: &mut Self,
+        max_packets: usize,
+        mtu: usize,
+    ) -> EgressQueue {
+        let budget = Arc::new(ByteBudget {
+            queued: AtomicUsize::new(0),
+            max: max_packets.saturating_mul(mtu),
+            packets: AtomicUsize::new(0),
+            max_packets,
+            max_packet_bytes: mtu,
+        });
+        self.tx.budget = Some(budget.clone());
+        consumer.rx.budget = Some(budget.clone());
+        EgressQueue(budget)
+    }
+
     /// Construct a new pipe with the given optional capacity `limit`.
     pub fn new(limit: Option<usize>) -> (Self, Self) {
         if let Some(limit) = limit {
@@ -208,6 +248,9 @@ impl WakingPipe {
         let budget = Arc::new(ByteBudget {
             queued: AtomicUsize::new(0),
             max: max_bytes,
+            packets: AtomicUsize::new(0),
+            max_packets: usize::MAX,
+            max_packet_bytes: 0,
         });
         let (mut device, mut caller) = Self::channels(Some(max_packets), None);
 
@@ -435,6 +478,17 @@ impl WakingPipeSender {
 
     /// Report whether we can currently transmit.
     pub fn tx_ready(&self) -> bool {
+        if let Some(budget) = &self.budget
+            && budget.max_packet_bytes > 0
+            && (budget.packets.load(Ordering::Acquire) >= budget.max_packets
+                || budget
+                    .queued
+                    .load(Ordering::Acquire)
+                    .saturating_add(budget.max_packet_bytes)
+                    > budget.max)
+        {
+            return false;
+        }
         !self.bounded || !self.tx.is_full()
     }
 }
@@ -564,7 +618,7 @@ impl smoltcp::phy::Device for WakingPipeDev {
     #[tracing::instrument(skip(self), level = "trace")]
     fn receive(&mut self, timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let _ = timestamp;
-        if self.pipe.tx.tx.is_disconnected() {
+        if self.pipe.tx.tx.is_disconnected() || !self.pipe.tx.tx_ready() {
             return None;
         }
         let b = self.pipe.rx.try_recv()?;
@@ -572,7 +626,7 @@ impl smoltcp::phy::Device for WakingPipeDev {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        if self.pipe.tx.tx.is_disconnected() {
+        if self.pipe.tx.tx.is_disconnected() || !self.pipe.tx.tx_ready() {
             return None;
         }
         Some(&mut self.pipe.tx)
@@ -634,6 +688,35 @@ mod tests {
         assert_eq!(discard.discard(), 0);
         assert!(caller.tx.try_send(&[0; 80]));
         assert_eq!(discard.discard(), 1);
+    }
+
+    #[test]
+    fn bounded_device_output_backpressures_without_blocking_tokens_and_keeps_batch_limit() {
+        use smoltcp::phy::{Device, TxToken};
+        for batching in [false, true] {
+            let (pipe, mut caller) = WakingPipe::unbounded();
+            let mut dev = device(pipe);
+            dev.mtu = 100;
+            let queue = dev.pipe.bound_output(&mut caller, 2, 100);
+            if batching {
+                dev.pipe.tx.pending_egress = Some(Vec::new());
+            }
+            for _ in 0..2 {
+                dev.transmit(Instant::ZERO)
+                    .unwrap()
+                    .consume(80, |b| b.fill(1));
+            }
+            assert_eq!(queue.occupancy(), (2, 160));
+            assert!(dev.transmit(Instant::ZERO).is_none());
+            dev.pipe.tx.flush_egress();
+            assert!(caller.rx.try_recv().is_some());
+            if batching {
+                assert!(caller.rx.try_recv().is_some());
+            }
+            assert!(dev.transmit(Instant::ZERO).is_some());
+            while caller.rx.try_recv().is_some() {}
+            assert_eq!(queue.occupancy(), (0, 0));
+        }
     }
 
     #[test]
