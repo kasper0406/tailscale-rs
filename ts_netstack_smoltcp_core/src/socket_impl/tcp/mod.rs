@@ -36,10 +36,12 @@ impl Netstack {
         // Forwarded flows carry the endpoints' own write patterns (TLS records, request/response);
         // the endpoints already coalesce, so Nagle here only delays small writes by a round trip.
         sock.set_nagle_enabled(false);
-        // Reno, matching gVisor in Go. smoltcp already defaults to Reno with only `socket-tcp-reno`
-        // on, but picks Cubic instead if anything else in the build enables `socket-tcp-cubic`, so
-        // pin the controller rather than inherit it from feature unification.
-        sock.set_congestion_control(tcp::CongestionControl::Reno);
+        // Cubic gives the larger-window single-flow gain in the private bottleneck matrix.
+        sock.set_congestion_control(tcp::CongestionControl::Cubic);
+        // Private 0.14 recovery policy; upstream library defaults remain unchanged.
+        sock.set_min_rto(smoltcp::time::Duration::from_millis(200));
+        sock.set_sender_sack_enabled(true);
+        sock.set_pacing_enabled(true);
         // `core::time::Duration` → smoltcp's own `Duration` (millisecond granularity is plenty for
         // a 60s/120s policy). Skip either knob when `None` (smoltcp's no-reaping default).
         if let Some(interval) = self.config.tcp_keep_alive_interval {
@@ -91,16 +93,20 @@ mod tests {
         );
     }
 
-    /// Every socket runs Reno congestion control, as gVisor does in Go. Without it smoltcp applies
-    /// no congestion window at all and a sender fills the whole receive window into a lossy path.
+    /// The private build pins the measured controller and recovery policy even when Cargo
+    /// unifies both congestion-control features.
     #[test]
-    fn new_tcp_socket_runs_reno_congestion_control() {
+    fn new_tcp_socket_runs_selected_congestion_control() {
         let stack = Netstack::new(Config::default(), Instant::ZERO);
 
         let sock = stack.new_tcp_socket();
+        assert_eq!(sock.min_rto(), smoltcp::time::Duration::from_millis(200));
+        assert_eq!(sock.initial_rto(), smoltcp::time::Duration::from_secs(1));
+        assert!(sock.sender_sack_enabled());
+        assert!(sock.pacing_enabled());
         assert_eq!(
             sock.congestion_control(),
-            smoltcp::socket::tcp::CongestionControl::Reno
+            smoltcp::socket::tcp::CongestionControl::Cubic
         );
     }
 
