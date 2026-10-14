@@ -2298,7 +2298,7 @@ impl<'a> Socket<'a> {
 
     fn seq_to_transmit(&self, cx: &mut Context) -> bool {
         // Fast retransmits should always send, even if later congestion checks would disallow
-        if self.pending_fast_retransmit && !self.tx_buffer.is_empty() {
+        if self.pending_fast_retransmit && self.remote_win_len > 0 && !self.tx_buffer.is_empty() {
             return true;
         }
 
@@ -2506,7 +2506,13 @@ impl<'a> Socket<'a> {
             // now for whatever reason (like zero window), this avoids an
             // infinite polling loop where `poll_at` returns `Now` but `dispatch`
             // can't actually do anything.
-            self.timer.set_for_idle(cx.now(), self.keep_alive);
+            if self.pending_fast_retransmit && self.flight_size() > 0 {
+                // A failed emit keeps the repair pending and a fallback deadline armed.
+                self.timer
+                    .set_for_retransmit(cx.now(), self.rtte.retransmission_timeout());
+            } else {
+                self.timer.set_for_idle(cx.now(), self.keep_alive);
+            }
 
             // Inform RTTE, so that it can avoid bogus measurements.
             self.rtte.on_retransmit();
@@ -2631,12 +2637,10 @@ impl<'a> Socket<'a> {
                 let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
                 let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
-                let offset = if self.pending_fast_retransmit {
+                let offset = if self.pending_fast_retransmit && self.remote_win_len > 0 {
                     let size = effective_mss.min(self.tx_buffer.len());
                     repr.seq_number = self.local_seq_no;
                     repr.payload = self.tx_buffer.get_allocated(0, size);
-
-                    self.pending_fast_retransmit = false;
 
                     0
                 } else {
@@ -2816,6 +2820,11 @@ impl<'a> Socket<'a> {
         // carry a fake segment.
         if is_keep_alive {
             return Ok(());
+        }
+
+        // Retire the pending repair only after successful emission of sequence space.
+        if self.pending_fast_retransmit && repr.segment_len() > 0 {
+            self.pending_fast_retransmit = false;
         }
 
         // We've sent a packet successfully, so we can update the internal state now.
@@ -3229,6 +3238,76 @@ mod test {
         s.remote_last_ack = Some(REMOTE_SEQ + 1);
         s.remote_last_win = s.scaled_window();
         s
+    }
+
+    fn brief29_flight() -> TestSocket {
+        let mut s = socket_established();
+        #[cfg(feature = "socket-tcp-reno")]
+        s.set_congestion_control(CongestionControl::Reno);
+        s.remote_mss = 6;
+        send!(s, time 0, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        });
+        s.send_slice(b"aaaaaabbbbbbccccccdddddd").unwrap();
+        for offset in [0, 6, 12, 18] {
+            recv!(s, time 0, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + offset,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"aaaaaabbbbbbccccccdddddd"[offset..offset + 6],
+                ..RECV_TEMPL
+            }));
+        }
+        for _ in 0..3 {
+            send!(s, time 10, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            });
+        }
+        assert_eq!(s.timer, Timer::FastRetransmit);
+        s
+    }
+
+    #[test]
+    fn brief29_bug_fast_retransmit_survives_failed_emit() {
+        let mut s = brief29_flight();
+        s.cx.set_now(Instant::from_millis(10));
+        assert_eq!(
+            s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+                assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
+                assert_eq!(repr.payload, b"aaaaaa");
+                Err::<(), _>(())
+            }),
+            Err(())
+        );
+        // The device rejected the repair. A subsequent successful dispatch must retry it.
+        let mut repairs = 0;
+        s.cx.set_now(Instant::from_millis(11));
+        s.socket
+            .dispatch(&mut s.cx, |_, _, (_, repr)| {
+                assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
+                assert_eq!(repr.payload, b"aaaaaa");
+                repairs += 1;
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert_eq!(repairs, 1, "failed emit lost repair; timer={:?}", s.timer);
+    }
+
+    #[test]
+    fn brief29_control_fast_retransmit_preserves_frontier() {
+        let mut s = brief29_flight();
+        recv!(s, time 10, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"aaaaaa",
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.remote_last_seq, LOCAL_SEQ + 1 + 24);
+        assert!(s.timer.is_retransmit());
+        recv_nothing!(s, time 11);
     }
 
     fn socket_established() -> TestSocket {
