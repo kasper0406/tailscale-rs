@@ -94,6 +94,11 @@ impl Controller for Reno {
         }
     }
 
+    fn on_sack_loss(&mut self, now: Instant, in_flight: usize) {
+        self.on_loss(now, in_flight);
+        self.cwnd = self.ssthresh.min(self.rwnd).max(self.mss);
+    }
+
     fn on_rto(&mut self, _now: Instant, in_flight: usize) {
         // RFC 5681: when the retransmission timer fires for a segment that has
         // already been retransmitted by the timer (no new data was ACKed since
