@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/smoltcp"]
 resolver = "3"
 members = [
     "checks",
@@ -129,7 +130,7 @@ serde_json = "1"
 serde_with = "3"
 smallvec = "1.15"
 static_assertions = "1.1"
-smoltcp = { version = "0.14", default-features = false }
+smoltcp = { version = "=0.14.0", default-features = false }
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros"] }
 tokio-util = { version = "0.7", default-features = false }
@@ -406,3 +407,7 @@ required-features = ["tsnet"]
 [[example]]
 name = "ssh_peer_lookup"
 required-features = ["ssh"]
+
+# Private, pinned 0.14.0 loss-recovery workaround. See vendor/smoltcp/PATCHES.md.
+[patch.crates-io]
+smoltcp = { path = "vendor/smoltcp" }
