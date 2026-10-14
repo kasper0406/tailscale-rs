@@ -1,5 +1,11 @@
 # RUNBOOK: Rust exit node on the Mac mini
 
+> **Current setup (2026-10-14):** the node runs as a launchd daemon named `kmini` from GeiserX `main` + one
+> commit; see **Permanent setup** at the end. Sections 1–5 describe the earlier manual runner (`runner/*.sh`,
+> state in `state/rust-exit/`, name `rust-exit`) and are kept for history and benchmarking. Don't follow their
+> auth-key steps for the live node: its identity already exists, and enrollment keys must not be kept in files.
+
+
 Experimental, unaudited networking code (see "Known limitations" below and `docs/LIMITATIONS.md`).
 Use it on a restricted tailnet, for test traffic only. The ASUS router VPN stays the fallback for remote access.
 
@@ -147,27 +153,39 @@ More logging: `RUST_LOG=debug runner/start.sh` (verbose; contains peer IPs, neve
 
 ## Permanent setup: launchd daemon (`deploy/launchd/`)
 
+**Code (since 2026-10-14):** GeiserX/tailscale-rs `main` plus one commit, `--serve-tcp` (branch `ts-exit/main`,
+0e10bc3 on 18fc6bc). GeiserX merged our exit-node, performance and fix PRs; our old layered branches are archived
+as tags `archive/ts-exit/*-pre-geiserx-switch`. Not in GeiserX main: our smoltcp TCP loss recovery (it was
+patched into a vendored smoltcp 0.13; GeiserX uses crates.io smoltcp 0.14 with Reno), so the window is back to
+the default 256 KiB.
+
 A system daemon (`/Library/LaunchDaemons/dev.kasper.rust-exit.plist`) that starts at boot before login but runs
 **as Kasper, not root**. Everything else is on the internal disk in his home, because `/Volumes/git` (USB) isn't
 mounted before login:
 
 | What | Where |
 |---|---|
-| binary, wrapper, log rotator | `~/Library/Application Support/rust-exit/{bin/exit_node,run.sh,rotate.pl}` |
-| node identity | `~/Library/Application Support/rust-exit/state/keys.json` (moved from `state/rust-exit/`) |
-| logs | `~/Library/Logs/rust-exit/exit_node.log` (rotated at 10 MiB, 5 kept); `launchd.log` for wrapper errors |
+| binary, wrapper, log rotator (+ `.prev` of each) | `~/Library/Application Support/rust-exit/{bin/exit_node,run.sh,rotate.pl}` |
+| node identity | `~/Library/Application Support/rust-exit/state/keys.json` (0600; back it up privately) |
+| logs | `~/Library/Logs/rust-exit/exit_node.log` (rotated at 10 MiB, 5 kept); `launchd.log` (wrapper errors, trimmed at 1 MiB) |
 
-Settings (in `run.sh`): `--status-interval 300 --tcp-buffer-size 1048576`, the three `TS_DEBUG_MAGICSOCK_*` flags,
-`RUST_LOG=info`. launchd restarts it if it exits (`KeepAlive`, 10 s throttle); file limit 61,440; umask 077.
+Settings (`run.sh`): node name **`kmini`**, `--serve-tcp 22=127.0.0.1:22` (`ssh kmini` reaches the Mac's sshd
+over the tailnet), `--status-interval 300`, default 256 KiB window, the three `TS_DEBUG_MAGICSOCK_*` Apple flags.
+The `TS_EXPERIMENT_*` flags are off until A/B-tested on this build (design review 28). launchd restarts it if it
+exits (`KeepAlive`, 10 s throttle); file limit 61,440; umask 077. The rotator never stops reading, so a stuck or
+full disk drops log lines instead of blocking the node.
 
-- **Install:** `runner/build.sh`, then `deploy/launchd/install.sh` as yourself (it asks for sudo for the plist only).
-  It stops a manually started node, moves the keys, installs and loads the plist. `runner/start.sh` refuses to run
-  while the daemon is installed.
-- **Update (no sudo):** `runner/build.sh && deploy/launchd/update.sh`: installs the binary and kills the node;
-  launchd restarts it on the new binary.
-- **Status:** `launchctl print system/dev.kasper.rust-exit | grep -E 'state|pid'`; `tail ~/Library/Logs/rust-exit/exit_node.log`.
-- **Remove:** `deploy/launchd/uninstall.sh` (keys and logs stay).
-- **FileVault is on:** after any reboot nothing runs until the disk is unlocked. For planned restarts use
-  `sudo fdesetup authrestart`. `pmset autorestart` is 1 (restarts after power loss, then waits for unlock).
-- **Tailscale admin console:** disable key expiry for `rust-exit`, or it drops off the tailnet when its node key
-  expires.
+- **Update:** build `ts-exit/main` (`runner/build.sh`), then `deploy/launchd/update.sh <binary>` **locally** (not
+  over `ssh kmini`: the restart drops that session). It keeps the previous release, restarts the node, and within
+  90 s requires: "running" in the log, an exit-node HTTPS fetch through the local Go test client, and an SSH
+  banner on the node's tailnet port 22. Otherwise it rolls back automatically.
+- **Install / remove:** `deploy/launchd/install.sh` (asks for sudo for the plist only); `uninstall.sh`.
+- **Status:** `launchctl print system/dev.kasper.rust-exit | grep -E 'state|pid'`; `tail ~/Library/Logs/rust-exit/exit_node.log`;
+  remotely: `ssh kmini`, and an HTTPS fetch with `kmini` as exit node.
+- **Don't reboot casually.** FileVault is on: after any reboot nothing runs until the disk is unlocked.
+  `sudo fdesetup authrestart` is hardware-dependent (check `fdesetup supportsauthrestart`); macOS 26 supports
+  FileVault unlock over SSH, but not through this daemon (its files are on the locked disk), so keep an
+  independent way in before planned restarts. `pmset`: sleep 0, autorestart 1.
+- **Tailscale admin console:** the node is user-owned (untagged, `--interactive`), so disable its key expiry.
+  Restrict TCP/22 on `kmini` to your own devices in the ACLs if anyone else shares the tailnet: sshd sees every
+  tailnet SSH connection as coming from 127.0.0.1.

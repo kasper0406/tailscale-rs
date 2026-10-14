@@ -327,3 +327,19 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   experiments 5c77397; clippy/tests/fmt/checks pass. Live node restarted on main 7089f9f
   (`bin/exit_node-main-7089f9f`, 1 MiB); the laptop was asleep, so the fix isn't confirmed live yet. Smoke test
   now downloads from Apple's networkQuality CDN (Cloudflare and OVH rate-limited the home IP after the tests).
+- **D32 Switch to GeiserX main (user, 2026-10-14).** GeiserX merged #597 (+ their exit-DNS fixes) and #598 (no
+  Nagle, 7 MiB buffers, egress batching, socket registry, half-close accept, 32 holes on by default; our Apple
+  RX batching, splice coalescing, targeted replay and connected sockets opt-in), and #599/#601/#603/#613/#614;
+  #600/#604 were superseded (smoltcp 0.14 from crates.io; betterAddr inside #597). Not included: our vendored
+  smoltcp TCP recovery (codex-24), which can't build on crates.io smoltcp. GeiserX also pins Reno (#627). Live now:
+  GeiserX main 18fc6bc + `--serve-tcp` (0e10bc3, `ts-exit/main`), node renamed `kmini`, `ssh kmini` via Serve
+  TCPForward to 127.0.0.1:22, default 256 KiB window, `TS_EXPERIMENT_*` off, Apple magicsock flags on. Smoke
+  6/6; LAN single flow ~480–500 Mbit/s. Old layers archived as `archive/ts-exit/*-pre-geiserx-switch`.
+  gpt-6.1-sol design review (`docs/review-28-design.md`): **go with changes**. Done before the switch:
+  transactional `update.sh` (keeps `.prev`, health = log "running" + exit HTTPS fetch + SSH banner, auto
+  rollback; it rolled back correctly on its first, mis-matched run), a rotator that never blocks the node and caps
+  records, bounded `launchd.log`, explicit build artifact. Open from the review: Serve bind failures are only
+  logged (fix in the GeiserX serve PR: bind before acknowledging, reject duplicate ports); ACL-restrict TCP/22 if
+  the tailnet is shared; FileVault recovery path before any planned reboot; A/B the `TS_EXPERIMENT_*` flags and
+  larger windows on this build; upstream the TCP recovery to smoltcp (port onto main, small PRs, keep the SACK
+  validation fix), optionally carried meanwhile as a `[patch.crates-io]` on 0.14.

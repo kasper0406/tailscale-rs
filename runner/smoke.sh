@@ -7,7 +7,7 @@ X=(--socks5-hostname 127.0.0.1:1055)
 want_ip=${1:-$(curl -s -4 -m 10 https://ifconfig.me)}
 fail=0
 check() { if eval "$2"; then echo "PASS $1"; else echo "FAIL $1"; fail=1; fi; }
-${0:A:h}/tsc set --exit-node=rust-exit
+${0:A:h}/tsc set --exit-node=100.112.127.25  # the node's tailnet IP; stable across renames
 ip=$(curl -s -m 15 $X https://ifconfig.me)
 check "egress ip $ip == $want_ip" '[[ $ip == $want_ip ]]'
 code=$(curl -s -m 15 $X -o /dev/null -w '%{http_code}' https://example.com)
