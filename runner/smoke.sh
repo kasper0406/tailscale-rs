@@ -14,7 +14,8 @@ code=$(curl -s -m 15 $X -o /dev/null -w '%{http_code}' https://example.com)
 check "dns+https example.com ($code)" '[[ $code == 200 ]]'
 code=$(curl -s -m 15 $X -o /dev/null -w '%{http_code}' http://example.com/)
 check "plain http example.com ($code)" '[[ $code == 200 ]]'
-bps=$(curl -s -m 60 $X -o /dev/null -w '%{speed_download}' 'https://speed.cloudflare.com/__down?bytes=50000000')
+# Apple's networkQuality CDN: built for load tests (Cloudflare and OVH rate-limit repeated runs from one IP).
+bps=$(curl -s -m 60 $X -o /dev/null -w '%{speed_download}' -r 0-52428799 https://mensura.cdn-apple.com/api/v1/gm/large)
 check "50 MB download ($(( ${bps%.*} * 8 / 1000000 )) Mbit/s)" '[[ ${bps%.*} -gt 1000000 ]]'
 t=$(curl -s -m 8 $X -o /dev/null -w '%{time_total}' 'https://[2606:4700:4700::1111]/'); rc=$?
 check "ipv6 refused fast (rc=$rc, ${t}s)" '[[ $rc -ne 0 ]] && (( ${t%.*} < 3 ))'

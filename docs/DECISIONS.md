@@ -315,3 +315,15 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   0528ebc (2). Workspace clippy -D warnings and all tests pass on experiments and on main. `main` equals the live
   candidate plus GeiserX's ruzstd and audit commits. Pushed to kasper0406/tailscale-rs. PRs #597/#598 on GeiserX
   still carry the old stack; not updated (the TCP work would be a scope change for #598; ask first).
+- **F36 Stuck on DERP after a peer moves; listener drops (codex-27, 2026-10-14).** Live: the laptop slept ~04:54
+  UTC and woke on a different Wi-Fi (easy NAT, `MappingVariesByDestIP: false`); the node stayed `path=derp` for
+  3+ hours while the laptop said direct; run C3 through it was flat ~21 Mbit/s. Root cause: `recompute_best`
+  scanned all historical RTTs, so the dead fast endpoint beat the fresh one forever, and our betterAddr guard
+  then refused to re-trust it: permanent DERP. Fix (Go's `betterAddr || bestUntrusted` on the pong in hand) is in
+  the fixes layer (857d2ea). Connected sockets were cleared. Listener: CLOSE-WAIT before accept was closed (request
+  discarded), Closed sockets with unread RX leaked; fix on top of the perf layer (it conflicts with the perf
+  layer's listener rework lower down), and the experiments layer's opt-in `accept_half_closed` flag was removed
+  as redundant. Layers: fixes 857d2ea (11) → exit-node 304763b → perf 7089f9f (46) = main → bench 74e24f4 →
+  experiments 5c77397; clippy/tests/fmt/checks pass. Live node restarted on main 7089f9f
+  (`bin/exit_node-main-7089f9f`, 1 MiB); the laptop was asleep, so the fix isn't confirmed live yet. Smoke test
+  now downloads from Apple's networkQuality CDN (Cloudflare and OVH rate-limited the home IP after the tests).

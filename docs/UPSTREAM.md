@@ -95,6 +95,13 @@ second fork, `kasper0406/geiserx-tailscale-rs`.
   `rust` CI passed on 650e0e2, which contains all three. The other open PRs' runs are `action_required`
   (awaiting approval); #604's ran and passed. On 2026-10-14 the layers were rebased onto 650e0e2 with our five
   identical commits dropped (code-identical to the squash merges, checked line by line).
+- 2026-10-14 (codex-27, `docs/DERP-STUCK-27.md`): GeiserX #613 `fix(magicsock): let a fresh pong replace an
+  untrusted best path` (stacked on #604's betterAddr commit) and #614 `fix(netstack): accept connections
+  half-closed before accept; reclaim dropped sockets` (stacked on #599). Official tailscale-rs #450: its listener
+  also closes CLOSE-WAIT sockets before accept (checked on main b44db0d); the path bug doesn't apply there.
+- CI on #597/#598/#600 (2026-10-14): `checks` lints_enabled choked on `vendor/smoltcp/Cargo.toml` (now excluded:
+  folded into the vendoring commit) and musl builds failed on `recvmmsg` flags (`MSG_DONTWAIT as _`, folded into
+  the batched-receive commit). All three green after the push.
 - Commit messages on all `ts-exit/*` layers were rewritten (codex-22, trees verified identical) after the reorg
   had left placeholder bodies. #597/#598 were updated with the same trees.
 
