@@ -2734,6 +2734,11 @@ impl<'a> Socket<'a> {
                 // A failed emit keeps the repair pending and a fallback deadline armed.
                 self.timer
                     .set_for_retransmit(cx.now(), self.rtte.retransmission_timeout());
+            } else if self.remote_win_len == 0 && !self.tx_buffer.is_empty() {
+                // An RTO can rewind the flight while the peer's window is closed.
+                // Keep probing even if the full tx buffer prevents another application send.
+                self.timer
+                    .set_for_zero_window_probe(cx.now(), self.rtte.retransmission_timeout());
             } else {
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
@@ -3852,6 +3857,36 @@ mod test {
             ..SEND_TEMPL
         });
         assert!(s.tx_buffer.is_empty());
+    }
+
+    #[test]
+    fn brief30_rto_with_closed_window_keeps_persist_timer() {
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        s.send_slice(b"aaaaaabbbbbb").unwrap();
+        for (offset, payload) in [(0, &b"aaaaaa"[..]), (6, &b"bbbbbb"[..])] {
+            recv!(s, time 0, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + offset,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            window_len: 0,
+            ..SEND_TEMPL
+        });
+        assert!(s.timer.is_retransmit());
+        recv_nothing!(s, time 1000);
+        assert!(s.timer.is_zero_window_probe());
+        recv!(s, time 3000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"a",
+            ..RECV_TEMPL
+        }));
     }
 
     fn socket_established() -> TestSocket {
