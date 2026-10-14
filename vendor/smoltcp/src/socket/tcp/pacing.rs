@@ -53,13 +53,37 @@ impl Pacer {
             .saturating_mul(rtt as u64)
             .saturating_mul(1000)
             .div_ceil(Self::rate_window(window) as u64);
-        self.next = Some(self.next.unwrap_or(now).max(now) + Duration::from_micros(delay));
+        // Fast repairs bypass allowance. Bound their accumulated debt so fresh
+        // data waits at most one current smoothed RTT, even after partial ACKs.
+        let next = self.next.unwrap_or(now).max(now) + Duration::from_micros(delay);
+        self.next = Some(next.min(now + Duration::from_millis(rtt as u64)));
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn repeated_repairs_bound_debt_to_current_rtt() {
+        let mut p = Pacer::default();
+        let mut now = Instant::from_millis(1000);
+        let mss = 1200;
+        let window = 2 * mss;
+        p.on_loss();
+        // Fast repairs bypass allowance, including back-to-back partial ACKs.
+        // A smaller RTT sample must also reduce debt already accumulated.
+        for rtt in [2000, 200] {
+            for _ in 0..2000 {
+                p.sent(now, mss, window, rtt);
+                let deadline = now + Duration::from_millis(rtt as u64);
+                assert!(p.next.unwrap() <= deadline);
+                assert!(p.ready_at(now, window, mss, rtt) <= deadline);
+                assert!(p.allowance(deadline, window, mss, rtt) >= mss);
+                now += Duration::from_micros(1);
+            }
+        }
+    }
 
     #[test]
     fn large_future_debt_cannot_wrap_credit_on_32_bit_targets() {

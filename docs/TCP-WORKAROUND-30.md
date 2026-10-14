@@ -210,3 +210,45 @@ at the bench-only commit `9af3f91`; env knobs are `BENCH_BURST=8`,
 hooks. Benchmark compilation and the long randomized-test command are in the
 vendor patch notes. Example: `RTT_MS=25 BW_MBPS=150 QUEUE_KB=64 TCP_BUF_KB=1024 LATENCY=1
 nice -n 10 <bench-binary> 15 1 down`. The matrix runner covers all rows.
+
+## 30b — review-31 pacing debt fix
+
+2026-10-15. LOW-1: each successful send now clamps `pacer.next` to `now + SRTT`.
+Immediate fast repairs still bypass the budget, but repeated partial ACKs cannot
+accumulate debt beyond one RTT. The regression fails before the fix and passes
+after it, including an RTT decrease with existing debt. Only `pacing.rs` changes
+in production; the netstack policy and scoreboard remain unchanged.
+
+The unchanged extended review-31 harness ran against a scratch copy with the
+reviewer's two field-visibility changes. Each row below used 100k rounds × 400
+hostile steps, then the `poll_at`-driven drain; no `log` feature.
+
+| Build | Seeds | Maximum scheduled pacing debt |
+|---|---|---|
+| Release | 11 / 22 / 33 / 44 | 6663 / 8055 / 5225 / 7676 ms |
+| Release, overflow checks + debug assertions | 101 | 6408 ms |
+
+Across the required **500k rounds**: 6.802 billion polls, 375,011 wrap rounds,
+64.7 million failed emits (801,180 failed repairs), and 13.9 million partial ACKs
+in recovery. **Zero panics, wedges, drain stalls, unarmed sockets, empty storms
+or data sent after `Ingress`; worst consecutive `Now` without emission: 1.**
+Maximum debt: **8.055 s**; a separate 100k-round seed-22 replay with read-only
+logging confirms **SRTT = 9.667 s** at that maximum. The bound prevents accumulated
+repair debt; it deliberately preserves peer-inflated RTTs. The targeted repair
+case reports 178 ms without SACK and 181 ms with SACK.
+
+Validation passes: smoltcp **725 tests** (one long harness ignored), netstack and
+forwarder **183 tests + five doctests**, workspace/vendor clippy `-D warnings`,
+both fmt checks, and no_std Reno/Cubic/no-CC builds. LOW-2 is left unchanged:
+Pipe caching would require broader recovery-state invalidation changes; its
+existing bounded cost remains acceptable for this narrow fix.
+
+[30b validation record](tcp-workaround-30b-validation.json) records run counters,
+source/binary hashes and quality commands. Raw commands/logs: `scratch/tcp30b-logs/`;
+runner: `scratch/tcp30b-fuzz.py`. Build with the recorded no-default feature set;
+run the ignored `socket::tcp::test::review31_random_peer_inputs` test with
+`R_ROUNDS=100000 R_STEPS=400 R_SEED=<seed> R_VERBOSE=0 --exact --ignored --nocapture
+--test-threads=1`. Checked release additionally uses
+`RUSTFLAGS='-C overflow-checks=yes -C debug-assertions=yes'`.
+Separate commit: `smoltcp: bound accumulated pacing debt to one smoothed RTT`
+(with the requested trailers). No live-node, main or remote changes.
