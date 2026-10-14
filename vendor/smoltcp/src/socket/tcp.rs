@@ -2200,7 +2200,12 @@ impl<'a> Socket<'a> {
         }
         if self.remote_win_len != 0 && self.timer.is_zero_window_probe() {
             tcp_trace!("stopping zero-window-probe timer");
-            self.timer.set_for_idle(cx.now(), self.keep_alive);
+            if self.flight_size() > 0 {
+                self.timer
+                    .set_for_retransmit(cx.now(), self.rtte.retransmission_timeout());
+            } else {
+                self.timer.set_for_idle(cx.now(), self.keep_alive);
+            }
         }
 
         let payload_len = payload.len();
@@ -3308,6 +3313,71 @@ mod test {
         assert_eq!(s.remote_last_seq, LOCAL_SEQ + 1 + 24);
         assert!(s.timer.is_retransmit());
         recv_nothing!(s, time 11);
+    }
+
+    #[test]
+    fn brief29_bug_reopened_window_retains_retransmit_timer() {
+        let mut s = socket_established();
+        #[cfg(feature = "socket-tcp-reno")]
+        s.set_congestion_control(CongestionControl::Reno);
+        s.remote_mss = 6;
+        s.send_slice(b"aaaaaabbbbbb").unwrap();
+        for (offset, payload) in [(0, &b"aaaaaa"[..]), (6, &b"bbbbbb"[..])] {
+            recv!(s, time 0, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + offset,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+        send!(s, time 10, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 6),
+            window_len: 0,
+            ..SEND_TEMPL
+        });
+        assert!(s.timer.is_zero_window_probe());
+        send!(s, time 20, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 6),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.flight_size(), 6);
+        assert_eq!(s.tx_buffer.len(), 6);
+        recv!(s, time 1020, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"bbbbbb",
+            ..RECV_TEMPL
+        }));
+        assert!(
+            s.timer.is_retransmit(),
+            "outstanding data has no timer: {:?}",
+            s.timer
+        );
+    }
+
+    #[test]
+    fn brief30_queued_data_after_zero_window_arms_persist() {
+        let mut s = socket_established();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 0,
+                ..SEND_TEMPL
+            }
+        );
+        s.send_slice(b"abcdef").unwrap();
+        recv_nothing!(s, time 10);
+        assert!(s.timer.is_zero_window_probe());
+        recv!(s, time 1010, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"a",
+            ..RECV_TEMPL
+        }));
     }
 
     fn socket_established() -> TestSocket {
