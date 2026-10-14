@@ -60,6 +60,7 @@ impl Scoreboard {
         }
     }
 
+    #[cfg(test)]
     pub fn sacked(&self, start: TcpSeqNumber, end: TcpSeqNumber) -> usize {
         self.ranges
             .iter()

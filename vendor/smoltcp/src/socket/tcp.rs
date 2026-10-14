@@ -3889,6 +3889,60 @@ mod test {
         }));
     }
 
+    #[test]
+    fn brief30_sack_requires_negotiation_and_clears_on_rto() {
+        let mut s = socket_established();
+        s.remote_mss = 6;
+        s.set_sender_sack_enabled(true);
+        s.remote_has_sack = false;
+        let base = LOCAL_SEQ + 1;
+        let data = b"aaaaaabbbbbbccccccddddddeeeeeeffffff";
+        s.send_slice(data).unwrap();
+        for (i, payload) in data.chunks(6).enumerate() {
+            recv!(s, time 0, Ok(TcpRepr {
+                seq_number: base + i * 6,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload,
+                ..RECV_TEMPL
+            }));
+        }
+        let blocks = [
+            Some(((base + 6).0 as u32, (base + 36).0 as u32)),
+            None,
+            None,
+        ];
+        for (negotiated, window) in [(false, 255), (true, 254)] {
+            s.remote_has_sack = negotiated;
+            send!(s, time 10, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(base),
+                window_len: window,
+                sack_ranges: blocks,
+                ..SEND_TEMPL
+            });
+            assert_eq!(
+                s.sack_scoreboard.sacked(base, base + 36),
+                if negotiated { 30 } else { 0 }
+            );
+            assert_eq!(s.tx_buffer.len(), 36);
+        }
+        recv!(s, time 10, Ok(TcpRepr {
+            seq_number: base,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"aaaaaa",
+            ..RECV_TEMPL
+        }));
+        // The receiver may renege on all advisory ranges; the RTO repairs from UNA.
+        recv!(s, time 1010, Ok(TcpRepr {
+            seq_number: base,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"aaaaaa",
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.sack_scoreboard.sacked(base, base + 36), 0);
+        assert_eq!(s.recovery_end, None);
+    }
+
     fn socket_established() -> TestSocket {
         socket_established_with_buffer_sizes(64, 64)
     }
