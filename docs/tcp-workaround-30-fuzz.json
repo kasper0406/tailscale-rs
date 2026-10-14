@@ -1,0 +1,38 @@
+[
+  {
+    "seed": 11,
+    "rounds": 100000,
+    "segments": 525777116,
+    "acks": 99056212,
+    "wedges": 0,
+    "panics": 0,
+    "worst_spin": 2
+  },
+  {
+    "seed": 22,
+    "rounds": 100000,
+    "segments": 526316114,
+    "acks": 99165817,
+    "wedges": 0,
+    "panics": 0,
+    "worst_spin": 2
+  },
+  {
+    "seed": 33,
+    "rounds": 100000,
+    "segments": 527216872,
+    "acks": 99141345,
+    "wedges": 0,
+    "panics": 0,
+    "worst_spin": 2
+  },
+  {
+    "seed": 44,
+    "rounds": 100000,
+    "segments": 531073330,
+    "acks": 99222043,
+    "wedges": 0,
+    "panics": 0,
+    "worst_spin": 2
+  }
+]

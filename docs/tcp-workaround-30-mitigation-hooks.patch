@@ -1,0 +1,66 @@
+--- a/ts_netstack_smoltcp_core/src/socket_impl/tcp/mod.rs
++++ b/ts_netstack_smoltcp_core/src/socket_impl/tcp/mod.rs
+@@ -1,4 +1,5 @@
+ use alloc::vec;
++extern crate std;
+ 
+ use smoltcp::socket::tcp;
+ 
+@@ -39,10 +40,15 @@
+         // Reno, matching gVisor in Go. smoltcp already defaults to Reno with only `socket-tcp-reno`
+         // on, but picks Cubic instead if anything else in the build enables `socket-tcp-cubic`, so
+         // pin the controller rather than inherit it from feature unification.
+-        sock.set_congestion_control(tcp::CongestionControl::Reno);
++        sock.set_congestion_control(if std::env::var("BENCH_CC").as_deref() == Ok("cubic") {
++            tcp::CongestionControl::Cubic
++        } else { tcp::CongestionControl::Reno });
++        if let Ok(ms) = std::env::var("BENCH_KEEPALIVE_MS") {
++            sock.set_keep_alive(Some(smoltcp::time::Duration::from_millis(ms.parse().unwrap())));
++        }
+         // `core::time::Duration` → smoltcp's own `Duration` (millisecond granularity is plenty for
+         // a 60s/120s policy). Skip either knob when `None` (smoltcp's no-reaping default).
+-        if let Some(interval) = self.config.tcp_keep_alive_interval {
++        if let Some(interval) = self.config.tcp_keep_alive_interval.filter(|_| std::env::var_os("BENCH_KEEPALIVE_MS").is_none()) {
+             sock.set_keep_alive(Some(smoltcp::time::Duration::from_millis(
+                 interval.as_millis() as u64,
+             )));
+--- a/ts_netstack_smoltcp_core/src/lib.rs
++++ b/ts_netstack_smoltcp_core/src/lib.rs
+@@ -5,6 +5,8 @@
+ #![no_std]
+ 
+ extern crate alloc;
++#[cfg(not(feature = "std"))]
++extern crate std;
+ 
+ #[cfg(feature = "std")]
+ extern crate std;
+@@ -132,6 +134,7 @@
+             config,
+             &mut NoopCapDev::with_caps(|caps| {
+                 caps.max_transmission_unit = ns_config.mtu;
++                caps.max_burst_size = std::env::var("BENCH_BURST").ok().map(|s| s.parse().unwrap());
+             }),
+             now,
+         );
+--- a/ts_netstack_smoltcp/src/pipe.rs
++++ b/ts_netstack_smoltcp/src/pipe.rs
+@@ -495,6 +495,7 @@
+         let mut caps = DeviceCapabilities::default();
+ 
+         caps.max_transmission_unit = self.mtu;
++        caps.max_burst_size = std::env::var("BENCH_BURST").ok().map(|s| s.parse().unwrap());
+         caps.medium = self.medium;
+         caps.checksum = ChecksumCapabilities::ignored();
+ 
+--- a/ts_forwarder/Cargo.toml
++++ b/ts_forwarder/Cargo.toml
+@@ -30,7 +30,7 @@
+ 
+ [dev-dependencies]
+ # Both benchmark receivers use the same bounded assembler as production.
+-smoltcp = { workspace = true, features = ["assembler-max-segment-count-32"] }
++smoltcp = { workspace = true, features = ["assembler-max-segment-count-32", "socket-tcp-cubic", "std"] }
+ tokio = { workspace = true, features = ["full"] }
+ 
+ [[bench]]

@@ -1,0 +1,7 @@
+{
+  "tcp30-stock": "2a2404b86fabd2ad5a6fbcbdc486973aa28d5edec8f5dddf3452527f382963d4",
+  "tcp30-mitigation-fixed": "2ee92b04962faaf62e35770c988448736a5a2d3575bde990cf7ffdc485032348",
+  "tcp30-patched-fixed": "be22bc462bc246ff4632c4da39fb0647cf4db0209f7a93bac1435bd82ca5533e",
+  "tcp30-patched-paced": "796d80e0b8fa485b17fb6fc769b30bedb641c73d6cae063bd56fecb3d33c05cc",
+  "tcp30-patched-cubic-paced": "4fa87dcce1fe5d34d434f57acc9a54a49a892e92cf51e0398efd0c3791e6f9bc"
+}
