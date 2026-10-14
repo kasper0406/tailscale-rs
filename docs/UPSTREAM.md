@@ -99,6 +99,10 @@ second fork, `kasper0406/geiserx-tailscale-rs`.
   untrusted best path` (stacked on #604's betterAddr commit) and #614 `fix(netstack): accept connections
   half-closed before accept; reclaim dropped sockets` (stacked on #599). Official tailscale-rs #450: its listener
   also closes CLOSE-WAIT sockets before accept (checked on main b44db0d); the path bug doesn't apply there.
+  Comment on #450 (2026-10-14) with a repro test (two piped stacks; client sends + FIN before `accept()`; fails
+  with a timeout on b44db0d) and a 4-line fix (CloseWait like Established in the half-open queue, accept queue and
+  `pump_tcp_accept`); verified in `scratch/official-450` (crate tests + clippy pass; a `ts_runtime` clippy error
+  with `--all-features` is pre-existing on main).
 - CI on #597/#598/#600 (2026-10-14): `checks` lints_enabled choked on `vendor/smoltcp/Cargo.toml` (now excluded:
   folded into the vendoring commit) and musl builds failed on `recvmmsg` flags (`MSG_DONTWAIT as _`, folded into
   the batched-receive commit). All three green after the push.
