@@ -540,6 +540,8 @@ pub struct Socket<'a> {
     local_rx_dup_acks: u8,
     /// If a fast retransmit needs to occur
     pending_fast_retransmit: bool,
+    /// Original flight boundary: partial ACKs repair without another cwnd reduction.
+    recovery_end: Option<TcpSeqNumber>,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -631,6 +633,7 @@ impl<'a> Socket<'a> {
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
             pending_fast_retransmit: false,
+            recovery_end: None,
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -986,6 +989,8 @@ impl<'a> Socket<'a> {
         self.local_seq_no = TcpSeqNumber::default();
         self.remote_seq_no = TcpSeqNumber::default();
         self.remote_last_seq = TcpSeqNumber::default();
+        self.recovery_end = None;
+        self.pending_fast_retransmit = false;
         self.remote_last_ack = None;
         self.remote_last_win = 0;
         self.remote_win_len = 0;
@@ -2185,7 +2190,7 @@ impl<'a> Socket<'a> {
                         }
                     );
 
-                    if self.local_rx_dup_acks == 3 {
+                    if self.local_rx_dup_acks == 3 && self.recovery_end.is_none() {
                         self.timer.set_for_fast_retransmit();
                         net_debug!("started fast retransmit");
                     }
@@ -2211,12 +2216,18 @@ impl<'a> Socket<'a> {
                     // Notify of fresh ACK
                     self.rtte.on_ack(cx.now(), ack_number);
                     let new_flight_size = self.flight_size().saturating_sub(ack_len);
-                    self.congestion_controller.inner_mut().on_ack(
-                        cx.now(),
-                        ack_len,
-                        new_flight_size,
-                        &self.rtte,
-                    );
+                    if ack_len > 0 && self.recovery_end.is_some_and(|end| ack_number < end) {
+                        self.congestion_controller
+                            .inner_mut()
+                            .on_partial_ack(cx.now(), ack_len);
+                    } else {
+                        self.congestion_controller.inner_mut().on_ack(
+                            cx.now(),
+                            ack_len,
+                            new_flight_size,
+                            &self.rtte,
+                        );
+                    }
                 }
             };
 
@@ -2256,6 +2267,15 @@ impl<'a> Socket<'a> {
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
             _ => {}
+        }
+
+        if let (Some(end), Some(ack)) = (self.recovery_end, repr.ack_number) {
+            if ack >= end {
+                self.recovery_end = None;
+                self.pending_fast_retransmit = false;
+            } else if ack_len > 0 {
+                self.timer.set_for_fast_retransmit();
+            }
         }
 
         // start/stop the Zero Window Probe timer.
@@ -2560,6 +2580,8 @@ impl<'a> Socket<'a> {
                 // had sent them. This will cause all data in the queue
                 // to be sent again.
                 self.remote_last_seq = self.local_seq_no;
+                self.recovery_end = None;
+                self.pending_fast_retransmit = false;
 
                 // Inform RTTE, so that it can can handle RTO backoff
                 self.rtte.on_rto();
@@ -2568,10 +2590,13 @@ impl<'a> Socket<'a> {
                 net_debug!("retransmitting for fast-retransmit");
 
                 // Inform the congestion controller that we're doing a fast retransmit and should enter the fast recovery state
-                let in_flight = self.flight_size();
-                self.congestion_controller
-                    .inner_mut()
-                    .on_loss(cx.now(), in_flight);
+                if self.recovery_end.is_none() {
+                    self.recovery_end = Some(self.remote_last_seq);
+                    let in_flight = self.flight_size();
+                    self.congestion_controller
+                        .inner_mut()
+                        .on_loss(cx.now(), in_flight);
+                }
 
                 self.pending_fast_retransmit = true;
             }
@@ -3533,6 +3558,69 @@ mod test {
         assert_eq!(s.initial_rto(), Duration::from_millis(50));
         assert!(!s.rtte.have_measurement);
         assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn brief29_feature_newreno_partial_ack_repairs_next_hole() {
+        let mut s = brief29_flight();
+        recv!(s, time 10, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"aaaaaa",
+            ..RECV_TEMPL
+        }));
+        send!(s, time 20, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 6),
+            ..SEND_TEMPL
+        });
+        // RFC 6582 desired improvement: repair the next hole without waiting for RTO.
+        recv!(s, time 20, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"bbbbbb",
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn brief30_newreno_original_boundary_and_rto_exit() {
+        let mut s = brief29_flight();
+        let end = s.remote_last_seq;
+        recv!(s, time 10, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"aaaaaa",
+            ..RECV_TEMPL
+        }));
+        s.send_slice(b"eeeeee").unwrap();
+        for offset in [6, 12] {
+            send!(s, time 20, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + offset),
+                ..SEND_TEMPL
+            });
+            recv!(s, time 20, Ok(TcpRepr {
+                seq_number: LOCAL_SEQ + 1 + offset,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"aaaaaabbbbbbccccccdddddd"[offset..offset + 6],
+                ..RECV_TEMPL
+            }));
+            assert_eq!(s.recovery_end, Some(end));
+        }
+        recv!(s, time 21, Ok(TcpRepr {
+            seq_number: end,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"eeeeee",
+            ..RECV_TEMPL
+        }));
+        assert_eq!(s.recovery_end, Some(end));
+        s.cx.set_now(Instant::from_millis(1020));
+        s.socket
+            .dispatch(&mut s.cx, |_, _, _| Ok::<(), ()>(()))
+            .unwrap();
+        assert_eq!(s.recovery_end, None);
+        assert!(!s.pending_fast_retransmit);
     }
 
     fn socket_established() -> TestSocket {

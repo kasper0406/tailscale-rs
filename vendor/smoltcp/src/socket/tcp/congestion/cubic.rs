@@ -173,6 +173,17 @@ impl Controller for Cubic {
         self.cwnd = (self.cwnd + increment).min(self.rwnd).max(self.mss);
     }
 
+    fn on_partial_ack(&mut self, _now: Instant, len: usize) {
+        if self.in_fast_recovery {
+            let credit = if len >= self.mss { self.mss } else { 0 };
+            self.cwnd = self
+                .cwnd
+                .saturating_sub(len)
+                .saturating_add(credit)
+                .max(self.mss);
+        }
+    }
+
     fn on_dup_ack(&mut self, _now: Instant, len: usize, _in_flight: usize) {
         if self.in_fast_recovery {
             self.cwnd = self.cwnd.saturating_add(len).min(self.rwnd).max(self.mss);

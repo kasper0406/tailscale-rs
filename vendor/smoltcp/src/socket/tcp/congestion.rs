@@ -20,6 +20,9 @@ pub(super) trait Controller {
 
     fn on_ack(&mut self, now: Instant, len: usize, in_flight: usize, rtt: &RttEstimator) {}
 
+    /// NewReno partial ACK: stay in the current recovery episode.
+    fn on_partial_ack(&mut self, now: Instant, len: usize) {}
+
     /// Fired on each duplicate ack received, after `on_loss` has been called.
     fn on_dup_ack(&mut self, now: Instant, len: usize, in_flight: usize) {}
 
