@@ -19,6 +19,7 @@ use crate::wire::{
 };
 
 mod congestion;
+mod pacing;
 mod recovery;
 
 macro_rules! tcp_trace {
@@ -171,6 +172,7 @@ struct RttEstimator {
     // Using u32 instead of Duration to save space (Duration is i64)
     /// Smoothed RTT
     srtt: u32,
+    min_rtt: u32,
     /// RTT variance.
     rttvar: u32,
     /// Retransmission Time-Out
@@ -186,6 +188,7 @@ impl Default for RttEstimator {
     fn default() -> Self {
         Self {
             have_measurement: false,
+            min_rtt: u32::MAX,
             srtt: 0,   // ignored, will be overwritten on first measurement.
             rttvar: 0, // ignored, will be overwritten on first measurement.
             rto: RTTE_INITIAL_RTO,
@@ -218,6 +221,7 @@ impl RttEstimator {
     }
 
     fn sample(&mut self, new_rtt: u32) {
+        self.min_rtt = self.min_rtt.min(new_rtt);
         if self.have_measurement {
             // RFC 6298 (2.3) When a subsequent RTT measurement R' is made, a host MUST set (...)
             let diff = (self.srtt as i32 - new_rtt as i32).unsigned_abs();
@@ -546,6 +550,8 @@ pub struct Socket<'a> {
     recovery_cursor: TcpSeqNumber,
     sack_scoreboard: recovery::Scoreboard,
     sender_sack_enabled: bool,
+    pacing_enabled: bool,
+    pacer: pacing::Pacer,
 
     /// Duration for Delayed ACK. If None no ACKs will be delayed.
     ack_delay: Option<Duration>,
@@ -641,6 +647,8 @@ impl<'a> Socket<'a> {
             recovery_cursor: TcpSeqNumber::default(),
             sack_scoreboard: recovery::Scoreboard::new(),
             sender_sack_enabled: false,
+            pacing_enabled: false,
+            pacer: pacing::Pacer::default(),
             ack_delay: Some(ACK_DELAY_DEFAULT),
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
@@ -779,6 +787,18 @@ impl<'a> Socket<'a> {
     /// See also the [set_initial_rto](#method.set_initial_rto) method.
     pub fn initial_rto(&self) -> Duration {
         Duration::from_millis(self.rtte.initial_rto as u64)
+    }
+
+    /// Enable bounded RTT-based data pacing. Disabled by default.
+    /// ACKs and the first fast repair remain immediate; baseline RTT <=5ms bypasses pacing.
+    pub fn set_pacing_enabled(&mut self, enabled: bool) {
+        self.pacing_enabled = enabled;
+        self.pacer = pacing::Pacer::default();
+    }
+
+    /// Return whether data pacing is enabled.
+    pub fn pacing_enabled(&self) -> bool {
+        self.pacing_enabled
     }
 
     /// Enable bounded sender SACK recovery. Disabled by default.
@@ -1010,6 +1030,7 @@ impl<'a> Socket<'a> {
         self.recovery_end = None;
         self.recovery_cursor = TcpSeqNumber::default();
         self.sack_scoreboard.clear();
+        self.pacer = pacing::Pacer::default();
         self.pending_fast_retransmit = false;
         self.remote_last_ack = None;
         self.remote_last_win = 0;
@@ -2444,6 +2465,22 @@ impl<'a> Socket<'a> {
         }
     }
 
+    fn pacing_window(&self) -> Option<usize> {
+        (self.pacing_enabled
+            && self.rtte.have_measurement
+            && self.rtte.srtt > 5
+            && self.rtte.min_rtt > 5
+            && self.congestion_control() != CongestionControl::None)
+            .then(|| self.congestion_controller.inner().window())
+    }
+
+    fn pacing_allowance(&self, now: Instant) -> usize {
+        self.pacing_window().map_or(usize::MAX, |window| {
+            self.pacer
+                .allowance(now, window, self.remote_mss, self.rtte.srtt)
+        })
+    }
+
     fn fast_repair(&self) -> Option<(TcpSeqNumber, usize)> {
         if self.tx_buffer.is_empty() || self.flight_size() == 0 {
             return None;
@@ -2462,6 +2499,7 @@ impl<'a> Socket<'a> {
     }
 
     fn enter_recovery(&mut self, now: Instant) {
+        self.pacer.on_loss();
         self.recovery_end = Some(self.remote_last_seq);
         self.recovery_cursor = self.local_seq_no;
         let in_flight = self.flight_size();
@@ -2710,6 +2748,7 @@ impl<'a> Socket<'a> {
                 self.remote_last_seq = self.local_seq_no;
                 self.recovery_end = None;
                 self.sack_scoreboard.clear();
+                self.pacer.on_loss();
                 self.pending_fast_retransmit = false;
 
                 // Inform RTTE, so that it can can handle RTO backoff
@@ -2760,7 +2799,9 @@ impl<'a> Socket<'a> {
         let retransmitting = self.pending_fast_retransmit || sack_retransmit.is_some();
 
         // Decide whether we're sending a packet.
-        if self.seq_to_transmit(cx) {
+        if (self.pending_fast_retransmit && self.fast_repair().is_some())
+            || (self.seq_to_transmit(cx) && self.pacing_allowance(cx.now()) > 0)
+        {
             // If we have data to transmit and it fits into partner's window, do it.
             tcp_trace!("outgoing segment will send data or flags");
         } else if self.ack_to_transmit() && self.delayed_ack_expired(cx.now()) {
@@ -2900,6 +2941,9 @@ impl<'a> Socket<'a> {
                         // http://www.tcpipguide.com/free/t_TCPWindowManagementIssues.htm
                         0
                     };
+
+                    // Even ACK-driven dispatches must cap data to the pacing budget.
+                    win_limit = win_limit.min(self.pacing_allowance(cx.now()));
 
                     // To send a zero-window-probe, force the window limit to at least 1 byte.
                     if win_limit == 0 && self.timer.should_zero_window_probe(cx.now()) {
@@ -3067,6 +3111,13 @@ impl<'a> Socket<'a> {
             return Ok(());
         }
 
+        if !repr.payload.is_empty()
+            && let Some(window) = self.pacing_window()
+        {
+            self.pacer
+                .sent(cx.now(), repr.payload.len(), window, self.rtte.srtt);
+        }
+
         if retransmitting && repr.segment_len() > 0 {
             self.recovery_cursor = self
                 .recovery_cursor
@@ -3132,8 +3183,35 @@ impl<'a> Socket<'a> {
             // Socket was aborted, we have an RST packet to transmit.
             PollAt::Now
         } else if self.seq_to_transmit(cx) {
-            // We have a data or flag packet to transmit.
-            PollAt::Now
+            if (self.pending_fast_retransmit && self.fast_repair().is_some())
+                || (self.ack_to_transmit() && self.delayed_ack_expired(cx.now()))
+                || self.window_to_update()
+            {
+                return PollAt::Now;
+            }
+            self.pacing_window().map_or(PollAt::Now, |window| {
+                let next = self
+                    .pacer
+                    .ready_at(cx.now(), window, self.remote_mss, self.rtte.srtt);
+                let ack = if self.ack_to_transmit() {
+                    match self.ack_delay_timer {
+                        AckDelayTimer::Waiting(t) => PollAt::Time(t),
+                        _ => PollAt::Now,
+                    }
+                } else {
+                    PollAt::Ingress
+                };
+                let timeout = match (self.remote_last_ts, self.timeout) {
+                    (Some(last), Some(timeout)) => PollAt::Time(last + timeout),
+                    _ => PollAt::Ingress,
+                };
+                let pacing = if next <= cx.now() {
+                    PollAt::Now
+                } else {
+                    PollAt::Time(next)
+                };
+                pacing.min(self.timer.poll_at()).min(ack).min(timeout)
+            })
         } else if self.window_to_update() {
             // The receive window has been raised significantly.
             PollAt::Now
@@ -3941,6 +4019,86 @@ mod test {
         }));
         assert_eq!(s.sack_scoreboard.sacked(base, base + 36), 0);
         assert_eq!(s.recovery_end, None);
+    }
+
+    #[cfg(feature = "socket-tcp-reno")]
+    #[test]
+    fn test_pacing_uses_baseline_rtt_despite_cpu_queueing() {
+        let mut s = socket_established();
+        s.set_congestion_control(CongestionControl::Reno);
+        s.set_pacing_enabled(true);
+        s.rtte.sample(1);
+        s.rtte.sample(100);
+        assert!(s.rtte.srtt > 5);
+        assert_eq!(s.pacing_window(), None);
+        s.reset();
+        s.rtte.sample(25);
+        assert!(s.pacing_window().is_some());
+    }
+
+    #[cfg(feature = "socket-tcp-reno")]
+    #[test]
+    fn test_pacing_schedules_data_without_delaying_ack() {
+        let mut s = socket_established_with_buffer_sizes(8192, 64);
+        s.set_ack_delay(None);
+        s.remote_win_len = 8192;
+        s.remote_mss = 1200;
+        s.set_nagle_enabled(false);
+        s.set_congestion_control(CongestionControl::Reno);
+        s.congestion_controller.inner_mut().set_mss(1200);
+        s.rtte.sample(20);
+        // Grow the unchanged IW2 enough to distinguish pacing from cwnd exhaustion.
+        for _ in 0..2 {
+            let rtt = s.rtte;
+            s.congestion_controller
+                .inner_mut()
+                .on_ack(Instant::ZERO, 1200, 0, &rtt);
+        }
+        s.set_pacing_enabled(true);
+        s.send_slice(&[0; 4096]).unwrap();
+        for _ in 0..2 {
+            s.socket
+                .dispatch(&mut s.cx, |_, _, (_, repr)| {
+                    assert_eq!(repr.payload.len(), 1200);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+        }
+        recv_nothing!(s, time 0);
+        send!(s, time 1, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"a",
+            window_len: 8192,
+            ..SEND_TEMPL
+        });
+        s.socket
+            .dispatch(&mut s.cx, |_, _, (_, repr)| {
+                assert!(repr.payload.is_empty());
+                assert_eq!(repr.ack_number, Some(REMOTE_SEQ + 2));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(
+            s.socket.poll_at(&mut s.cx),
+            PollAt::Time(Instant::from_micros(4498))
+        );
+    }
+
+    #[cfg(feature = "socket-tcp-reno")]
+    #[test]
+    fn brief30_pacing_requires_a_valid_rtt_estimate() {
+        let mut s = socket_established();
+        s.set_congestion_control(CongestionControl::Reno);
+        s.set_pacing_enabled(true);
+        s.rtte.sample(25);
+        assert!(s.pacing_window().is_some());
+        for _ in 0..3 {
+            s.rtte.on_rto();
+        }
+        assert_eq!(s.pacing_window(), None);
+        s.rtte.sample(30);
+        assert!(s.pacing_window().is_some());
     }
 
     fn socket_established() -> TestSocket {

@@ -1,5 +1,5 @@
 // Port of review26b-copy: same PRNG, seeds, hostile inputs, 400 steps and drain bound.
-// Keep the unused pacing draw so disabling pacing does not change the input stream.
+// Preserve the original pacing draw and toggle, as well as the original input generator.
 #[cfg(all(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
 #[test]
 #[ignore = "long-running randomized review-26 harness; configure R_SEED/R_ROUNDS"]
@@ -25,12 +25,16 @@ fn review26b_random_peer_inputs() {
     let rounds = env("R_ROUNDS", 200);
     let seed = env("R_SEED", 1);
     let steps = env("R_STEPS", 400);
+    let progress = std::env::var_os("R_PROGRESS").is_some();
     let mut wedges = 0u64;
     let mut worst_spin = 0u32;
     let mut panics = std::vec::Vec::new();
     let hook = std::panic::take_hook();
     std::panic::set_hook(std::boxed::Box::new(|_| {}));
     for round in 0..rounds {
+        if progress && round.is_multiple_of(10_000) {
+            std::println!("PROGRESS seed={seed} round={round}/{rounds}");
+        }
         let mut r = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
             ^ (round + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9)
             | 1);
@@ -41,7 +45,7 @@ fn review26b_random_peer_inputs() {
             } else {
                 CongestionControl::Cubic
             });
-            let _pacing_draw = r.next() % 4 != 0;
+            s.set_pacing_enabled(r.next() % 4 != 0);
             s.set_sender_sack_enabled(true);
             s.set_min_rto(Duration::from_millis(200));
             s.set_nagle_enabled(r.next() % 2 == 0);
