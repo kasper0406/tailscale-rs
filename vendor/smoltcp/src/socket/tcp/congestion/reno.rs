@@ -143,6 +143,23 @@ mod test {
     }
 
     #[test]
+    fn partial_ack_retains_recovery_until_full_ack() {
+        let mut reno = Reno::new();
+        reno.set_mss(MSS);
+        reno.cwnd = 32 * MSS;
+        reno.on_loss(Instant::ZERO, 32 * MSS);
+        let threshold = reno.ssthresh;
+        let window = reno.window();
+        reno.on_partial_ack(Instant::from_millis(1), 2 * MSS);
+        assert!(reno.in_fast_recovery);
+        assert_eq!(reno.ssthresh, threshold);
+        assert_eq!(reno.window(), window - MSS);
+        ack(&mut reno, MSS, Instant::from_millis(2));
+        assert!(!reno.in_fast_recovery);
+        assert_eq!(reno.window(), threshold);
+    }
+
+    #[test]
     fn congestion_avoidance_works() {
         let mut reno = Reno::new();
         reno.set_mss(MSS);

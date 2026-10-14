@@ -339,6 +339,23 @@ mod test {
     }
 
     #[test]
+    fn partial_ack_retains_recovery_until_full_ack() {
+        let mut cubic = Cubic::new();
+        cubic.set_mss(MSS);
+        cubic.cwnd = 32 * MSS;
+        cubic.on_loss(Instant::ZERO, 32 * MSS);
+        let threshold = cubic.ssthresh;
+        let window = cubic.window();
+        cubic.on_partial_ack(Instant::from_millis(1), 2 * MSS);
+        assert!(cubic.in_fast_recovery);
+        assert_eq!(cubic.ssthresh, threshold);
+        assert_eq!(cubic.window(), window - MSS);
+        ack(&mut cubic, MSS, Instant::from_millis(2));
+        assert!(!cubic.in_fast_recovery);
+        assert_eq!(cubic.window(), threshold);
+    }
+
+    #[test]
     fn congestion_avoidance_works() {
         let mut cubic = Cubic::new();
         cubic.set_mss(MSS);
