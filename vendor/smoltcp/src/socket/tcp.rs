@@ -2556,10 +2556,8 @@ impl<'a> Socket<'a> {
             return true;
         }
 
-        if self.recovery_end.is_some() {
-            if self.sack_retransmit(cx).is_some() {
-                return true;
-            }
+        if self.recovery_end.is_some() && self.sack_retransmit(cx).is_some() {
+            return true;
         }
 
         let ip_header_len = match self.tuple.unwrap().local.addr {

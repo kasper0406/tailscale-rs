@@ -40,16 +40,16 @@ fn review26b_random_peer_inputs() {
             | 1);
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> (bool, u32) {
             let mut s = socket_established_with_buffer_sizes(65536, 64);
-            s.set_congestion_control(if r.next() % 3 == 0 {
+            s.set_congestion_control(if r.next().is_multiple_of(3) {
                 CongestionControl::Reno
             } else {
                 CongestionControl::Cubic
             });
-            s.set_pacing_enabled(r.next() % 4 != 0);
+            s.set_pacing_enabled(!r.next().is_multiple_of(4));
             s.set_sender_sack_enabled(true);
             s.set_min_rto(Duration::from_millis(200));
-            s.set_nagle_enabled(r.next() % 2 == 0);
-            s.remote_has_sack = r.next() % 5 != 0;
+            s.set_nagle_enabled(r.next().is_multiple_of(2));
+            s.remote_has_sack = !r.next().is_multiple_of(5);
             let mss = [1usize, 6, 536, 1200, 1460, 9000, 65535][(r.next() % 7) as usize];
             s.remote_mss = mss;
             s.congestion_controller.inner_mut().set_mss(mss);
@@ -93,7 +93,7 @@ fn review26b_random_peer_inputs() {
                     _ => 10_000,
                 });
                 s.cx.set_now(now);
-                if r.next() % 3 == 0 {
+                if r.next().is_multiple_of(3) {
                     let _ = s.socket.send_slice(&vec![0u8; (r.next() % 20000) as usize]);
                 }
                 for _ in 0..(r.next() % 64) {
@@ -129,7 +129,7 @@ fn review26b_random_peer_inputs() {
                 };
                 let mut sack = [None; 3];
                 for b in sack.iter_mut() {
-                    if r.next() % 2 == 0 {
+                    if r.next().is_multiple_of(2) {
                         let base = match r.next() % 4 {
                             0 => r.next(),
                             1 => (una + (r.next() % span) as usize).0 as u32,
@@ -157,7 +157,7 @@ fn review26b_random_peer_inputs() {
                 peer(&mut s, ack, sack, win);
                 inv(&s);
                 // occasional duplicate-ACK bursts with in-flight SACKs
-                if r.next() % 4 == 0 {
+                if r.next().is_multiple_of(4) {
                     for _ in 0..(3 + r.next() % 4) {
                         let l = (s.local_seq_no + (r.next() % span) as usize).0 as u32;
                         let una2 = s.local_seq_no;
