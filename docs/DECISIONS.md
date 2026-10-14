@@ -285,3 +285,33 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   DERP until its app restarted. Now the top commit of `ts-exit/fixes` (307bf6b; layers restacked: main b78d017);
   GeiserX PR #606. The live node runs it (`bin/exit_node-restartfix`). Note: `runner/env.sh` defaults
   `TS_EXIT_TAG=tag:rust-exit`, but the live node is untagged, so run the check with `TS_EXIT_TAG=`.
+- **F34 TCP loss recovery (codex-24) + independent review (2026-10-14).** codex rewrote smoltcp's sender recovery
+  (`docs/TCP-RECOVERY-24.md`): NewReno partial-ACK repair, a bounded 32-range SACK scoreboard, cwnd over bytes in
+  flight, Reno/Cubic fixes, slow-start restart after RTO, RTT pacing, a 200 ms computed-RTO floor, 32 assembler
+  holes, and an async-runner fix (stale I/O timestamps gave 0–20 ms RTT samples on a 25 ms path). Bottleneck bench
+  (150 Mbit/s, 25 ms): every stalled configuration now 70–142 Mbit/s, longest pause 0.25 s (was 4–12 s); no-loss
+  rows +4–16%. Recommends a 1 MiB window. The independent review (`docs/review-26-tcp-recovery.md`, Claude
+  subagent) found **CRITICAL-1**: SACK blocks validated only by wrapping endpoint comparisons, so a SACK-negotiating
+  downloader could make `Scoreboard::pipe()` loop forever (node wedged at 100% CPU). Fixed in 4e6b554 (accept
+  blocks only inside the flight by wrapping offset from ack; bounded walks); re-check: 400k randomized rounds,
+  ~2.15 billion segments, no panics or busy-loops (pre-fix harness hung in 538/2000 rounds). LOW-2 (pre-existing in
+  smoltcp, reduced by the patch): no persist timer, so a zero-window or zero-window-then-reopen flow can stall
+  until keepalive (≤ ~3 min, that flow only). Release builds run with overflow-checks off (MEDIUM-1, context).
+  Live candidate `ts-exit/live-candidate` = main b78d017 + 14 production commits + no-Nagle (44c854d) + 4e6b554;
+  running since 2026-10-14 with `--tcp-buffer-size 1048576` (`bin/exit_node-candidate`); smoke 6/6 at 593 Mbit/s.
+- **F35 Candidate on the laptop (2026-10-14 ~00:00 UTC, runs C and C2 via `run-ts.sh`, no app restart: the restart
+  fix kept the path direct).** Single flow through the node 16.9 / 18.8 / 19.4 and 20.0 / 7.6 / 20.0 MB/s (was
+  capped at 8.8–9.8); direct 20.8 (noisy run) and 29.5–31 MB/s. The 7.6 MB/s flow coincided with the node's CPU
+  dropping (no stall, path direct): a loss-recovery episode on Wi-Fi. networkQuality upload completed in both (158
+  / 157 Mbit/s; it had failed in 2 of 4 earlier runs). TLS after connect ~60 ms (no-Nagle level). Loaded
+  responsiveness: down 210 / 283 ms (A3 442), up 337 / 124 ms (A3 104), noisy. Node: ~18% CPU average, 66 MB RSS.
+  Open: networkQuality's sequential download through the node is ~101 Mbit/s in A3, C and C2 regardless of build
+  or window, while the forwarder alone does 190 (1 flow) / 217 (16 flows) Mbit/s over an emulated 250 Mbit/s, 25 ms
+  link. A parallel-download test (`par.sh` on the laptop) is waiting for Kasper's approval in the laptop session.
+- **D31 Layers after the merges and the candidate (2026-10-14).** Rebased onto GeiserX 650e0e2 (#602/#605/#606 merged
+  upstream; our 5 copies dropped). The perf layer now also carries the TCP recovery (codex-24, 14 commits), the SACK
+  fix 4e6b554 (kept separate) and no-Nagle; the bench layer gains the bottleneck/recovery-gap/latency-probe bench
+  commits. fixes ca2a4ad (10) → exit-node 4b73115 (5) → perf 5719937 (28) = main → bench 3d76a28 (7) → experiments
+  0528ebc (2). Workspace clippy -D warnings and all tests pass on experiments and on main. `main` equals the live
+  candidate plus GeiserX's ruzstd and audit commits. Pushed to kasper0406/tailscale-rs. PRs #597/#598 on GeiserX
+  still carry the old stack; not updated (the TCP work would be a scope change for #598; ask first).

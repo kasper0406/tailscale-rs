@@ -90,6 +90,11 @@ second fork, `kasper0406/geiserx-tailscale-rs`.
   `docs/RESTART-DIRECT-25.md`). Root cause of "after a node restart, connected clients stay on DERP". Official
   tailscale-rs doesn't have this code (different discovery actor), so nothing to report there. On our layers it
   is the top commit of `ts-exit/fixes` (307bf6b).
+- **Merged by GeiserX 2026-10-13 ~23:36 UTC: #602, #605, #606.** Their GitHub Actions runs show "failure" with
+  zero jobs: fork-PR runs still awaiting maintainer approval are marked failed when the PR closes. GeiserX main's
+  `rust` CI passed on 650e0e2, which contains all three. The other open PRs' runs are `action_required`
+  (awaiting approval); #604's ran and passed. On 2026-10-14 the layers were rebased onto 650e0e2 with our five
+  identical commits dropped (code-identical to the squash merges, checked line by line).
 - Commit messages on all `ts-exit/*` layers were rewritten (codex-22, trees verified identical) after the reorg
   had left placeholder bodies. #597/#598 were updated with the same trees.
 
