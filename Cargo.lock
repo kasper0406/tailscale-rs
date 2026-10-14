@@ -2112,6 +2112,7 @@ dependencies = [
  "geiserx_ts_netstack_smoltcp",
  "if-addrs",
  "ipnet",
+ "smoltcp",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

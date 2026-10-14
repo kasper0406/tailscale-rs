@@ -29,4 +29,10 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 
 [dev-dependencies]
+# Both benchmark receivers use the same bounded assembler as production.
+smoltcp = { workspace = true, features = ["assembler-max-segment-count-32"] }
 tokio = { workspace = true, features = ["full"] }
+
+[[bench]]
+name = "forward_throughput"
+harness = false
