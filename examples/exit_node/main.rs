@@ -93,6 +93,31 @@ struct Args {
     /// Seconds between status lines (peers, direct vs DERP path). 0 disables.
     #[arg(long, default_value_t = 30)]
     status_interval: u64,
+
+    /// Forward a TCP port on this node's tailnet address to a service on this host (Tailscale
+    /// Serve `TCPForward`, like `tailscale serve --tcp`). `PORT=127.0.0.1:PORT`, repeatable: e.g.
+    /// `22=127.0.0.1:22` makes `ssh <node>` reach this host's sshd. Tailnet ACLs still apply.
+    /// Only loopback backends are accepted, so this can't expose other LAN hosts.
+    #[arg(long = "serve-tcp", value_name = "PORT=ADDR", value_parser = parse_serve_tcp)]
+    serve_tcp: Vec<(u16, std::net::SocketAddr)>,
+}
+
+fn parse_serve_tcp(s: &str) -> Result<(u16, std::net::SocketAddr), String> {
+    let (port, backend) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected PORT=ADDR, got {s:?}"))?;
+    let port = port
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| format!("invalid tailnet port {port:?}"))?;
+    let backend = backend
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("invalid backend {backend:?}: {e}"))?;
+    if !backend.ip().is_loopback() {
+        return Err(format!("backend {backend} must be a loopback address"));
+    }
+    Ok((port, backend))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -182,6 +207,25 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         advertise_exit_node = !args.no_advertise,
         "running"
     );
+
+    // The serve accept loops belong to this config; keep its hand-back channel for the node's life.
+    let _serve = if args.serve_tcp.is_empty() {
+        None
+    } else {
+        let mut state = tailscale::ServeState::default();
+        for (port, backend) in &args.serve_tcp {
+            state.tcp.insert(
+                *port,
+                tailscale::TcpPortHandler {
+                    tcp_forward: backend.to_string(),
+                    ..Default::default()
+                },
+            );
+        }
+        let accepted = dev.set_serve_config(state).await?;
+        tracing::info!(ports = ?args.serve_tcp, "forwarding tailnet TCP ports to local services");
+        Some(accepted)
+    };
 
     if args.sink_port != 0 {
         let listener = dev
@@ -306,5 +350,24 @@ async fn serve_sink(mut conn: tailscale::netstack::TcpStream) {
             }
         },
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_serve_tcp;
+
+    #[test]
+    fn serve_tcp_accepts_only_loopback_backends() {
+        assert_eq!(
+            parse_serve_tcp("22=127.0.0.1:22").unwrap(),
+            (22, "127.0.0.1:22".parse().unwrap())
+        );
+        assert!(parse_serve_tcp("2222=[::1]:22").is_ok());
+        assert!(parse_serve_tcp("22=192.168.1.10:22").is_err());
+        assert!(parse_serve_tcp("22=0.0.0.0:22").is_err());
+        assert!(parse_serve_tcp("0=127.0.0.1:22").is_err());
+        assert!(parse_serve_tcp("22").is_err());
+        assert!(parse_serve_tcp("22=localhost:22").is_err());
     }
 }
