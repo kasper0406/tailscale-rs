@@ -4,6 +4,10 @@
 # Userspace only: no root, no changes to host routes, DNS or pf.
 set -eu
 source ${0:A:h}/env.sh
+if [[ -f /Library/LaunchDaemons/dev.kasper.rust-exit.plist ]]; then
+  echo "the launchd daemon runs the node (deploy/launchd); use deploy/launchd/update.sh, or uninstall.sh first"
+  exit 1
+fi
 mkdir -p $TS_EXIT_STATE && chmod 700 $TS_EXIT_STATE
 if [[ -f $TS_EXIT_PIDFILE ]] && kill -0 $(cat $TS_EXIT_PIDFILE) 2>/dev/null; then
   echo "already running (pid $(cat $TS_EXIT_PIDFILE))"; exit 1

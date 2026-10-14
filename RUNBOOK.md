@@ -144,3 +144,30 @@ More logging: `RUST_LOG=debug runner/start.sh` (verbose; contains peer IPs, neve
   permission in force until the next full update. Don't rely on revocation being instant.
 - Single-flow throughput is capped by the fixed TCP window (no autotuning). See BENCHMARKS.md.
 - Not audited. Don't route sensitive traffic through it.
+
+## Permanent setup: launchd daemon (`deploy/launchd/`)
+
+A system daemon (`/Library/LaunchDaemons/dev.kasper.rust-exit.plist`) that starts at boot before login but runs
+**as Kasper, not root**. Everything else is on the internal disk in his home, because `/Volumes/git` (USB) isn't
+mounted before login:
+
+| What | Where |
+|---|---|
+| binary, wrapper, log rotator | `~/Library/Application Support/rust-exit/{bin/exit_node,run.sh,rotate.pl}` |
+| node identity | `~/Library/Application Support/rust-exit/state/keys.json` (moved from `state/rust-exit/`) |
+| logs | `~/Library/Logs/rust-exit/exit_node.log` (rotated at 10 MiB, 5 kept); `launchd.log` for wrapper errors |
+
+Settings (in `run.sh`): `--status-interval 300 --tcp-buffer-size 1048576`, the three `TS_DEBUG_MAGICSOCK_*` flags,
+`RUST_LOG=info`. launchd restarts it if it exits (`KeepAlive`, 10 s throttle); file limit 61,440; umask 077.
+
+- **Install:** `runner/build.sh`, then `deploy/launchd/install.sh` as yourself (it asks for sudo for the plist only).
+  It stops a manually started node, moves the keys, installs and loads the plist. `runner/start.sh` refuses to run
+  while the daemon is installed.
+- **Update (no sudo):** `runner/build.sh && deploy/launchd/update.sh`: installs the binary and kills the node;
+  launchd restarts it on the new binary.
+- **Status:** `launchctl print system/dev.kasper.rust-exit | grep -E 'state|pid'`; `tail ~/Library/Logs/rust-exit/exit_node.log`.
+- **Remove:** `deploy/launchd/uninstall.sh` (keys and logs stay).
+- **FileVault is on:** after any reboot nothing runs until the disk is unlocked. For planned restarts use
+  `sudo fdesetup authrestart`. `pmset autorestart` is 1 (restarts after power loss, then waits for unlock).
+- **Tailscale admin console:** disable key expiry for `rust-exit`, or it drops off the tailnet when its node key
+  expires.

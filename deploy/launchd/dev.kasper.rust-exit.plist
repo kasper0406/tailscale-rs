@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Rust Tailscale exit node. A system daemon so it starts at boot, before login, but it runs as the
+     owning user (no root): everything it touches lives in that user's home on the internal disk. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.kasper.rust-exit</string>
+	<key>UserName</key>
+	<string>@USER@</string>
+	<key>GroupName</key>
+	<string>staff</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>@APP@/run.sh</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>@HOME@</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>@APP@</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<!-- 077: the key file and logs stay owner-only. -->
+	<key>Umask</key>
+	<integer>63</integer>
+	<!-- One host socket per forwarded flow; launchd's default soft limit is 256. -->
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>61440</integer>
+	</dict>
+	<key>HardResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>61440</integer>
+	</dict>
+	<!-- Only wrapper-level errors land here; the node's own log is exit_node.log next to it. -->
+	<key>StandardOutPath</key>
+	<string>@HOME@/Library/Logs/rust-exit/launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/Library/Logs/rust-exit/launchd.log</string>
+</dict>
+</plist>
