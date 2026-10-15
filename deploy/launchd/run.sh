@@ -17,10 +17,11 @@ export TS_DEBUG_MAGICSOCK_CONNECTED_SOCKETS=1 TS_DEBUG_DONT_FRAGMENT=1 TS_DEBUG_
 
 # --interactive only matters if state/keys.json is missing: the node then logs a login URL instead of exiting.
 # --serve-tcp 22=127.0.0.1:22: `ssh kmini` from the tailnet reaches this Mac's sshd.
-# Default 256 KiB TCP window: stock smoltcp has no SACK/NewReno recovery, and larger windows stall
-# on lossy links (docs/DECISIONS.md F31, F34). Raise it again once that recovery is upstream.
+# 1 MiB TCP window: needs the patched smoltcp in this build (ts-exit/tcp-0.14: NewReno, SACK, pacing,
+# 200 ms RTO floor; docs/TCP-WORKAROUND-30.md). With stock smoltcp use the 256 KiB default: larger
+# windows stall on lossy links (docs/DECISIONS.md F31, F34).
 $dir/bin/exit_node --state-dir $dir/state --hostname kmini --port 41642 --interactive \
-  --status-interval 300 --serve-tcp 22=127.0.0.1:22 \
+  --status-interval 300 --tcp-buffer-size 1048576 --serve-tcp 22=127.0.0.1:22 \
   > >(/usr/bin/perl $dir/rotate.pl $logdir/exit_node.log) 2>&1 &
 pid=$!
 # launchd stops the job with SIGTERM to this script; pass it on so the node shuts down cleanly.

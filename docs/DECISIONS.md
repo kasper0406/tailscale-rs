@@ -343,3 +343,18 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   the tailnet is shared; FileVault recovery path before any planned reboot; A/B the `TS_EXPERIMENT_*` flags and
   larger windows on this build; upstream the TCP recovery to smoltcp (port onto main, small PRs, keep the SACK
   validation fix), optionally carried meanwhile as a `[patch.crates-io]` on 0.14.
+- **D33 Carry patched smoltcp 0.14 on GeiserX main (user, 2026-10-15).** smoltcp's CONTRIBUTING adopts the NLnet
+  Labs LLM policy (human-authored code only; AI analysis and suggested fixes in bug reports allowed with
+  disclosure), so upstream gets Kasper's rewrites of `docs/smoltcp-drafts/` B1–B3 (codex-29,
+  `docs/SMOLTCP-UPSTREAM-29.md`: most of our 0.13 congestion fixes are already upstream; B1 failed-emit loses the
+  fast retransmit, B2 zero-window reopen drops the RTO, B3 Cubic doesn't build without std; NewReno, sender SACK
+  and pacing are features). Our build carries a pinned vendored smoltcp 0.14.0 + patches (codex-30,
+  `ts-exit/tcp-0.14`, `docs/TCP-WORKAROUND-30.md`). Bottleneck matrix (25 ms, 150/250 Mbit/s, shallow queues): stock
+  median 57 Mbit/s, max pause 2.03 s; no-patch mitigations (burst cap, Cubic, 1 s keepalive) don't help; patched
+  + Cubic + pacing + 200 ms floor median 141 Mbit/s, max pause 0.23 s; 1 MiB single flow 121–230 Mbit/s vs ~69 at
+  256 KiB. CPU-bound no-loss 8-flow 0 ms/4 MiB is ~9% lower (lab only). Independent review 31
+  (`docs/review-31-tcp-0.14.md`): safe to run live, two LOW findings; its stronger harness (wraparound, failed
+  emits, pacing, partial ACKs, poll_at-driven drain) passed 1M release + 100k overflow-checked rounds. LOW-1
+  (pacing debt) fixed in 92c7b2e and rerun clean (500k). Live since 2026-10-15 via `update.sh` with
+  `--tcp-buffer-size 1048576`; smoke 6/6 (503 Mbit/s on LAN). `ts-exit/main` = `ts-exit/tcp-0.14` (92c7b2e).
+  Laptop validation (run D) requested.

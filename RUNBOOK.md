@@ -153,11 +153,12 @@ More logging: `RUST_LOG=debug runner/start.sh` (verbose; contains peer IPs, neve
 
 ## Permanent setup: launchd daemon (`deploy/launchd/`)
 
-**Code (since 2026-10-14):** GeiserX/tailscale-rs `main` plus one commit, `--serve-tcp` (branch `ts-exit/main`,
-0e10bc3 on 18fc6bc). GeiserX merged our exit-node, performance and fix PRs; our old layered branches are archived
-as tags `archive/ts-exit/*-pre-geiserx-switch`. Not in GeiserX main: our smoltcp TCP loss recovery (it was
-patched into a vendored smoltcp 0.13; GeiserX uses crates.io smoltcp 0.14 with Reno), so the window is back to
-the default 256 KiB.
+**Code (since 2026-10-15):** GeiserX/tailscale-rs `main` (18fc6bc) plus `--serve-tcp` and a pinned, patched
+smoltcp 0.14.0 (branch `ts-exit/main` = `ts-exit/tcp-0.14`, 92c7b2e; `docs/TCP-WORKAROUND-30.md`, reviews 31). GeiserX merged our exit-node, performance and fix PRs; our old layered branches are archived
+as tags `archive/ts-exit/*-pre-geiserx-switch`. GeiserX main lacks smoltcp loss recovery (crates.io smoltcp
+0.14, Reno), so we carry it ourselves via `[patch.crates-io]` (`vendor/smoltcp`: B1/B2 fixes, #1211 RTO bounds,
+NewReno, bounded sender SACK, pacing, no_std Cubic). Drop the patch when upstream has the equivalent. With
+stock smoltcp, go back to the 256 KiB window.
 
 A system daemon (`/Library/LaunchDaemons/dev.kasper.rust-exit.plist`) that starts at boot before login but runs
 **as Kasper, not root**. Everything else is on the internal disk in his home, because `/Volumes/git` (USB) isn't
@@ -170,7 +171,7 @@ mounted before login:
 | logs | `~/Library/Logs/rust-exit/exit_node.log` (rotated at 10 MiB, 5 kept); `launchd.log` (wrapper errors, trimmed at 1 MiB) |
 
 Settings (`run.sh`): node name **`kmini`**, `--serve-tcp 22=127.0.0.1:22` (`ssh kmini` reaches the Mac's sshd
-over the tailnet), `--status-interval 300`, default 256 KiB window, the three `TS_DEBUG_MAGICSOCK_*` Apple flags.
+over the tailnet), `--status-interval 300`, `--tcp-buffer-size 1048576` (needs the patched smoltcp), the three `TS_DEBUG_MAGICSOCK_*` Apple flags.
 The `TS_EXPERIMENT_*` flags are off until A/B-tested on this build (design review 28). launchd restarts it if it
 exits (`KeepAlive`, 10 s throttle); file limit 61,440; umask 077. The rotator never stops reading, so a stuck or
 full disk drops log lines instead of blocking the node.
