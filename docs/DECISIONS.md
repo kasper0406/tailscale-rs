@@ -358,3 +358,14 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   (pacing debt) fixed in 92c7b2e and rerun clean (500k). Live since 2026-10-15 via `update.sh` with
   `--tcp-buffer-size 1048576`; smoke 6/6 (503 Mbit/s on LAN). `ts-exit/main` = `ts-exit/tcp-0.14` (92c7b2e).
   Laptop validation (run D) requested.
+- **F37 Real-world pacing A/B (2026-10-16, laptop on an away Wi-Fi network, ~50 Mbit/s access link, direct path).**
+  Build `exit_node-pacing-live` (stock smoltcp 0.14.0 + runtime-switchable pacer, Reno, 1 MiB window); pacing
+  switched by the Mac on 120 s UTC slots (`runner/pacing-schedule.sh`), laptop blocks clock-aligned
+  (`deploy/laptop/run-pacing-sched.sh`; SSH from the laptop to kmini isn't key-authorized). Analysis:
+  `runner/pacing-real-analyze.py`; data in `bench/results/pacing-real/`. Pacing engaged (≈260–330k deferrals per
+  on-block vs 3–5 off) but **no measurable difference**: single flow median 21 (off) vs 22 (on) Mbit/s, 8 flows 49
+  vs 48 (link cap), retransmissions 3.1% vs 3.0%, 13–21 RTOs per 30 s block in both. Interpretation: losses on this
+  path aren't caused by our bursts (Wi-Fi or a policer), so pacing can't remove them; with stock recovery (1 s min
+  RTO, no NewReno/SACK) the RTOs cap single flows at ~40% of the link. On this network loss recovery is what
+  matters. For the upstream issue: present pacing for shallow-queue bottlenecks (emulated evidence,
+  `docs/PACING-AB-32.md`), don't claim a real-world gain. Normal patched build restored afterwards (smoke 6/6).

@@ -1,0 +1,7 @@
+== pacing-real-1 2026-10-16T13:32:17Z blocks=6
+block=1 slot=14934647 pacing=on t_start=1792157648.518 t_end=1792157678.750 single=22,21 Mbit/s par8=48 Mbit/s
+block=2 slot=14934648 pacing=off t_start=1792157769.091 t_end=1792157799.321 single=21,19 Mbit/s par8=49 Mbit/s
+block=3 slot=14934649 pacing=on t_start=1792157888.696 t_end=1792157918.934 single=19,23 Mbit/s par8=51 Mbit/s
+block=4 slot=14934650 pacing=off t_start=1792158009.307 t_end=1792158039.535 single=22,18 Mbit/s par8=50 Mbit/s
+block=5 slot=14934651 pacing=on t_start=1792158128.958 t_end=1792158159.188 single=23,22 Mbit/s par8=48 Mbit/s
+block=6 slot=14934652 pacing=off t_start=1792158248.579 t_end=1792158278.809 single=21,50 Mbit/s par8=46 Mbit/s
