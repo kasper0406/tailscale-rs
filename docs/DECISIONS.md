@@ -377,7 +377,9 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   couldn't fire. Also a frame prefix restarted the body deadline (~240 s worst case), and `health` only covered
   the packet filter. Fix (Go-style whole-poll watchdog, shared frame deadline, "Disconnected from coordination
   server" health) f287893 is on `ts-exit/main`, live since 2026-10-17 (`bin/exit_node-watchdog`, smoke 6/6).
-  GeiserX PR #634. Official tailscale-rs (0d41a6f) has a broader gap (no map-stream watchdog, plain h2
+  GeiserX PR #634, **merged 2026-10-17** (69713c9). Phase diagnostics (codex-35b: the timeout warning names the
+  stuck phase, its age, time since the last map response, frames, partial-frame progress) live since 2026-10-17
+  (`ts-exit/main` 5d1f88f, `bin/exit_node-watchdog2`) and proposed as GeiserX PR #636. Official tailscale-rs (0d41a6f) has a broader gap (no map-stream watchdog, plain h2
   handshake without PINGs); not reported there yet. Exact pending future in the incident unproven.
 - **F37 correction (review 34, `docs/review-34-evidence.md`).** The real-world pacing run is underpowered (3+3
   blocks) and shows no clear gain, but doesn't support "losses aren't burst-driven" or "RTOs cap singles" (most

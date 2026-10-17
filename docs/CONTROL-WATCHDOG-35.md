@@ -117,3 +117,41 @@ the requested priority could not be applied. A writable Cargo home at
 `scratch/control-watchdog-cargo-home` avoided writes to the restricted home
 cache. `bd` was unavailable; no tracker changes were made. No public addresses
 were copied into this report or the new tests.
+
+## 35b — identify the stalled await
+
+New commit `b66def8a0d5424127eca8fd39eac69a40aab7f1c` on
+`fix/control-watchdog`, directly after unchanged `f9e6db2`; requested trailers
+included. Nothing pushed; live node untouched.
+
+The existing watch channel now records connect, register, map response headers,
+frame reads, response processing, C2N ping handling and each named side request:
+`set_derp_home_region`, `set_endpoints`, `set_routable_ips`, `set_hostname`.
+Startup Hostinfo runs concurrently, so it appears as
+`concurrent_phase=startup_map_request` with its own age rather than replacing
+the reader's phase.
+
+Both watchdog timeout paths retain the **warn** message prefix
+`map response long-poll timed out! Restarting control connection` and include:
+
+- `phase`, `phase_secs`, `since_last_map_response_secs`, `frames_received`,
+  `attempt_age_secs`;
+- `partial_frame`, `frame_part` (prefix/body), bytes received/expected;
+- concurrent startup phase and `startup_request_secs`.
+
+Partial-byte progress comes from actual reads and never extends the deadline.
+Decoded frames, including keep-alives, are counted before cache persistence;
+response arrival age therefore remains useful if persistence hangs. Before the
+first response, response age is attempt age. Re-entering an unchanged phase does
+not reset its age. Diagnostics contain only fixed labels, durations and counts;
+no keys, tokens, URLs or peer data. Timeout and health behavior remain unchanged.
+
+Seven new paused-clock tests inspect the same snapshot used by the warn log:
+headers, all four side requests, a two-byte prefix at 119 seconds, partial body
+versus silence, concurrent startup/reader and startup/processing states, and
+single counting of decoded keep-alives/netmaps.
+
+Validation passed with the commands above: **398 control + 649 runtime + 1
+integration test**, doc tests, clippy `-D warnings`, fmt and whitespace checks.
+Logs: `scratch/control-watchdog-35b-{tests,clippy,fmt-check}.log`. Jobs remained
+capped at four; `nice -n 10` again encountered the sandbox's `setpriority` denial.
