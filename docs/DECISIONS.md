@@ -369,3 +369,19 @@ Newest last. Each entry: date, decision or finding, evidence, consequence.
   RTO, no NewReno/SACK) the RTOs cap single flows at ~40% of the link. On this network loss recovery is what
   matters. For the upstream issue: present pacing for shallow-queue bottlenecks (emulated evidence,
   `docs/PACING-AB-32.md`), don't claim a real-world gain. Normal patched build restored afterwards (smoke 6/6).
+- **F38 Silent control disconnect (2026-10-17).** kmini kept forwarding for known peers but control marked it
+  offline from 00:09 UTC; clients showed the exit node as blocked and the laptop dropped out of its netmap.
+  Nothing was logged; `health=[]`. A restart fixed it. codex-35 (`docs/CONTROL-WATCHDOG-35.md`): GeiserX's
+  control client already had a 120 s body-read watchdog and HTTP/2 PINGs, but setup, map-response headers,
+  awaited side map requests and C2N replies weren't bounded, so the reader wasn't polled and its watchdog
+  couldn't fire. Also a frame prefix restarted the body deadline (~240 s worst case), and `health` only covered
+  the packet filter. Fix (Go-style whole-poll watchdog, shared frame deadline, "Disconnected from coordination
+  server" health) f287893 is on `ts-exit/main`, live since 2026-10-17 (`bin/exit_node-watchdog`, smoke 6/6).
+  GeiserX PR #634. Official tailscale-rs (0d41a6f) has a broader gap (no map-stream watchdog, plain h2
+  handshake without PINGs); not reported there yet. Exact pending future in the incident unproven.
+- **F37 correction (review 34, `docs/review-34-evidence.md`).** The real-world pacing run is underpowered (3+3
+  blocks) and shows no clear gain, but doesn't support "losses aren't burst-driven" or "RTOs cap singles" (most
+  RTOs fell in the 8-flow phase: 1–3 per single phase). The analyzer bracketed `log_ts`, not snapshot `ts_ms`
+  (minor; result unchanged). Claims graded: "pacing biggest gain" holds only within the lab stress matrix;
+  "recovery matters more" is untested. No defensible real-world ranking yet; next decisive test is a 2×2
+  (recovery × pacing) on the laptop path with per-flow stats.

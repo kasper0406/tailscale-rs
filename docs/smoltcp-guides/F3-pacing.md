@@ -1,14 +1,16 @@
 # Feature: pacing
 
-**Kind:** feature. **Effort:** 2–4 days after the design is agreed. **Matters for us:** most of all: in our
-benchmark it took median throughput from 62 to 130 Mbit/s (Reno) on top of loss recovery.
+**Kind:** feature. **Effort:** 2–4 days after the design is agreed. **Matters for us:** large in our emulated
+shallow-queue benchmark (median 51 → 112 Mbit/s on stock 0.14.0, `docs/PACING-AB-32.md`), but one real Wi-Fi A/B
+showed no clear gain (F37), and review 34 rates its real-world priority as unproven.
 
 ## The problem
 
 Without pacing, a TCP sender sends as much as cwnd allows the moment ACKs arrive, back to back at line rate. A
 1 MiB window can mean hundreds of packets in one burst. A home router or Wi-Fi access point with a shallow queue
 (64–256 KiB) drops the tail of the burst, so you get burst losses, which recovery then has to clean up. Pacing
-spreads the window over the round trip, so the queue never overflows in the first place. Linux paces by default
+spreads the window over the round trip, which reduces queue overflow from our own bursts. It doesn't prevent
+losses from other causes (radio loss, cross traffic). Linux paces by default
 (`fq`/TCP internal pacing); smoltcp doesn't pace at all.
 
 ## Design we used (commit `21e8417`, +269/−5, opt-in via `set_pacing_enabled`, plus the fix `92c7b2e`)

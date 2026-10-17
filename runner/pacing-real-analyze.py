@@ -6,8 +6,9 @@ import json, re, statistics, sys
 
 rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 def at(t, before):
-    cands = [r for r in rows if (r["log_ts"] <= t if before else r["log_ts"] >= t)]
-    return (max if before else min)(cands, key=lambda r: r["log_ts"]) if cands else None
+    # Bracket by the node's own snapshot time (ts_ms), not by when the logger read the file.
+    cands = [r for r in rows if (r["ts_ms"] / 1000 <= t if before else r["ts_ms"] / 1000 >= t)]
+    return (max if before else min)(cands, key=lambda r: r["ts_ms"]) if cands else None
 
 blocks = []
 for line in open(sys.argv[2]):
